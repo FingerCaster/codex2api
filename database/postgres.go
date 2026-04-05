@@ -885,18 +885,32 @@ type TrafficSnapshot struct {
 
 // GetUsageStats 获取使用统计（基线 + 当前日志）
 func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
+	return db.GetUsageStatsByAPIKey(ctx, nil)
+}
+
+// GetUsageStatsByAPIKey 获取按 API Key 过滤的使用统计
+func (db *DB) GetUsageStatsByAPIKey(ctx context.Context, apiKeyID *int64) (*UsageStats, error) {
 	stats := &UsageStats{}
 	now := time.Now()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	minuteAgo := now.Add(-1 * time.Minute)
 
+	totalQuery := `
+	SELECT
+		COUNT(*) AS total_requests,
+		COALESCE(SUM(total_tokens), 0) AS total_tokens,
+		COALESCE(SUM(prompt_tokens), 0) AS total_prompt,
+		COALESCE(SUM(completion_tokens), 0) AS total_completion,
+		COALESCE(SUM(cached_tokens), 0) AS total_cached
+	FROM usage_logs
+	WHERE status_code <> 499
+	`
+	totalArgs := []interface{}{}
+
 	todayQuery := `
 	SELECT
 		COUNT(*) AS today_requests,
 		COALESCE(SUM(total_tokens), 0) AS today_tokens,
-		COALESCE(SUM(prompt_tokens), 0) AS today_prompt,
-		COALESCE(SUM(completion_tokens), 0) AS today_completion,
-		COALESCE(SUM(cached_tokens), 0) AS today_cached,
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN 1 ELSE 0 END), 0) AS rpm,
 		COALESCE(SUM(CASE WHEN created_at >= $2 THEN total_tokens ELSE 0 END), 0) AS tpm,
 		COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
@@ -907,13 +921,20 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	`
 	queryArgs := []interface{}{todayStart, minuteAgo}
 	if db.isSQLite() {
+		totalQuery = `
+		SELECT
+			COUNT(*) AS total_requests,
+			COALESCE(SUM(total_tokens), 0) AS total_tokens,
+			COALESCE(SUM(prompt_tokens), 0) AS total_prompt,
+			COALESCE(SUM(completion_tokens), 0) AS total_completion,
+			COALESCE(SUM(cached_tokens), 0) AS total_cached
+		FROM usage_logs
+		WHERE status_code <> 499
+		`
 		todayQuery = `
 		SELECT
 			COUNT(*) AS today_requests,
 			COALESCE(SUM(total_tokens), 0) AS today_tokens,
-			COALESCE(SUM(prompt_tokens), 0) AS today_prompt,
-			COALESCE(SUM(completion_tokens), 0) AS today_completion,
-			COALESCE(SUM(cached_tokens), 0) AS today_cached,
 			COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime($2) THEN 1 ELSE 0 END), 0) AS rpm,
 			COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime($2) THEN total_tokens ELSE 0 END), 0) AS tpm,
 			COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
@@ -924,10 +945,19 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		`
 		queryArgs = []interface{}{todayStart.Format(time.RFC3339), minuteAgo.Format(time.RFC3339)}
 	}
+	if apiKeyID != nil {
+		paramIdx := len(queryArgs) + 1
+		todayQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", paramIdx)
+		queryArgs = append(queryArgs, *apiKeyID)
+
+		totalParamIdx := len(totalArgs) + 1
+		totalQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", totalParamIdx)
+		totalArgs = append(totalArgs, *apiKeyID)
+	}
 
 	var todayErrors int64
 	err := db.conn.QueryRowContext(ctx, todayQuery, queryArgs...).Scan(
-		&stats.TodayRequests, &stats.TodayTokens, &stats.TotalPrompt, &stats.TotalCompletion, &stats.TotalCachedTokens,
+		&stats.TodayRequests, &stats.TodayTokens,
 		&stats.RPM, &stats.TPM,
 		&stats.AvgDurationMs,
 		&todayErrors,
@@ -936,24 +966,31 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 		return nil, err
 	}
 
-	// 统计当前可见请求总数（排除 499，保证与使用统计列表口径一致）
-	var visibleTotal int64
-	_ = db.conn.QueryRowContext(ctx, `
-		SELECT COUNT(*) FROM usage_logs WHERE status_code <> 499
-	`).Scan(&visibleTotal)
+	err = db.conn.QueryRowContext(ctx, totalQuery, totalArgs...).Scan(
+		&stats.TotalRequests,
+		&stats.TotalTokens,
+		&stats.TotalPrompt,
+		&stats.TotalCompletion,
+		&stats.TotalCachedTokens,
+	)
+	if err != nil {
+		return nil, err
+	}
 
 	// 加上基线值（清空日志前保存的累计值）
-	var bReq, bTok, bPrompt, bComp, bCached int64
-	_ = db.conn.QueryRowContext(ctx, `
-		SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens
-		FROM usage_stats_baseline WHERE id = 1
-	`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached)
+	if apiKeyID == nil {
+		var bReq, bTok, bPrompt, bComp, bCached int64
+		_ = db.conn.QueryRowContext(ctx, `
+			SELECT total_requests, total_tokens, prompt_tokens, completion_tokens, cached_tokens
+			FROM usage_stats_baseline WHERE id = 1
+		`).Scan(&bReq, &bTok, &bPrompt, &bComp, &bCached)
 
-	stats.TotalRequests = visibleTotal + bReq
-	stats.TotalTokens = stats.TodayTokens + bTok
-	stats.TotalPrompt += bPrompt
-	stats.TotalCompletion += bComp
-	stats.TotalCachedTokens += bCached
+		stats.TotalRequests += bReq
+		stats.TotalTokens += bTok
+		stats.TotalPrompt += bPrompt
+		stats.TotalCompletion += bComp
+		stats.TotalCachedTokens += bCached
+	}
 
 	if stats.TodayRequests > 0 {
 		stats.ErrorRate = float64(todayErrors) / float64(stats.TodayRequests) * 100

@@ -469,6 +469,7 @@
     "tableDuration": "Duration",
     "tableTime": "Time",
     "searchEmail": "Search account email…",
+    "apiKeyScope": "Top metrics are scoped to API key: {{name}}",
     "allApiKeys": "All API Keys",
     "allModels": "All Models",
     "allEndpoints": "All Endpoints",

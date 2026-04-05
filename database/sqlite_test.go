@@ -146,6 +146,126 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 	}
 }
 
+func TestGetUsageStatsByAPIKey(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	targetAPIKeyID := int64(7)
+
+	logs := []*UsageLogInput{
+		{
+			AccountID:       1,
+			Endpoint:        "/v1/responses",
+			Model:           "gpt-5.4",
+			StatusCode:      200,
+			DurationMs:      100,
+			PromptTokens:    40,
+			CompletionTokens: 60,
+			TotalTokens:     100,
+			CachedTokens:    10,
+			APIKeyID:        targetAPIKeyID,
+			APIKeyName:      "Team A",
+		},
+		{
+			AccountID:       1,
+			Endpoint:        "/v1/responses",
+			Model:           "gpt-5.4-mini",
+			StatusCode:      401,
+			DurationMs:      200,
+			PromptTokens:    4,
+			CompletionTokens: 6,
+			TotalTokens:     10,
+			APIKeyID:        targetAPIKeyID,
+			APIKeyName:      "Team A",
+		},
+		{
+			AccountID:       2,
+			Endpoint:        "/v1/chat/completions",
+			Model:           "gpt-5.4",
+			StatusCode:      200,
+			DurationMs:      300,
+			PromptTokens:    80,
+			CompletionTokens: 120,
+			TotalTokens:     200,
+			CachedTokens:    20,
+			APIKeyID:        8,
+			APIKeyName:      "Team B",
+		},
+	}
+
+	for _, usageLog := range logs {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	stats, err := db.GetUsageStatsByAPIKey(ctx, &targetAPIKeyID)
+	if err != nil {
+		t.Fatalf("GetUsageStatsByAPIKey 返回错误: %v", err)
+	}
+
+	if stats.TotalRequests != 2 {
+		t.Fatalf("TotalRequests = %d, want %d", stats.TotalRequests, 2)
+	}
+	if stats.TotalTokens != 110 {
+		t.Fatalf("TotalTokens = %d, want %d", stats.TotalTokens, 110)
+	}
+	if stats.TotalPrompt != 44 {
+		t.Fatalf("TotalPrompt = %d, want %d", stats.TotalPrompt, 44)
+	}
+	if stats.TotalCompletion != 66 {
+		t.Fatalf("TotalCompletion = %d, want %d", stats.TotalCompletion, 66)
+	}
+	if stats.TotalCachedTokens != 10 {
+		t.Fatalf("TotalCachedTokens = %d, want %d", stats.TotalCachedTokens, 10)
+	}
+	if stats.TodayRequests != 2 {
+		t.Fatalf("TodayRequests = %d, want %d", stats.TodayRequests, 2)
+	}
+	if stats.TodayTokens != 110 {
+		t.Fatalf("TodayTokens = %d, want %d", stats.TodayTokens, 110)
+	}
+	if stats.RPM != 2 {
+		t.Fatalf("RPM = %v, want %v", stats.RPM, float64(2))
+	}
+	if stats.TPM != 110 {
+		t.Fatalf("TPM = %v, want %v", stats.TPM, float64(110))
+	}
+	if stats.ErrorRate != 50 {
+		t.Fatalf("ErrorRate = %v, want %v", stats.ErrorRate, float64(50))
+	}
+
+	if err := db.ClearUsageLogs(ctx); err != nil {
+		t.Fatalf("ClearUsageLogs 返回错误: %v", err)
+	}
+
+	filteredAfterClear, err := db.GetUsageStatsByAPIKey(ctx, &targetAPIKeyID)
+	if err != nil {
+		t.Fatalf("clear 后 GetUsageStatsByAPIKey 返回错误: %v", err)
+	}
+	if filteredAfterClear.TotalRequests != 0 || filteredAfterClear.TotalTokens != 0 {
+		t.Fatalf("clear 后按 key 统计应归零: requests=%d tokens=%d", filteredAfterClear.TotalRequests, filteredAfterClear.TotalTokens)
+	}
+
+	overallAfterClear, err := db.GetUsageStats(ctx)
+	if err != nil {
+		t.Fatalf("clear 后 GetUsageStats 返回错误: %v", err)
+	}
+	if overallAfterClear.TotalRequests != 3 {
+		t.Fatalf("clear 后 TotalRequests = %d, want %d", overallAfterClear.TotalRequests, 3)
+	}
+	if overallAfterClear.TotalTokens != 310 {
+		t.Fatalf("clear 后 TotalTokens = %d, want %d", overallAfterClear.TotalTokens, 310)
+	}
+}
+
 func TestSQLiteTimeRangeQueriesHandleOffsetWindows(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

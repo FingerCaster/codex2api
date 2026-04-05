@@ -118,6 +118,8 @@ export default function Usage() {
   const showFastFilter = false
   const PAGE_SIZE = 20
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
+  const statsAPIKeyFilterRef = useRef('')
+  const didInitStatsScopeRef = useRef(false)
 
   // 搜索防抖：输入停止 400ms 后触发查询
   const handleSearchChange = useCallback((value: string) => {
@@ -129,9 +131,13 @@ export default function Usage() {
     }, 400)
   }, [])
 
+  useEffect(() => {
+    statsAPIKeyFilterRef.current = filterApiKeyId
+  }, [filterApiKeyId])
+
   // 仅加载轻量统计（秒级）
   const loadStats = useCallback(async () => {
-    const stats = await api.getUsageStats()
+    const stats = await api.getUsageStats({ apiKeyId: statsAPIKeyFilterRef.current || undefined })
     return { stats }
   }, [])
 
@@ -192,6 +198,14 @@ export default function Usage() {
     return () => window.clearInterval(timer)
   }, [reloadSilently])
 
+  useEffect(() => {
+    if (!didInitStatsScopeRef.current) {
+      didInitStatsScopeRef.current = true
+      return
+    }
+    void reloadSilently()
+  }, [filterApiKeyId, reloadSilently])
+
   const { stats } = data
   const totalPages = Math.max(1, Math.ceil(logsTotal / PAGE_SIZE))
   const totalRequests = stats?.total_requests ?? 0
@@ -206,6 +220,8 @@ export default function Usage() {
   const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
   const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
+  const selectedAPIKey = apiKeys.find((apiKey) => String(apiKey.id) === filterApiKeyId) ?? null
+  const selectedAPIKeyLabel = selectedAPIKey ? formatAPIKeyOptionLabel(selectedAPIKey) : ''
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
@@ -227,6 +243,12 @@ export default function Usage() {
           description={t('usage.description')}
           onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
         />
+
+        {selectedAPIKeyLabel && (
+          <div className="mb-3 rounded-xl border border-blue-500/20 bg-blue-500/6 px-4 py-2 text-[12px] text-muted-foreground">
+            {t('usage.apiKeyScope', { name: selectedAPIKeyLabel })}
+          </div>
+        )}
 
         {/* Top stats: 2 columns */}
         <div className="grid grid-cols-2 gap-3 mb-3 max-sm:grid-cols-1">

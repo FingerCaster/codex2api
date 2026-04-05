@@ -1404,12 +1404,31 @@ func (h *Handler) GetHealth(c *gin.Context) {
 
 // ==================== Usage ====================
 
+func parseOptionalAPIKeyID(raw string) (*int64, error) {
+	if raw == "" {
+		return nil, nil
+	}
+
+	parsed, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || parsed <= 0 {
+		return nil, fmt.Errorf("api_key_id 参数无效，需要正整数")
+	}
+
+	return &parsed, nil
+}
+
 // GetUsageStats 获取使用统计
 func (h *Handler) GetUsageStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	stats, err := h.db.GetUsageStats(ctx)
+	apiKeyID, err := parseOptionalAPIKeyID(c.Query("api_key_id"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	stats, err := h.db.GetUsageStatsByAPIKey(ctx, apiKeyID)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -1495,14 +1514,10 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 					pageSize = n
 				}
 			}
-			var apiKeyID *int64
-			if apiKeyIDStr := c.Query("api_key_id"); apiKeyIDStr != "" {
-				parsed, err := strconv.ParseInt(apiKeyIDStr, 10, 64)
-				if err != nil || parsed <= 0 {
-					writeError(c, http.StatusBadRequest, "api_key_id 参数无效，需要正整数")
-					return
-				}
-				apiKeyID = &parsed
+			apiKeyID, err := parseOptionalAPIKeyID(c.Query("api_key_id"))
+			if err != nil {
+				writeError(c, http.StatusBadRequest, err.Error())
+				return
 			}
 
 			filter := database.UsageLogFilter{

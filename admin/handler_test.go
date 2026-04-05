@@ -160,3 +160,26 @@ func TestGetUsageLogsRejectsInvalidAPIKeyID(t *testing.T) {
 		t.Fatalf("error = %q, want %q", got, "api_key_id 参数无效，需要正整数")
 	}
 }
+
+func TestGetUsageStatsRejectsInvalidAPIKeyID(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/usage/stats?api_key_id=bad", nil)
+
+	handler.GetUsageStats(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+
+	var payload map[string]string
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if got := payload["error"]; got != "api_key_id 参数无效，需要正整数" {
+		t.Fatalf("error = %q, want %q", got, "api_key_id 参数无效，需要正整数")
+	}
+}

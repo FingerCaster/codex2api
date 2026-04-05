@@ -946,9 +946,6 @@ curl --request POST \\
         apiKey={firstKey}
         baseUrl={baseUrl}
         allKeys={allKeys}
-        path="/api/admin/accounts/:id"
-        title={t('apiRef.deleteAccount.title')}
-        description={t('apiRef.deleteAccount.desc')}
         curlExample={`curl --request DELETE \\
   --url ${baseUrl}/api/admin/accounts/1 \\
   --header 'X-Admin-Key: <admin_secret>'`}

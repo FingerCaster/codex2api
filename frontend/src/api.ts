@@ -109,7 +109,12 @@ export const api = {
     request<AccountUsageDetail>(`/accounts/${id}/usage`),
   getHealth: () => request<HealthResponse>('/health'),
   getOpsOverview: () => request<OpsOverviewResponse>('/ops/overview'),
-  getUsageStats: () => request<UsageStats>('/usage/stats'),
+  getUsageStats: (params: { apiKeyId?: string } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.apiKeyId) searchParams.set('api_key_id', params.apiKeyId)
+    const query = searchParams.toString()
+    return request<UsageStats>(query ? `/usage/stats?${query}` : '/usage/stats')
+  },
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()
     if (params.start && params.end) {
