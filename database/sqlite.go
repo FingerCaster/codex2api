@@ -220,8 +220,8 @@ func (db *DB) getTrafficSnapshotSQLite(ctx context.Context) (*TrafficSnapshot, e
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT created_at, total_tokens
 		FROM usage_logs
-		WHERE created_at >= $1
-	`, sqliteComparableTime(since))
+		WHERE datetime(created_at) >= datetime($1)
+	`, since.Format(time.RFC3339))
 	if err != nil {
 		return nil, err
 	}
@@ -276,14 +276,12 @@ func (db *DB) getTrafficSnapshotSQLite(ctx context.Context) (*TrafficSnapshot, e
 }
 
 func (db *DB) getChartAggregationSQLite(ctx context.Context, start, end time.Time, bucketMinutes int) (*ChartAggregation, error) {
-	startArg := sqliteComparableTime(start)
-	endArg := sqliteComparableTime(end)
 	rows, err := db.conn.QueryContext(ctx, `
 		SELECT created_at, duration_ms, input_tokens, output_tokens, reasoning_tokens, cached_tokens, model, status_code
 		FROM usage_logs
-		WHERE created_at >= $1 AND created_at <= $2
+		WHERE datetime(created_at) >= datetime($1) AND datetime(created_at) <= datetime($2)
 		  AND status_code <> 499
-	`, startArg, endArg)
+	`, start.Format(time.RFC3339), end.Format(time.RFC3339))
 	if err != nil {
 		return nil, err
 	}
@@ -409,8 +407,8 @@ func (db *DB) getAccountEventTrendSQLite(ctx context.Context, start, end time.Ti
 	}
 
 	rows, err := db.conn.QueryContext(ctx,
-		`SELECT created_at, event_type, source FROM account_events WHERE created_at >= $1 AND created_at <= $2`,
-		sqliteComparableTime(start), sqliteComparableTime(end),
+		`SELECT created_at, event_type, source FROM account_events WHERE datetime(created_at) >= datetime($1) AND datetime(created_at) <= datetime($2)`,
+		start.Format(time.RFC3339), end.Format(time.RFC3339),
 	)
 	if err != nil {
 		return nil, err

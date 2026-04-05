@@ -889,12 +889,6 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	now := time.Now()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	minuteAgo := now.Add(-1 * time.Minute)
-	todayArg := interface{}(todayStart)
-	minuteAgoArg := interface{}(minuteAgo)
-	if db.isSQLite() {
-		todayArg = sqliteComparableTime(todayStart)
-		minuteAgoArg = sqliteComparableTime(minuteAgo)
-	}
 
 	todayQuery := `
 	SELECT
@@ -911,9 +905,28 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	WHERE created_at >= $1
 	  AND status_code <> 499
 	`
+	queryArgs := []interface{}{todayStart, minuteAgo}
+	if db.isSQLite() {
+		todayQuery = `
+		SELECT
+			COUNT(*) AS today_requests,
+			COALESCE(SUM(total_tokens), 0) AS today_tokens,
+			COALESCE(SUM(prompt_tokens), 0) AS today_prompt,
+			COALESCE(SUM(completion_tokens), 0) AS today_completion,
+			COALESCE(SUM(cached_tokens), 0) AS today_cached,
+			COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime($2) THEN 1 ELSE 0 END), 0) AS rpm,
+			COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime($2) THEN total_tokens ELSE 0 END), 0) AS tpm,
+			COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
+			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
+		FROM usage_logs
+		WHERE datetime(created_at) >= datetime($1)
+		  AND status_code <> 499
+		`
+		queryArgs = []interface{}{todayStart.Format(time.RFC3339), minuteAgo.Format(time.RFC3339)}
+	}
 
 	var todayErrors int64
-	err := db.conn.QueryRowContext(ctx, todayQuery, todayArg, minuteAgoArg).Scan(
+	err := db.conn.QueryRowContext(ctx, todayQuery, queryArgs...).Scan(
 		&stats.TodayRequests, &stats.TodayTokens, &stats.TotalPrompt, &stats.TotalCompletion, &stats.TotalCachedTokens,
 		&stats.RPM, &stats.TPM,
 		&stats.AvgDurationMs,
@@ -1233,13 +1246,22 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	           WHERE u.created_at >= $1 AND u.created_at <= $2
 	             AND u.status_code <> 499
 	           ORDER BY u.created_at ASC`
-	startArg := interface{}(start)
-	endArg := interface{}(end)
+	args := []interface{}{start, end}
 	if db.isSQLite() {
-		startArg = sqliteComparableTime(start)
-		endArg = sqliteComparableTime(end)
+		query = `SELECT u.id, u.account_id, u.endpoint, u.model, u.prompt_tokens, u.completion_tokens, u.total_tokens, u.status_code, u.duration_ms,
+		            COALESCE(u.input_tokens, 0), COALESCE(u.output_tokens, 0), COALESCE(u.reasoning_tokens, 0),
+		            COALESCE(u.first_token_ms, 0), COALESCE(u.reasoning_effort, ''), COALESCE(u.inbound_endpoint, ''),
+		            COALESCE(u.upstream_endpoint, ''), COALESCE(u.stream, false), COALESCE(u.cached_tokens, 0), COALESCE(u.service_tier, ''),
+		            COALESCE(u.api_key_id, 0), COALESCE(u.api_key_name, ''), COALESCE(u.api_key_masked, ''),
+		            COALESCE(CAST(a.credentials AS TEXT), '{}'), u.created_at
+		           FROM usage_logs u
+		           LEFT JOIN accounts a ON u.account_id = a.id
+		           WHERE datetime(u.created_at) >= datetime($1) AND datetime(u.created_at) <= datetime($2)
+		             AND u.status_code <> 499
+		           ORDER BY u.created_at ASC`
+		args = []interface{}{start.Format(time.RFC3339), end.Format(time.RFC3339)}
 	}
-	rows, err := db.conn.QueryContext(ctx, query, startArg, endArg)
+	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -1296,13 +1318,11 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 
 	// 动态拼接 WHERE 条件
 	where := `u.created_at >= $1 AND u.created_at <= $2 AND u.status_code <> 499`
-	startArg := interface{}(f.Start)
-	endArg := interface{}(f.End)
+	args := []interface{}{f.Start, f.End}
 	if db.isSQLite() {
-		startArg = sqliteComparableTime(f.Start)
-		endArg = sqliteComparableTime(f.End)
+		where = `datetime(u.created_at) >= datetime($1) AND datetime(u.created_at) <= datetime($2) AND u.status_code <> 499`
+		args = []interface{}{f.Start.Format(time.RFC3339), f.End.Format(time.RFC3339)}
 	}
-	args := []interface{}{startArg, endArg}
 	paramIdx := 3
 
 	if f.Email != "" {
@@ -1430,10 +1450,6 @@ type AccountRequestCount struct {
 // GetAccountRequestCounts 按 account_id 聚合近 7 天成功/失败请求数
 func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRequestCount, error) {
 	since := time.Now().AddDate(0, 0, -7)
-	sinceArg := interface{}(since)
-	if db.isSQLite() {
-		sinceArg = sqliteComparableTime(since)
-	}
 	query := `
 	SELECT account_id,
 		COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0) AS success_count,
@@ -1442,7 +1458,19 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 	WHERE created_at >= $1
 	GROUP BY account_id
 	`
-	rows, err := db.conn.QueryContext(ctx, query, sinceArg)
+	args := []interface{}{since}
+	if db.isSQLite() {
+		query = `
+		SELECT account_id,
+			COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0) AS success_count,
+			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count
+		FROM usage_logs
+		WHERE datetime(created_at) >= datetime($1)
+		GROUP BY account_id
+		`
+		args = []interface{}{since.Format(time.RFC3339)}
+	}
+	rows, err := db.conn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
