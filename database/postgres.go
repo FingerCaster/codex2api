@@ -889,6 +889,12 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	now := time.Now()
 	todayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
 	minuteAgo := now.Add(-1 * time.Minute)
+	todayArg := interface{}(todayStart)
+	minuteAgoArg := interface{}(minuteAgo)
+	if db.isSQLite() {
+		todayArg = sqliteComparableTime(todayStart)
+		minuteAgoArg = sqliteComparableTime(minuteAgo)
+	}
 
 	todayQuery := `
 	SELECT
@@ -907,7 +913,7 @@ func (db *DB) GetUsageStats(ctx context.Context) (*UsageStats, error) {
 	`
 
 	var todayErrors int64
-	err := db.conn.QueryRowContext(ctx, todayQuery, todayStart, minuteAgo).Scan(
+	err := db.conn.QueryRowContext(ctx, todayQuery, todayArg, minuteAgoArg).Scan(
 		&stats.TodayRequests, &stats.TodayTokens, &stats.TotalPrompt, &stats.TotalCompletion, &stats.TotalCachedTokens,
 		&stats.RPM, &stats.TPM,
 		&stats.AvgDurationMs,
@@ -1227,7 +1233,13 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 	           WHERE u.created_at >= $1 AND u.created_at <= $2
 	             AND u.status_code <> 499
 	           ORDER BY u.created_at ASC`
-	rows, err := db.conn.QueryContext(ctx, query, start, end)
+	startArg := interface{}(start)
+	endArg := interface{}(end)
+	if db.isSQLite() {
+		startArg = sqliteComparableTime(start)
+		endArg = sqliteComparableTime(end)
+	}
+	rows, err := db.conn.QueryContext(ctx, query, startArg, endArg)
 	if err != nil {
 		return nil, err
 	}
@@ -1284,7 +1296,13 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 
 	// 动态拼接 WHERE 条件
 	where := `u.created_at >= $1 AND u.created_at <= $2 AND u.status_code <> 499`
-	args := []interface{}{f.Start, f.End}
+	startArg := interface{}(f.Start)
+	endArg := interface{}(f.End)
+	if db.isSQLite() {
+		startArg = sqliteComparableTime(f.Start)
+		endArg = sqliteComparableTime(f.End)
+	}
+	args := []interface{}{startArg, endArg}
 	paramIdx := 3
 
 	if f.Email != "" {
@@ -1412,6 +1430,10 @@ type AccountRequestCount struct {
 // GetAccountRequestCounts 按 account_id 聚合近 7 天成功/失败请求数
 func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRequestCount, error) {
 	since := time.Now().AddDate(0, 0, -7)
+	sinceArg := interface{}(since)
+	if db.isSQLite() {
+		sinceArg = sqliteComparableTime(since)
+	}
 	query := `
 	SELECT account_id,
 		COALESCE(SUM(CASE WHEN status_code < 400 THEN 1 ELSE 0 END), 0) AS success_count,
@@ -1420,7 +1442,7 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 	WHERE created_at >= $1
 	GROUP BY account_id
 	`
-	rows, err := db.conn.QueryContext(ctx, query, since)
+	rows, err := db.conn.QueryContext(ctx, query, sinceArg)
 	if err != nil {
 		return nil, err
 	}

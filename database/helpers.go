@@ -9,6 +9,8 @@ import (
 	"time"
 )
 
+const sqliteTimestampLayout = "2006-01-02 15:04:05"
+
 func normalizeDriver(driver string) string {
 	driver = strings.TrimSpace(strings.ToLower(driver))
 	if driver == "" {
@@ -66,6 +68,13 @@ func parseDBTimeString(value string) (time.Time, error) {
 		}
 	}
 	return time.Time{}, fmt.Errorf("无法解析时间值: %q", value)
+}
+
+func sqliteComparableTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format(sqliteTimestampLayout)
 }
 
 func decodeCredentials(raw interface{}) map[string]interface{} {

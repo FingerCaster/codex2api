@@ -42,6 +42,8 @@ export default function Operations() {
   }, [reloadSilently])
 
   const updatedLabel = overview?.updated_at ? formatTimeLabel(overview.updated_at) : '--:--:--'
+  const databaseMetric = overview ? buildDatabaseMetric(overview, t) : null
+  const cacheMetric = overview ? buildCacheMetric(overview, t) : null
 
   return (
     <StateShell
@@ -104,19 +106,19 @@ export default function Operations() {
                     t={t}
                   />
                   <OpsMetricCard
-                    label={overview.database_label || t('ops.postgres')}
-                    value={`${overview.postgres.usage_percent.toFixed(1)}%`}
-                    sub={t('ops.pgConn', { open: overview.postgres.open, max: overview.postgres.max_open || '∞' })}
+                    label={databaseMetric?.label || overview.database_label || t('ops.postgres')}
+                    value={databaseMetric?.value || `${overview.postgres.usage_percent.toFixed(1)}%`}
+                    sub={databaseMetric?.sub || t('ops.pgConn', { open: overview.postgres.open, max: overview.postgres.max_open || '∞' })}
                     icon={<Database className="size-5" />}
-                    tone={overview.postgres.healthy ? getPercentTone(overview.postgres.usage_percent, 75, 90) : 'danger'}
+                    tone={databaseMetric?.tone || (overview.postgres.healthy ? getPercentTone(overview.postgres.usage_percent, 75, 90) : 'danger')}
                     t={t}
                   />
                   <OpsMetricCard
-                    label={overview.cache_label || t('ops.redis')}
-                    value={`${overview.redis.usage_percent.toFixed(1)}%`}
-                    sub={t('ops.redisConn', { open: overview.redis.total_conns, max: overview.redis.pool_size || '-' })}
+                    label={cacheMetric?.label || overview.cache_label || t('ops.redis')}
+                    value={cacheMetric?.value || `${overview.redis.usage_percent.toFixed(1)}%`}
+                    sub={cacheMetric?.sub || t('ops.redisConn', { open: overview.redis.total_conns, max: overview.redis.pool_size || '-' })}
                     icon={<Server className="size-5" />}
-                    tone={overview.redis.healthy ? getPercentTone(overview.redis.usage_percent, 70, 90) : 'danger'}
+                    tone={cacheMetric?.tone || (overview.redis.healthy ? getPercentTone(overview.redis.usage_percent, 70, 90) : 'danger')}
                     t={t}
                   />
                   <OpsMetricCard
@@ -300,4 +302,49 @@ function formatUptime(seconds: number, t: (key: string) => string): string {
     return `${hours}${t('ops.hours')} ${minutes}${t('ops.minutes')}`
   }
   return `${minutes}${t('ops.minutes')}`
+}
+
+function buildDatabaseMetric(
+  overview: OpsOverviewResponse,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): { label: string; value: string; sub: string; tone: MetricTone } {
+  if (overview.database_driver === 'sqlite') {
+    return {
+      label: overview.database_label || 'SQLite',
+      value: overview.postgres.healthy ? t('ops.sqliteReady') : t('common.danger'),
+      sub: t('ops.sqliteConn', {
+        open: overview.postgres.open,
+        max: overview.postgres.max_open || 1,
+      }),
+      tone: overview.postgres.healthy ? 'normal' : 'danger',
+    }
+  }
+
+  return {
+    label: overview.database_label || t('ops.postgres'),
+    value: `${overview.postgres.usage_percent.toFixed(1)}%`,
+    sub: t('ops.pgConn', { open: overview.postgres.open, max: overview.postgres.max_open || '∞' }),
+    tone: overview.postgres.healthy ? getPercentTone(overview.postgres.usage_percent, 75, 90) : 'danger',
+  }
+}
+
+function buildCacheMetric(
+  overview: OpsOverviewResponse,
+  t: (key: string, options?: Record<string, unknown>) => string,
+): { label: string; value: string; sub: string; tone: MetricTone } {
+  if (overview.cache_driver === 'memory') {
+    return {
+      label: overview.cache_label || 'Memory',
+      value: overview.redis.healthy ? t('ops.memoryCacheReady') : t('common.danger'),
+      sub: t('ops.memoryCacheDesc'),
+      tone: overview.redis.healthy ? 'normal' : 'danger',
+    }
+  }
+
+  return {
+    label: overview.cache_label || t('ops.redis'),
+    value: `${overview.redis.usage_percent.toFixed(1)}%`,
+    sub: t('ops.redisConn', { open: overview.redis.total_conns, max: overview.redis.pool_size || '-' }),
+    tone: overview.redis.healthy ? getPercentTone(overview.redis.usage_percent, 70, 90) : 'danger',
+  }
 }

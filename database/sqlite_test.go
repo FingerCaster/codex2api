@@ -145,3 +145,65 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 		}
 	}
 }
+
+func TestSQLiteTimeRangeQueriesHandleOffsetWindows(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	if err := db.InsertUsageLog(ctx, &UsageLogInput{
+		AccountID:       1,
+		Endpoint:        "/v1/responses",
+		Model:           "gpt-5.4",
+		StatusCode:      200,
+		DurationMs:      1234,
+		InputTokens:     100,
+		OutputTokens:    20,
+		TotalTokens:     120,
+		CachedTokens:    80,
+		ServiceTier:     "default",
+		ReasoningEffort: "high",
+	}); err != nil {
+		t.Fatalf("InsertUsageLog 返回错误: %v", err)
+	}
+	db.flushLogs()
+
+	var latestRaw interface{}
+	if err := db.conn.QueryRowContext(ctx, `SELECT created_at FROM usage_logs ORDER BY id DESC LIMIT 1`).Scan(&latestRaw); err != nil {
+		t.Fatalf("查询最新 created_at 返回错误: %v", err)
+	}
+	latestUTC, err := parseDBTimeValue(latestRaw)
+	if err != nil {
+		t.Fatalf("parseDBTimeValue 返回错误: %v", err)
+	}
+
+	localZone := time.FixedZone("CST", 8*60*60)
+	start := latestUTC.In(localZone).Add(-30 * time.Minute)
+	end := latestUTC.In(localZone).Add(30 * time.Minute)
+
+	page, err := db.ListUsageLogsByTimeRangePaged(ctx, UsageLogFilter{
+		Start:    start,
+		End:      end,
+		Page:     1,
+		PageSize: 10,
+	})
+	if err != nil {
+		t.Fatalf("ListUsageLogsByTimeRangePaged 返回错误: %v", err)
+	}
+	if page.Total != 1 || len(page.Logs) != 1 {
+		t.Fatalf("offset 窗口日志查询结果异常: total=%d len=%d, want 1/1", page.Total, len(page.Logs))
+	}
+
+	agg, err := db.GetChartAggregation(ctx, start, end, 5)
+	if err != nil {
+		t.Fatalf("GetChartAggregation 返回错误: %v", err)
+	}
+	if len(agg.Timeline) != 1 {
+		t.Fatalf("offset 窗口图表聚合结果异常: len=%d, want 1", len(agg.Timeline))
+	}
+}
