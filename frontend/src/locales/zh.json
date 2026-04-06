@@ -442,6 +442,7 @@
     "rangeEndDate": "结束日期",
     "rangeApply": "应用",
     "rangePreset": {
+      "all": "全部用量",
       "today": "今天",
       "yesterday": "昨天",
       "24h": "近24小时",

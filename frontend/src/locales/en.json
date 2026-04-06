@@ -442,6 +442,7 @@
     "rangeEndDate": "End Date",
     "rangeApply": "Apply",
     "rangePreset": {
+      "all": "All Usage",
       "today": "Today",
       "yesterday": "Yesterday",
       "24h": "Last 24 Hours",

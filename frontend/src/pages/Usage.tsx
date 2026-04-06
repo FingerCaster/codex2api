@@ -99,7 +99,7 @@ export default function Usage() {
   const { confirm, confirmDialog } = useConfirmDialog()
   const [page, setPage] = useState(1)
   const [clearing, setClearing] = useState(false)
-  const [rangeValue, setRangeValue] = useState(() => createUsageRangeValue('7d'))
+  const [rangeValue, setRangeValue] = useState(() => createUsageRangeValue('all'))
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)

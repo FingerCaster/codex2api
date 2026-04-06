@@ -6,6 +6,7 @@ import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
 
 export type UsageRangePreset =
+  | 'all'
   | 'today'
   | 'yesterday'
   | '24h'
@@ -22,12 +23,18 @@ export interface UsageRangeValue {
   endDate: string
 }
 
-const PRESET_BUTTONS: Exclude<UsageRangePreset, 'custom'>[] = ['today', 'yesterday', '24h', '7d', '14d', '30d', 'thisMonth', 'lastMonth']
+const PRESET_BUTTONS: Exclude<UsageRangePreset, 'custom'>[] = ['all', 'today', 'yesterday', '24h', '7d', '14d', '30d', 'thisMonth', 'lastMonth']
 
 export function createUsageRangeValue(preset: Exclude<UsageRangePreset, 'custom'>): UsageRangeValue {
   const now = new Date()
 
   switch (preset) {
+    case 'all':
+      return {
+        preset,
+        startDate: '2020-01-01',
+        endDate: formatDateInput(now),
+      }
     case 'today':
       return {
         preset,
@@ -90,6 +97,11 @@ export function getUsageRangeRequestRange(value: UsageRangeValue): { start: stri
   const now = new Date()
 
   switch (value.preset) {
+    case 'all':
+      return {
+        start: toLocalRFC3339(startOfDay(parseDateInput(value.startDate))),
+        end: toLocalRFC3339(now),
+      }
     case 'today':
       return {
         start: toLocalRFC3339(startOfDay(now)),
@@ -190,7 +202,7 @@ export default function UsageRangePicker({ value, onApply }: UsageRangePickerPro
       </button>
 
       {open ? (
-        <div className="absolute left-0 top-[calc(100%+0.75rem)] z-50 w-[324px] rounded-2xl border border-border bg-popover p-3 shadow-[0_20px_50px_hsl(220_35%_12%/0.18)]">
+        <div className="absolute right-0 top-[calc(100%+0.75rem)] z-50 w-[352px] max-w-[calc(100vw-1rem)] rounded-2xl border border-border bg-popover p-3 shadow-[0_20px_50px_hsl(220_35%_12%/0.18)]">
           <div className="grid grid-cols-2 gap-2">
             {PRESET_BUTTONS.map((preset) => {
               const active = draft.preset === preset
@@ -213,13 +225,13 @@ export default function UsageRangePicker({ value, onApply }: UsageRangePickerPro
           </div>
 
           <div className="mt-4 border-t border-border pt-4">
-            <div className="grid grid-cols-[1fr_auto_1fr] items-end gap-2">
-              <div>
+            <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-end gap-2">
+              <div className="min-w-0">
                 <div className="mb-1.5 text-xs text-muted-foreground">{t('usage.rangeStartDate')}</div>
                 <Input
                   type="date"
                   value={draft.startDate}
-                  className="h-10 text-sm"
+                  className="h-10 min-w-0 text-sm"
                   onChange={(event) => setDraft((current) => ({
                     ...current,
                     preset: 'custom',
@@ -228,12 +240,12 @@ export default function UsageRangePicker({ value, onApply }: UsageRangePickerPro
                 />
               </div>
               <div className="pb-2 text-muted-foreground">→</div>
-              <div>
+              <div className="min-w-0">
                 <div className="mb-1.5 text-xs text-muted-foreground">{t('usage.rangeEndDate')}</div>
                 <Input
                   type="date"
                   value={draft.endDate}
-                  className="h-10 text-sm"
+                  className="h-10 min-w-0 text-sm"
                   onChange={(event) => setDraft((current) => ({
                     ...current,
                     preset: 'custom',
