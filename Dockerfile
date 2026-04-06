@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-
 # ============================================================
 # Stage 1: 构建前端 (React + Vite)
 # 前端产物是纯静态文件，只需构建一次，与目标平台无关
@@ -22,8 +20,12 @@ RUN VITE_APP_VERSION=${BUILD_VERSION} npm run build
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS go-builder
 
 ARG TARGETARCH
+ARG GOPROXY=https://proxy.golang.org,direct
+ARG GOSUMDB=sum.golang.org
 
 WORKDIR /app
+ENV GOPROXY=${GOPROXY}
+ENV GOSUMDB=${GOSUMDB}
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod \
     go mod download
