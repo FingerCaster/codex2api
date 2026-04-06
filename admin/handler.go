@@ -1417,18 +1417,58 @@ func parseOptionalAPIKeyID(raw string) (*int64, error) {
 	return &parsed, nil
 }
 
+func parseUsageLogFilter(c *gin.Context) (database.UsageLogFilter, error) {
+	filter := database.UsageLogFilter{
+		Email:    c.Query("email"),
+		Model:    c.Query("model"),
+		Endpoint: c.Query("endpoint"),
+	}
+
+	startStr := c.Query("start")
+	endStr := c.Query("end")
+	if startStr != "" || endStr != "" {
+		if startStr == "" || endStr == "" {
+			return filter, fmt.Errorf("start/end 参数需要同时提供，且格式为 RFC3339")
+		}
+		startTime, e1 := time.Parse(time.RFC3339, startStr)
+		endTime, e2 := time.Parse(time.RFC3339, endStr)
+		if e1 != nil || e2 != nil {
+			return filter, fmt.Errorf("start/end 参数格式错误，需要 RFC3339 格式")
+		}
+		filter.Start = startTime
+		filter.End = endTime
+	}
+
+	apiKeyID, err := parseOptionalAPIKeyID(c.Query("api_key_id"))
+	if err != nil {
+		return filter, err
+	}
+	filter.APIKeyID = apiKeyID
+
+	if fastStr := c.Query("fast"); fastStr != "" {
+		v := fastStr == "true"
+		filter.FastOnly = &v
+	}
+	if streamStr := c.Query("stream"); streamStr != "" {
+		v := streamStr == "true"
+		filter.StreamOnly = &v
+	}
+
+	return filter, nil
+}
+
 // GetUsageStats 获取使用统计
 func (h *Handler) GetUsageStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
 
-	apiKeyID, err := parseOptionalAPIKeyID(c.Query("api_key_id"))
+	filter, err := parseUsageLogFilter(c)
 	if err != nil {
 		writeError(c, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	stats, err := h.db.GetUsageStatsByAPIKey(ctx, apiKeyID)
+	stats, err := h.db.GetUsageStatsByFilter(ctx, filter)
 	if err != nil {
 		writeInternalError(c, err)
 		return
@@ -1498,10 +1538,9 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 	endStr := c.Query("end")
 
 	if startStr != "" && endStr != "" {
-		startTime, e1 := time.Parse(time.RFC3339, startStr)
-		endTime, e2 := time.Parse(time.RFC3339, endStr)
-		if e1 != nil || e2 != nil {
-			writeError(c, http.StatusBadRequest, "start/end 参数格式错误，需要 RFC3339 格式")
+		filter, err := parseUsageLogFilter(c)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
 			return
 		}
 
@@ -1514,30 +1553,8 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 					pageSize = n
 				}
 			}
-			apiKeyID, err := parseOptionalAPIKeyID(c.Query("api_key_id"))
-			if err != nil {
-				writeError(c, http.StatusBadRequest, err.Error())
-				return
-			}
-
-			filter := database.UsageLogFilter{
-				Start:    startTime,
-				End:      endTime,
-				Page:     page,
-				PageSize: pageSize,
-				Email:    c.Query("email"),
-				Model:    c.Query("model"),
-				Endpoint: c.Query("endpoint"),
-				APIKeyID: apiKeyID,
-			}
-			if fastStr := c.Query("fast"); fastStr != "" {
-				v := fastStr == "true"
-				filter.FastOnly = &v
-			}
-			if streamStr := c.Query("stream"); streamStr != "" {
-				v := streamStr == "true"
-				filter.StreamOnly = &v
-			}
+			filter.Page = page
+			filter.PageSize = pageSize
 
 			result, err := h.db.ListUsageLogsByTimeRangePaged(ctx, filter)
 			if err != nil {
@@ -1549,7 +1566,7 @@ func (h *Handler) GetUsageLogs(c *gin.Context) {
 		}
 
 		// 无 page 参数 → 返回全量（Dashboard 图表聚合）
-		logs, err := h.db.ListUsageLogsByTimeRange(ctx, startTime, endTime)
+		logs, err := h.db.ListUsageLogsByTimeRange(ctx, filter.Start, filter.End)
 		if err != nil {
 			writeInternalError(c, err)
 			return

@@ -160,42 +160,43 @@ func TestGetUsageStatsByAPIKey(t *testing.T) {
 
 	logs := []*UsageLogInput{
 		{
-			AccountID:       1,
-			Endpoint:        "/v1/responses",
-			Model:           "gpt-5.4",
-			StatusCode:      200,
-			DurationMs:      100,
-			PromptTokens:    40,
+			AccountID:        1,
+			Endpoint:         "/v1/responses",
+			InboundEndpoint:  "/v1/responses",
+			Model:            "gpt-5.4",
+			StatusCode:       200,
+			DurationMs:       100,
+			PromptTokens:     40,
 			CompletionTokens: 60,
-			TotalTokens:     100,
-			CachedTokens:    10,
-			APIKeyID:        targetAPIKeyID,
-			APIKeyName:      "Team A",
+			TotalTokens:      100,
+			CachedTokens:     10,
+			APIKeyID:         targetAPIKeyID,
+			APIKeyName:       "Team A",
 		},
 		{
-			AccountID:       1,
-			Endpoint:        "/v1/responses",
-			Model:           "gpt-5.4-mini",
-			StatusCode:      401,
-			DurationMs:      200,
-			PromptTokens:    4,
+			AccountID:        1,
+			Endpoint:         "/v1/responses",
+			Model:            "gpt-5.4-mini",
+			StatusCode:       401,
+			DurationMs:       200,
+			PromptTokens:     4,
 			CompletionTokens: 6,
-			TotalTokens:     10,
-			APIKeyID:        targetAPIKeyID,
-			APIKeyName:      "Team A",
+			TotalTokens:      10,
+			APIKeyID:         targetAPIKeyID,
+			APIKeyName:       "Team A",
 		},
 		{
-			AccountID:       2,
-			Endpoint:        "/v1/chat/completions",
-			Model:           "gpt-5.4",
-			StatusCode:      200,
-			DurationMs:      300,
-			PromptTokens:    80,
+			AccountID:        2,
+			Endpoint:         "/v1/chat/completions",
+			Model:            "gpt-5.4",
+			StatusCode:       200,
+			DurationMs:       300,
+			PromptTokens:     80,
 			CompletionTokens: 120,
-			TotalTokens:     200,
-			CachedTokens:    20,
-			APIKeyID:        8,
-			APIKeyName:      "Team B",
+			TotalTokens:      200,
+			CachedTokens:     20,
+			APIKeyID:         8,
+			APIKeyName:       "Team B",
 		},
 	}
 
@@ -263,6 +264,99 @@ func TestGetUsageStatsByAPIKey(t *testing.T) {
 	}
 	if overallAfterClear.TotalTokens != 310 {
 		t.Fatalf("clear 后 TotalTokens = %d, want %d", overallAfterClear.TotalTokens, 310)
+	}
+}
+
+func TestGetUsageStatsByFilter(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	targetAPIKeyID := int64(7)
+
+	logs := []*UsageLogInput{
+		{
+			AccountID:        1,
+			Endpoint:         "/v1/responses",
+			InboundEndpoint:  "/v1/responses",
+			Model:            "gpt-5.4",
+			StatusCode:       200,
+			DurationMs:       120,
+			PromptTokens:     50,
+			CompletionTokens: 30,
+			TotalTokens:      80,
+			APIKeyID:         targetAPIKeyID,
+			APIKeyName:       "Team A",
+		},
+		{
+			AccountID:        1,
+			Endpoint:         "/v1/responses",
+			InboundEndpoint:  "/v1/responses",
+			Model:            "gpt-5.4-mini",
+			StatusCode:       500,
+			DurationMs:       240,
+			PromptTokens:     10,
+			CompletionTokens: 5,
+			TotalTokens:      15,
+			APIKeyID:         targetAPIKeyID,
+			APIKeyName:       "Team A",
+		},
+		{
+			AccountID:        2,
+			Endpoint:         "/v1/chat/completions",
+			InboundEndpoint:  "/v1/chat/completions",
+			Model:            "gpt-5.4-mini",
+			StatusCode:       200,
+			DurationMs:       360,
+			PromptTokens:     90,
+			CompletionTokens: 60,
+			TotalTokens:      150,
+			APIKeyID:         8,
+			APIKeyName:       "Team B",
+		},
+	}
+
+	for _, usageLog := range logs {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	stats, err := db.GetUsageStatsByFilter(ctx, UsageLogFilter{
+		Model:    "gpt-5.4",
+		Endpoint: "/v1/responses",
+		APIKeyID: &targetAPIKeyID,
+	})
+	if err != nil {
+		t.Fatalf("GetUsageStatsByFilter 返回错误: %v", err)
+	}
+
+	if stats.TotalRequests != 1 {
+		t.Fatalf("TotalRequests = %d, want %d", stats.TotalRequests, 1)
+	}
+	if stats.TotalTokens != 80 {
+		t.Fatalf("TotalTokens = %d, want %d", stats.TotalTokens, 80)
+	}
+	if stats.TotalPrompt != 50 {
+		t.Fatalf("TotalPrompt = %d, want %d", stats.TotalPrompt, 50)
+	}
+	if stats.TotalCompletion != 30 {
+		t.Fatalf("TotalCompletion = %d, want %d", stats.TotalCompletion, 30)
+	}
+	if stats.ErrorRate != 0 {
+		t.Fatalf("ErrorRate = %v, want %v", stats.ErrorRate, float64(0))
+	}
+	if stats.AvgDurationMs != 120 {
+		t.Fatalf("AvgDurationMs = %v, want %v", stats.AvgDurationMs, float64(120))
+	}
+	if stats.RPM != 0 || stats.TPM != 0 {
+		t.Fatalf("RPM/TPM = %v/%v, want 0/0 without explicit time range", stats.RPM, stats.TPM)
 	}
 }
 

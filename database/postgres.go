@@ -1332,8 +1332,8 @@ type UsageLogPage struct {
 
 // UsageLogFilter 日志查询过滤条件
 type UsageLogFilter struct {
-	Start      time.Time
-	End        time.Time
+	Start      time.Time // zero=不限制
+	End        time.Time // zero=不限制
 	Page       int
 	PageSize   int
 	Email      string // LIKE 模糊匹配
@@ -1342,6 +1342,117 @@ type UsageLogFilter struct {
 	APIKeyID   *int64 // nil=全部
 	FastOnly   *bool  // nil=全部, true=仅fast, false=仅非fast
 	StreamOnly *bool  // nil=全部, true=仅stream, false=仅sync
+}
+
+func (db *DB) buildUsageLogWhereClause(f UsageLogFilter) (string, []interface{}, int) {
+	conditions := []string{"u.status_code <> 499"}
+	args := make([]interface{}, 0, 8)
+	paramIdx := 1
+
+	if !f.Start.IsZero() {
+		if db.isSQLite() {
+			conditions = append(conditions, fmt.Sprintf(`datetime(u.created_at) >= datetime($%d)`, paramIdx))
+			args = append(args, f.Start.Format(time.RFC3339))
+		} else {
+			conditions = append(conditions, fmt.Sprintf(`u.created_at >= $%d`, paramIdx))
+			args = append(args, f.Start)
+		}
+		paramIdx++
+	}
+	if !f.End.IsZero() {
+		if db.isSQLite() {
+			conditions = append(conditions, fmt.Sprintf(`datetime(u.created_at) <= datetime($%d)`, paramIdx))
+			args = append(args, f.End.Format(time.RFC3339))
+		} else {
+			conditions = append(conditions, fmt.Sprintf(`u.created_at <= $%d`, paramIdx))
+			args = append(args, f.End)
+		}
+		paramIdx++
+	}
+	if f.Email != "" {
+		conditions = append(conditions, fmt.Sprintf(`LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER($%d)`, paramIdx))
+		args = append(args, "%"+f.Email+"%")
+		paramIdx++
+	}
+	if f.Model != "" {
+		conditions = append(conditions, fmt.Sprintf(`u.model = $%d`, paramIdx))
+		args = append(args, f.Model)
+		paramIdx++
+	}
+	if f.Endpoint != "" {
+		conditions = append(conditions, fmt.Sprintf(`u.inbound_endpoint = $%d`, paramIdx))
+		args = append(args, f.Endpoint)
+		paramIdx++
+	}
+	if f.APIKeyID != nil {
+		conditions = append(conditions, fmt.Sprintf(`COALESCE(u.api_key_id, 0) = $%d`, paramIdx))
+		args = append(args, *f.APIKeyID)
+		paramIdx++
+	}
+	if f.FastOnly != nil {
+		if *f.FastOnly {
+			conditions = append(conditions, `COALESCE(u.service_tier, '') = 'fast'`)
+		} else {
+			conditions = append(conditions, `COALESCE(u.service_tier, '') <> 'fast'`)
+		}
+	}
+	if f.StreamOnly != nil {
+		conditions = append(conditions, fmt.Sprintf(`COALESCE(u.stream, false) = $%d`, paramIdx))
+		args = append(args, *f.StreamOnly)
+		paramIdx++
+	}
+
+	return strings.Join(conditions, " AND "), args, paramIdx
+}
+
+// GetUsageStatsByFilter 获取按筛选条件统计的使用数据
+func (db *DB) GetUsageStatsByFilter(ctx context.Context, f UsageLogFilter) (*UsageStats, error) {
+	where, args, _ := db.buildUsageLogWhereClause(f)
+	stats := &UsageStats{}
+	var errorCount int64
+
+	query := `
+	SELECT
+		COUNT(*),
+		COALESCE(SUM(u.total_tokens), 0),
+		COALESCE(SUM(u.prompt_tokens), 0),
+		COALESCE(SUM(u.completion_tokens), 0),
+		COALESCE(SUM(u.cached_tokens), 0),
+		COALESCE(AVG(u.duration_ms), 0),
+		COALESCE(SUM(CASE WHEN u.status_code >= 400 THEN 1 ELSE 0 END), 0)
+	FROM usage_logs u
+	LEFT JOIN accounts a ON u.account_id = a.id
+	WHERE ` + where
+
+	if err := db.conn.QueryRowContext(ctx, query, args...).Scan(
+		&stats.TotalRequests,
+		&stats.TotalTokens,
+		&stats.TotalPrompt,
+		&stats.TotalCompletion,
+		&stats.TotalCachedTokens,
+		&stats.AvgDurationMs,
+		&errorCount,
+	); err != nil {
+		return nil, err
+	}
+
+	stats.TodayRequests = stats.TotalRequests
+	stats.TodayTokens = stats.TotalTokens
+
+	if stats.TotalRequests > 0 {
+		stats.ErrorRate = float64(errorCount) / float64(stats.TotalRequests) * 100
+	}
+
+	if !f.Start.IsZero() && !f.End.IsZero() && f.End.After(f.Start) {
+		minutes := f.End.Sub(f.Start).Minutes()
+		if minutes < 1 {
+			minutes = 1
+		}
+		stats.RPM = float64(stats.TotalRequests) / minutes
+		stats.TPM = float64(stats.TotalTokens) / minutes
+	}
+
+	return stats, nil
 }
 
 // ListUsageLogsByTimeRangePaged 按时间范围分页查询请求日志（支持筛选）
@@ -1353,47 +1464,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 		f.PageSize = 20
 	}
 
-	// 动态拼接 WHERE 条件
-	where := `u.created_at >= $1 AND u.created_at <= $2 AND u.status_code <> 499`
-	args := []interface{}{f.Start, f.End}
-	if db.isSQLite() {
-		where = `datetime(u.created_at) >= datetime($1) AND datetime(u.created_at) <= datetime($2) AND u.status_code <> 499`
-		args = []interface{}{f.Start.Format(time.RFC3339), f.End.Format(time.RFC3339)}
-	}
-	paramIdx := 3
-
-	if f.Email != "" {
-		where += fmt.Sprintf(` AND LOWER(COALESCE(CAST(a.credentials AS TEXT), '')) LIKE LOWER($%d)`, paramIdx)
-		args = append(args, "%"+f.Email+"%")
-		paramIdx++
-	}
-	if f.Model != "" {
-		where += fmt.Sprintf(` AND u.model = $%d`, paramIdx)
-		args = append(args, f.Model)
-		paramIdx++
-	}
-	if f.Endpoint != "" {
-		where += fmt.Sprintf(` AND u.inbound_endpoint = $%d`, paramIdx)
-		args = append(args, f.Endpoint)
-		paramIdx++
-	}
-	if f.APIKeyID != nil {
-		where += fmt.Sprintf(` AND COALESCE(u.api_key_id, 0) = $%d`, paramIdx)
-		args = append(args, *f.APIKeyID)
-		paramIdx++
-	}
-	if f.FastOnly != nil {
-		if *f.FastOnly {
-			where += ` AND COALESCE(u.service_tier, '') = 'fast'`
-		} else {
-			where += ` AND COALESCE(u.service_tier, '') <> 'fast'`
-		}
-	}
-	if f.StreamOnly != nil {
-		where += fmt.Sprintf(` AND COALESCE(u.stream, false) = $%d`, paramIdx)
-		args = append(args, *f.StreamOnly)
-		paramIdx++
-	}
+	where, args, paramIdx := db.buildUsageLogWhereClause(f)
 
 	offset := (f.Page - 1) * f.PageSize
 	where += fmt.Sprintf(` ORDER BY u.created_at DESC LIMIT $%d OFFSET $%d`, paramIdx, paramIdx+1)

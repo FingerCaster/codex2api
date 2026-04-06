@@ -1,12 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
-import { getTimeRangeISO } from '../components/DashboardUsageCharts'
-import type { TimeRangeKey } from '../components/DashboardUsageCharts'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
 import ToastNotice from '../components/ToastNotice'
+import UsageRangePicker, { createUsageRangeValue, getUsageRangeLabel, getUsageRangeRequestRange } from '../components/UsageRangePicker'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
@@ -72,8 +71,6 @@ function getStatusBadgeClassName(statusCode: number): string {
   return 'border-transparent bg-slate-500/14 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'
 }
 
-const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
-
 function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
   return apiKey.name ? `${apiKey.name} · ${apiKey.key}` : apiKey.key
 }
@@ -102,7 +99,7 @@ export default function Usage() {
   const { confirm, confirmDialog } = useConfirmDialog()
   const [page, setPage] = useState(1)
   const [clearing, setClearing] = useState(false)
-  const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
+  const [rangeValue, setRangeValue] = useState(() => createUsageRangeValue('7d'))
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
@@ -118,8 +115,6 @@ export default function Usage() {
   const showFastFilter = false
   const PAGE_SIZE = 20
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
-  const statsAPIKeyFilterRef = useRef('')
-  const didInitStatsScopeRef = useRef(false)
 
   // 搜索防抖：输入停止 400ms 后触发查询
   const handleSearchChange = useCallback((value: string) => {
@@ -131,15 +126,25 @@ export default function Usage() {
     }, 400)
   }, [])
 
-  useEffect(() => {
-    statsAPIKeyFilterRef.current = filterApiKeyId
-  }, [filterApiKeyId])
+  const requestRange = useMemo(
+    () => getUsageRangeRequestRange(rangeValue),
+    [rangeValue],
+  )
 
   // 仅加载轻量统计（秒级）
   const loadStats = useCallback(async () => {
-    const stats = await api.getUsageStats({ apiKeyId: statsAPIKeyFilterRef.current || undefined })
+    const stats = await api.getUsageStats({
+      start: requestRange.start,
+      end: requestRange.end,
+      email: searchEmail || undefined,
+      model: filterModel || undefined,
+      endpoint: filterEndpoint || undefined,
+      apiKeyId: filterApiKeyId || undefined,
+      fast: filterFast || undefined,
+      stream: filterStream || undefined,
+    })
     return { stats }
-  }, [])
+  }, [requestRange.end, requestRange.start, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: UsageStats | null
@@ -163,9 +168,11 @@ export default function Usage() {
   const loadLogs = useCallback(async () => {
     setLogsLoading(true)
     try {
-      const { start, end } = getTimeRangeISO(timeRange)
       const res = await api.getUsageLogsPaged({
-        start, end, page, pageSize: PAGE_SIZE,
+        start: requestRange.start,
+        end: requestRange.end,
+        page,
+        pageSize: PAGE_SIZE,
         email: searchEmail || undefined,
         model: filterModel || undefined,
         endpoint: filterEndpoint || undefined,
@@ -180,7 +187,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, page, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [requestRange.start, requestRange.end, page, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -198,30 +205,23 @@ export default function Usage() {
     return () => window.clearInterval(timer)
   }, [reloadSilently])
 
-  useEffect(() => {
-    if (!didInitStatsScopeRef.current) {
-      didInitStatsScopeRef.current = true
-      return
-    }
-    void reloadSilently()
-  }, [filterApiKeyId, reloadSilently])
-
   const { stats } = data
   const totalPages = Math.max(1, Math.ceil(logsTotal / PAGE_SIZE))
   const totalRequests = stats?.total_requests ?? 0
   const totalTokens = stats?.total_tokens ?? 0
   const totalPromptTokens = stats?.total_prompt_tokens ?? 0
   const totalCompletionTokens = stats?.total_completion_tokens ?? 0
-  const todayRequests = stats?.today_requests ?? 0
   const rpm = stats?.rpm ?? 0
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
   const avgDurationMs = stats?.avg_duration_ms ?? 0
-  const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
+  const errorRequests = Math.round(totalRequests * errorRate / 100)
+  const successRequests = Math.max(0, totalRequests - errorRequests)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
   const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
   const selectedAPIKey = apiKeys.find((apiKey) => String(apiKey.id) === filterApiKeyId) ?? null
   const selectedAPIKeyLabel = selectedAPIKey ? formatAPIKeyOptionLabel(selectedAPIKey) : ''
+  const selectedRangeLabel = getUsageRangeLabel(rangeValue, (key) => t(key))
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
@@ -244,11 +244,23 @@ export default function Usage() {
           onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
         />
 
-        {selectedAPIKeyLabel && (
-          <div className="mb-3 rounded-xl border border-blue-500/20 bg-blue-500/6 px-4 py-2 text-[12px] text-muted-foreground">
-            {t('usage.apiKeyScope', { name: selectedAPIKeyLabel })}
+        <div className="mb-4 flex items-start justify-between gap-4 rounded-2xl border border-border bg-card/70 px-4 py-4 max-sm:flex-col">
+          <div>
+            <div className="text-[13px] font-medium text-foreground">{t('usage.rangeTitle')}</div>
+            <div className="mt-1 text-xs text-muted-foreground">
+              {selectedAPIKeyLabel
+                ? t('usage.rangeSummaryWithKey', { range: selectedRangeLabel, name: selectedAPIKeyLabel })
+                : t('usage.rangeSummary', { range: selectedRangeLabel })}
+            </div>
           </div>
-        )}
+          <UsageRangePicker
+            value={rangeValue}
+            onApply={(nextValue) => {
+              setRangeValue(nextValue)
+              setPage(1)
+            }}
+          />
+        </div>
 
         {/* Top stats: 2 columns */}
         <div className="grid grid-cols-2 gap-3 mb-3 max-sm:grid-cols-1">
@@ -265,7 +277,7 @@ export default function Usage() {
               </div>
               <div className="text-[12px] text-muted-foreground leading-relaxed">
                 <span className="text-[hsl(var(--success))]">● {t('usage.success')}: {formatTokens(successRequests)}</span>
-                <span className="ml-2 text-muted-foreground">● {t('usage.today')}: {formatTokens(todayRequests)}</span>
+                <span className="ml-2 text-muted-foreground">● {t('usage.errors')}: {formatTokens(errorRequests)}</span>
               </div>
             </CardContent>
           </Card>
@@ -343,22 +355,6 @@ export default function Usage() {
             <div className="flex items-center justify-between gap-4 mb-4 flex-wrap">
               <div className="flex items-center gap-3">
                 <h3 className="text-base font-semibold text-foreground">{t('usage.requestLogs')}</h3>
-                <div className="inline-flex rounded-lg border border-border bg-muted/50 p-0.5">
-                  {TIME_RANGE_OPTIONS.map((key) => (
-                    <button
-                      key={key}
-                      type="button"
-                      onClick={() => { setTimeRange(key); setPage(1) }}
-                      className={`px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 ${
-                        timeRange === key
-                          ? 'bg-background text-foreground shadow-sm border border-border'
-                          : 'text-muted-foreground hover:text-foreground'
-                      }`}
-                    >
-                      {t(`dashboard.timeRange${key.toUpperCase()}`)}
-                    </button>
-                  ))}
-                </div>
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-xs text-muted-foreground">{logsLoading ? t('common.loading') : t('usage.recordsCount', { count: logsTotal })}</span>
