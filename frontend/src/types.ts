@@ -18,6 +18,10 @@ export interface StatsResponse {
 export interface AccountRow {
   id: number
   name: string
+  platform?: string
+  type?: string
+  provider_name?: string
+  base_url?: string
   email: string
   plan_type: string
   status: AccountStatus
@@ -67,6 +71,15 @@ export interface AddATAccountRequest {
   name?: string
   access_token: string
   proxy_url: string
+}
+
+export interface AddProviderKeyRequest {
+  name?: string
+  base_url: string
+  api_key: string
+  provider_name?: string
+  proxy_url: string
+  extra_headers?: Record<string, string>
 }
 
 export interface AccountModelStat {

@@ -8,11 +8,14 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -50,7 +53,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	hasToken := account.AccessToken != ""
 	account.Mu().RUnlock()
 
-	if !hasToken {
+	if !hasToken && !account.IsAPIKeyProvider() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "账号没有可用的 Access Token，请先刷新"})
 		return
 	}
@@ -69,10 +72,17 @@ func (h *Handler) TestConnection(c *gin.Context) {
 
 	// 构建最小测试请求体（参考 sub2api createOpenAITestPayload）
 	payload := buildTestPayload(testModel)
+	estimatedPromptTokens := estimateSimpleTokens(string(payload))
 
 	// 发送请求
 	start := time.Now()
-	resp, reqErr := proxy.ExecuteRequest(c.Request.Context(), account, payload, "", "", "", nil, nil)
+	var resp *http.Response
+	var reqErr error
+	if account.IsAPIKeyProvider() {
+		resp, reqErr = proxy.ExecuteGenericOpenAIRequest(c.Request.Context(), account, "/v1/responses", payload, "", true, nil)
+	} else {
+		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", "", "", nil, nil)
+	}
 	if reqErr != nil {
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("请求失败: %s", reqErr.Error())})
 		return
@@ -80,27 +90,40 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, account); ok {
-			h.store.PersistUsageSnapshot(account, usagePct)
-		}
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
-			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
-		case http.StatusTooManyRequests:
-			h.store.MarkCooldown(account, 5*time.Minute, "rate_limited")
+		if !account.IsAPIKeyProvider() {
+			if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, account); ok {
+				h.store.PersistUsageSnapshot(account, usagePct)
+			}
+			switch resp.StatusCode {
+			case http.StatusUnauthorized:
+				h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
+			case http.StatusTooManyRequests:
+				h.store.MarkCooldown(account, 5*time.Minute, "rate_limited")
+			}
 		}
 		errBody, _ := io.ReadAll(resp.Body)
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
 		return
 	}
 
-	usagePct, hasUsage := proxy.ParseCodexUsageHeaders(resp, account)
-	if hasUsage {
-		h.store.PersistUsageSnapshot(account, usagePct)
+	usagePct := 0.0
+	hasUsage := false
+	if !account.IsAPIKeyProvider() {
+		usagePct, hasUsage = proxy.ParseCodexUsageHeaders(resp, account)
+		if hasUsage {
+			h.store.PersistUsageSnapshot(account, usagePct)
+		}
 	}
 
 	// 解析 SSE 流
 	hasContent := false
+	var promptTokens int
+	var completionTokens int
+	var totalTokens int
+	var inputTokens int
+	var outputTokens int
+	var reasoningTokens int
+	var cachedTokens int
 	_ = proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
 		eventType := gjson.GetBytes(data, "type").String()
 
@@ -112,11 +135,63 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				sendTestEvent(c, testEvent{Type: "content", Text: delta})
 			}
 		case "response.completed":
+			usage := gjson.GetBytes(data, "response.usage")
+			if usage.Exists() {
+				promptTokens = int(usage.Get("prompt_tokens").Int())
+				completionTokens = int(usage.Get("completion_tokens").Int())
+				totalTokens = int(usage.Get("total_tokens").Int())
+				inputTokens = int(usage.Get("input_tokens").Int())
+				outputTokens = int(usage.Get("output_tokens").Int())
+				reasoningTokens = int(usage.Get("output_tokens_details.reasoning_tokens").Int())
+				cachedTokens = int(usage.Get("input_tokens_details.cached_tokens").Int())
+
+				if promptTokens == 0 {
+					promptTokens = inputTokens
+				}
+				if completionTokens == 0 {
+					completionTokens = outputTokens
+				}
+				if inputTokens == 0 {
+					inputTokens = promptTokens
+				}
+				if outputTokens == 0 {
+					outputTokens = completionTokens
+				}
+				if totalTokens == 0 {
+					totalTokens = inputTokens + outputTokens
+				}
+			}
 			// 只有用量未耗尽时才重置状态
-			if !hasUsage || usagePct < 100 {
+			if !account.IsAPIKeyProvider() && (!hasUsage || usagePct < 100) {
 				h.store.ClearCooldown(account)
 			}
 			duration := time.Since(start).Milliseconds()
+			if totalTokens == 0 && hasContent {
+				inputTokens = estimatedPromptTokens
+				promptTokens = estimatedPromptTokens
+				outputTokens = 1
+				completionTokens = 1
+				totalTokens = inputTokens + outputTokens
+			}
+			if h.db != nil {
+				_ = h.db.InsertUsageLog(context.Background(), &database.UsageLogInput{
+					AccountID:        account.ID(),
+					Endpoint:         "/api/admin/accounts/test",
+					Model:            testModel,
+					PromptTokens:     promptTokens,
+					CompletionTokens: completionTokens,
+					TotalTokens:      totalTokens,
+					StatusCode:       http.StatusOK,
+					DurationMs:       int(duration),
+					InputTokens:      inputTokens,
+					OutputTokens:     outputTokens,
+					ReasoningTokens:  reasoningTokens,
+					CachedTokens:     cachedTokens,
+					InboundEndpoint:  "/api/admin/accounts/test",
+					UpstreamEndpoint: "/v1/responses",
+					Stream:           true,
+				})
+			}
 			sendTestEvent(c, testEvent{
 				Type: "content",
 				Text: fmt.Sprintf("\n\n--- 耗时 %dms ---", duration),
@@ -180,6 +255,18 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+func estimateSimpleTokens(text string) int {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	count := utf8.RuneCountInString(text) / 4
+	if count < 1 {
+		count = 1
+	}
+	return count
 }
 
 // BatchTest 批量测试所有账号连接

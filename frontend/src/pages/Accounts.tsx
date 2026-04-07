@@ -10,7 +10,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
-import type { AccountRow, AddAccountRequest, AddATAccountRequest } from '../types'
+import type { AccountRow, AddAccountRequest, AddATAccountRequest, AddProviderKeyRequest } from '../types'
 import { getErrorMessage } from '../utils/error'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -27,6 +27,18 @@ import {
 import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
+
+function getAccountDisplayName(account: Pick<AccountRow, 'id' | 'email' | 'provider_name' | 'name' | 'base_url'>): string {
+  const email = (account.email || '').trim()
+  if (email) return email
+  const providerName = (account.provider_name || '').trim()
+  if (providerName) return providerName
+  const name = (account.name || '').trim()
+  if (name) return name
+  const baseURL = (account.base_url || '').trim()
+  if (baseURL) return baseURL
+  return `ID ${account.id}`
+}
 
 export default function Accounts() {
   const { t } = useTranslation()
@@ -64,9 +76,16 @@ export default function Accounts() {
   const [migrateKey, setMigrateKey] = useState('')
   const [migrating, setMigrating] = useState(false)
   const [importProgress, setImportProgress] = useState<{ show: boolean; current: number; total: number; success: number; duplicate: number; failed: number; done: boolean }>({ show: false, current: 0, total: 0, success: 0, duplicate: 0, failed: 0, done: false })
-  const [addMethod, setAddMethod] = useState<'rt' | 'at' | 'oauth'>('rt')
+  const [addMethod, setAddMethod] = useState<'rt' | 'at' | 'provider' | 'oauth'>('rt')
   const [atForm, setAtForm] = useState<AddATAccountRequest>({
     access_token: '',
+    proxy_url: '',
+  })
+  const [providerForm, setProviderForm] = useState<AddProviderKeyRequest>({
+    name: '',
+    base_url: '',
+    api_key: '',
+    provider_name: '',
     proxy_url: '',
   })
   const [oauthStep, setOauthStep] = useState<'generate' | 'exchange'>('generate')
@@ -145,7 +164,9 @@ export default function Accounts() {
       const q = searchQuery.toLowerCase()
       const email = (account.email || '').toLowerCase()
       const name = (account.name || '').toLowerCase()
-      if (!email.includes(q) && !name.includes(q)) return false
+      const providerName = (account.provider_name || '').toLowerCase()
+      const baseURL = (account.base_url || '').toLowerCase()
+      if (!email.includes(q) && !name.includes(q) && !providerName.includes(q) && !baseURL.includes(q)) return false
     }
     return true
   })
@@ -216,6 +237,22 @@ export default function Accounts() {
       showToast(t('accounts.addSuccess'))
       setShowAdd(false)
       setAtForm({ access_token: '', proxy_url: '' })
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.addFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  const handleAddProviderKey = async () => {
+    if (!providerForm.base_url.trim() || !providerForm.api_key.trim()) return
+    setSubmitting(true)
+    try {
+      await api.addProviderKey(providerForm)
+      showToast(t('accounts.addSuccess'))
+      setShowAdd(false)
+      setProviderForm({ name: '', base_url: '', api_key: '', provider_name: '', proxy_url: '' })
       void reload()
     } catch (error) {
       showToast(t('accounts.addFailed', { error: getErrorMessage(error) }), 'error')
@@ -565,7 +602,7 @@ export default function Accounts() {
   const handleDelete = async (account: AccountRow) => {
     const confirmed = await confirm({
       title: t('accounts.deleteTitle'),
-      description: t('accounts.deleteDesc', { account: account.email || `ID ${account.id}` }),
+      description: t('accounts.deleteDesc', { account: getAccountDisplayName(account) }),
       confirmText: t('accounts.deleteConfirm'),
       tone: 'destructive',
       confirmVariant: 'destructive',
@@ -581,6 +618,10 @@ export default function Accounts() {
   }
 
   const handleRefresh = async (account: AccountRow) => {
+    if (account.type === 'api_key') {
+      showToast(t('accounts.providerRefreshDisabled'), 'error')
+      return
+    }
     setRefreshingIds((prev) => new Set(prev).add(account.id))
     try {
       const result = await api.refreshAccount(account.id)
@@ -990,10 +1031,15 @@ export default function Accounts() {
                         </TableCell>
                         <TableCell className="text-[14px] font-mono text-muted-foreground">{account.id}</TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
-                          {account.email || '-'}
+                          {getAccountDisplayName(account)}
                           {account.at_only && (
                             <span className="ml-1.5 inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
                               AT
+                            </span>
+                          )}
+                          {account.type === 'api_key' && (
+                            <span className="ml-1.5 inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
+                              API
                             </span>
                           )}
                           {account.locked && (
@@ -1058,9 +1104,9 @@ export default function Accounts() {
                               variant="outline"
                               size="icon"
                               className="h-7 w-8 px-0"
-                              disabled={refreshingIds.has(account.id) || account.at_only}
+                              disabled={refreshingIds.has(account.id) || account.at_only || account.type === 'api_key'}
                               onClick={() => void handleRefresh(account)}
-                              title={account.at_only ? t('accounts.atRefreshDisabled') : t('accounts.refreshAccessToken')}
+                              title={account.type === 'api_key' ? t('accounts.providerRefreshDisabled') : account.at_only ? t('accounts.atRefreshDisabled') : t('accounts.refreshAccessToken')}
                             >
                               <RefreshCw className={`size-3.5 ${refreshingIds.has(account.id) ? 'animate-spin' : ''}`} />
                             </Button>
@@ -1123,6 +1169,7 @@ export default function Accounts() {
                   setOauthSession(null)
                   setOauthCallbackUrl('')
                   setOauthName('')
+                  setProviderForm({ name: '', base_url: '', api_key: '', provider_name: '', proxy_url: '' })
                 }}
               >
                 {t('common.cancel')}
@@ -1133,6 +1180,10 @@ export default function Accounts() {
                 </Button>
               ) : addMethod === 'at' ? (
                 <Button onClick={() => void handleAddAT()} disabled={submitting || !atForm.access_token.trim()}>
+                  {submitting ? t('accounts.adding') : t('accounts.submit')}
+                </Button>
+              ) : addMethod === 'provider' ? (
+                <Button onClick={() => void handleAddProviderKey()} disabled={submitting || !providerForm.base_url.trim() || !providerForm.api_key.trim()}>
                   {submitting ? t('accounts.adding') : t('accounts.submit')}
                 </Button>
               ) : oauthStep === 'generate' ? (
@@ -1173,6 +1224,17 @@ export default function Accounts() {
             >
               <Fingerprint className="size-3.5" />
               {t('accounts.addMethodAT')}
+            </button>
+            <button
+              onClick={() => setAddMethod('provider')}
+              className={`flex-1 flex items-center justify-center gap-1.5 rounded-lg py-2 text-sm font-semibold transition-all ${
+                addMethod === 'provider'
+                  ? 'bg-background shadow-sm text-foreground'
+                  : 'text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              <ExternalLink className="size-3.5" />
+              {t('accounts.addMethodProvider')}
             </button>
             <button
               onClick={() => { setAddMethod('oauth'); setOauthStep('generate'); setOauthSession(null); setOauthCallbackUrl('') }}
@@ -1236,6 +1298,63 @@ export default function Accounts() {
                   value={atForm.proxy_url}
                   onChange={(event: ChangeEvent<HTMLInputElement>) =>
                     setAtForm((form) => ({ ...form, proxy_url: event.target.value }))
+                  }
+                />
+              </div>
+            </div>
+          ) : addMethod === 'provider' ? (
+            <div className="space-y-4">
+              <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-300">
+                {t('accounts.providerWarning')}
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.providerNameLabel')}</label>
+                <Input
+                  placeholder={t('accounts.providerNamePlaceholder')}
+                  value={providerForm.provider_name || ''}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setProviderForm((form) => ({ ...form, provider_name: event.target.value }))
+                  }
+                />
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.baseUrlLabel')} *</label>
+                <Input
+                  placeholder={t('accounts.baseUrlPlaceholder')}
+                  value={providerForm.base_url}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setProviderForm((form) => ({ ...form, base_url: event.target.value }))
+                  }
+                />
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.providerApiKeyLabel')} *</label>
+                <Input
+                  type="password"
+                  placeholder={t('accounts.providerApiKeyPlaceholder')}
+                  value={providerForm.api_key}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setProviderForm((form) => ({ ...form, api_key: event.target.value }))
+                  }
+                />
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.nameLabel')}</label>
+                <Input
+                  placeholder={t('accounts.providerNodeNamePlaceholder')}
+                  value={providerForm.name || ''}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setProviderForm((form) => ({ ...form, name: event.target.value }))
+                  }
+                />
+              </div>
+              <div>
+                <label className="block mb-2 text-sm font-semibold text-muted-foreground">{t('accounts.proxyUrl')}</label>
+                <Input
+                  placeholder={t('accounts.proxyUrlPlaceholder')}
+                  value={providerForm.proxy_url}
+                  onChange={(event: ChangeEvent<HTMLInputElement>) =>
+                    setProviderForm((form) => ({ ...form, proxy_url: event.target.value }))
                   }
                 />
               </div>
@@ -1835,7 +1954,7 @@ function TestConnectionModal({
   return (
     <Modal
       show={true}
-      title={t('accounts.testConnectionTitle', { account: account.email || `ID ${account.id}` })}
+      title={t('accounts.testConnectionTitle', { account: getAccountDisplayName(account) })}
       onClose={() => {
         abortRef.current?.abort()
         onClose()

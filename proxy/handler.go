@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
@@ -41,6 +42,28 @@ func (h *Handler) nextAccountForSession(sessionID string, exclude map[int64]bool
 		return nil, ""
 	}
 	return h.store.NextForSession(sessionID, exclude)
+}
+
+func (h *Handler) nextCompatibleAccountForSession(ctx context.Context, sessionID string, exclude map[int64]bool, timeout time.Duration, predicate func(*auth.Account) bool) (*auth.Account, string) {
+	waited := false
+	for {
+		account, stickyProxyURL := h.nextAccountForSession(sessionID, exclude)
+		if account == nil {
+			if waited {
+				return nil, ""
+			}
+			account, stickyProxyURL = h.store.WaitForSessionAvailable(ctx, sessionID, timeout, exclude)
+			waited = true
+			if account == nil {
+				return nil, ""
+			}
+		}
+		if predicate == nil || predicate(account) {
+			return account, stickyProxyURL
+		}
+		h.store.Release(account)
+		exclude[account.ID()] = true
+	}
 }
 
 type usageLimitDetails struct {
@@ -173,6 +196,210 @@ func populateAPIKeyMetaFromContext(c *gin.Context, input *database.UsageLogInput
 func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInput) {
 	populateAPIKeyMetaFromContext(c, input)
 	h.logUsage(input)
+}
+
+func estimateTokenCount(text string) int {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	count := utf8.RuneCountInString(text) / 4
+	if count < 1 {
+		count = 1
+	}
+	return count
+}
+
+func estimatePromptTokensFromBody(body []byte) int {
+	if len(body) == 0 {
+		return 0
+	}
+	return estimateTokenCount(string(body))
+}
+
+func estimateOutputTokensFromOpenAIBody(body []byte) int {
+	if len(body) == 0 {
+		return 0
+	}
+	if text := gjson.GetBytes(body, "choices.0.message.content").String(); text != "" {
+		return estimateTokenCount(text)
+	}
+	if text := gjson.GetBytes(body, "output.0.content.0.text").String(); text != "" {
+		return estimateTokenCount(text)
+	}
+	if text := gjson.GetBytes(body, "response.output.0.content.0.text").String(); text != "" {
+		return estimateTokenCount(text)
+	}
+	return 0
+}
+
+func copyGenericResponseHeaders(c *gin.Context, resp *http.Response) {
+	if c == nil || resp == nil {
+		return
+	}
+	for key, values := range resp.Header {
+		lowerKey := strings.ToLower(key)
+		switch lowerKey {
+		case "content-type", "cache-control", "x-request-id", "openai-processing-ms":
+			for _, value := range values {
+				c.Writer.Header().Add(key, value)
+			}
+		}
+	}
+}
+
+func extractUsageFromOpenAIBody(body []byte) *UsageInfo {
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return nil
+	}
+
+	usagePath := "usage"
+	if !gjson.GetBytes(body, usagePath).Exists() && gjson.GetBytes(body, "response.usage").Exists() {
+		usagePath = "response.usage"
+	}
+	if !gjson.GetBytes(body, usagePath).Exists() {
+		return nil
+	}
+
+	info := &UsageInfo{
+		PromptTokens:     int(gjson.GetBytes(body, usagePath+".prompt_tokens").Int()),
+		CompletionTokens: int(gjson.GetBytes(body, usagePath+".completion_tokens").Int()),
+		TotalTokens:      int(gjson.GetBytes(body, usagePath+".total_tokens").Int()),
+		InputTokens:      int(gjson.GetBytes(body, usagePath+".input_tokens").Int()),
+		OutputTokens:     int(gjson.GetBytes(body, usagePath+".output_tokens").Int()),
+		ReasoningTokens:  int(gjson.GetBytes(body, usagePath+".reasoning_tokens").Int()),
+		CachedTokens:     int(gjson.GetBytes(body, usagePath+".cached_tokens").Int()),
+	}
+	if info.InputTokens == 0 {
+		info.InputTokens = info.PromptTokens
+	}
+	if info.OutputTokens == 0 {
+		info.OutputTokens = info.CompletionTokens
+	}
+	if info.TotalTokens == 0 {
+		info.TotalTokens = info.InputTokens + info.OutputTokens
+	}
+	if info.TotalTokens == 0 && info.PromptTokens == 0 && info.CompletionTokens == 0 && info.ReasoningTokens == 0 && info.CachedTokens == 0 {
+		return nil
+	}
+	return info
+}
+
+func (h *Handler) proxyGenericOpenAIResponse(c *gin.Context, resp *http.Response, account *auth.Account, input *database.UsageLogInput) {
+	defer resp.Body.Close()
+	copyGenericResponseHeaders(c, resp)
+
+	if input == nil {
+		input = &database.UsageLogInput{}
+	}
+	input.StatusCode = resp.StatusCode
+
+	if input.Stream {
+		c.Status(resp.StatusCode)
+		flusher, _ := c.Writer.(http.Flusher)
+		streamStart := time.Now()
+		outputChars := 0
+		_ = ReadSSEStream(resp.Body, func(data []byte) bool {
+			parsed := gjson.ParseBytes(data)
+			eventType := parsed.Get("type").String()
+			if input.FirstTokenMs == 0 {
+				if eventType == "response.output_text.delta" || parsed.Get("choices.0.delta.content").Exists() {
+					input.FirstTokenMs = int(time.Since(streamStart).Milliseconds())
+				}
+			}
+			if delta := parsed.Get("delta").String(); delta != "" {
+				outputChars += utf8.RuneCountInString(delta)
+			}
+			if delta := parsed.Get("choices.0.delta.content").String(); delta != "" {
+				outputChars += utf8.RuneCountInString(delta)
+			}
+
+			if eventType == "response.completed" {
+				if usage := extractUsageFromResult(parsed.Get("response.usage")); usage != nil {
+					input.PromptTokens = usage.PromptTokens
+					input.CompletionTokens = usage.CompletionTokens
+					input.TotalTokens = usage.TotalTokens
+					input.InputTokens = usage.InputTokens
+					input.OutputTokens = usage.OutputTokens
+					input.ReasoningTokens = usage.ReasoningTokens
+					input.CachedTokens = usage.CachedTokens
+				}
+			} else if parsed.Get("usage").Exists() {
+				if usage := extractUsageFromOpenAIBody(data); usage != nil {
+					input.PromptTokens = usage.PromptTokens
+					input.CompletionTokens = usage.CompletionTokens
+					input.TotalTokens = usage.TotalTokens
+					input.InputTokens = usage.InputTokens
+					input.OutputTokens = usage.OutputTokens
+					input.ReasoningTokens = usage.ReasoningTokens
+					input.CachedTokens = usage.CachedTokens
+				}
+			}
+
+			if _, err := fmt.Fprintf(c.Writer, "data: %s\n\n", data); err != nil {
+				return false
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return true
+		})
+		if input.TotalTokens == 0 && outputChars > 0 {
+			outputTokens := outputChars / 4
+			if outputTokens < 1 {
+				outputTokens = 1
+			}
+			input.OutputTokens = outputTokens
+			input.CompletionTokens = outputTokens
+			if input.InputTokens == 0 && input.PromptTokens > 0 {
+				input.InputTokens = input.PromptTokens
+			}
+			input.TotalTokens = input.InputTokens + input.OutputTokens
+		}
+		h.logUsageForRequest(c, input)
+		h.store.ReportRequestSuccess(account, time.Duration(input.DurationMs)*time.Millisecond)
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		ErrorToGinResponse(c, ErrUpstream(resp.StatusCode, "读取上游响应失败", err))
+		h.store.ReportRequestFailure(account, "transport", time.Duration(input.DurationMs)*time.Millisecond)
+		return
+	}
+
+	if usage := extractUsageFromOpenAIBody(body); usage != nil {
+		input.PromptTokens = usage.PromptTokens
+		input.CompletionTokens = usage.CompletionTokens
+		input.TotalTokens = usage.TotalTokens
+		input.InputTokens = usage.InputTokens
+		input.OutputTokens = usage.OutputTokens
+		input.ReasoningTokens = usage.ReasoningTokens
+		input.CachedTokens = usage.CachedTokens
+	} else {
+		if input.InputTokens == 0 && input.PromptTokens > 0 {
+			input.InputTokens = input.PromptTokens
+		}
+		if outputTokens := estimateOutputTokensFromOpenAIBody(body); outputTokens > 0 {
+			input.OutputTokens = outputTokens
+			input.CompletionTokens = outputTokens
+			input.TotalTokens = input.InputTokens + input.OutputTokens
+		}
+	}
+
+	if !gjson.ValidBytes(body) && strings.Contains(strings.ToLower(resp.Header.Get("content-type")), "json") {
+		ErrorToGinResponse(c, ErrUpstream(resp.StatusCode, "上游返回了无效 JSON", errors.New("invalid json")))
+		h.store.ReportRequestFailure(account, "server", time.Duration(input.DurationMs)*time.Millisecond)
+		return
+	}
+
+	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
+	h.logUsageForRequest(c, input)
+	if resp.StatusCode >= 400 {
+		h.store.ReportRequestFailure(account, classifyHTTPFailure(resp.StatusCode), time.Duration(input.DurationMs)*time.Millisecond)
+	} else {
+		h.store.ReportRequestSuccess(account, time.Duration(input.DurationMs)*time.Millisecond)
+	}
 }
 
 // extractReasoningEffort 从请求体提取推理强度
@@ -451,20 +678,16 @@ func (h *Handler) Responses(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextCompatibleAccountForSession(c.Request.Context(), sessionID, excludeAccounts, 30*time.Second, nil)
 		if account == nil {
-			// 排队等待可用账号（最多 30s）
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
-			if account == nil {
-				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
-					return
-				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
-				})
+			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
+			})
+			return
 		}
 
 		start := time.Now()
@@ -489,7 +712,13 @@ func (h *Handler) Responses(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		var resp *http.Response
+		var reqErr error
+		if account.IsAPIKeyProvider() {
+			resp, reqErr = ExecuteGenericOpenAIRequest(c.Request.Context(), account, "/v1/responses", rawBody, proxyURL, isStream, downstreamHeaders)
+		} else {
+			resp, reqErr = ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		}
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -515,8 +744,10 @@ func (h *Handler) Responses(c *gin.Context) {
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
+			if !account.IsAPIKeyProvider() {
+				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
+					h.store.PersistUsageSnapshot(account, usagePct)
+				}
 			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -526,7 +757,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/responses", resp.StatusCode, model, account.ID(), errBody)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			logInput := &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/responses",
 				Model:            model,
@@ -537,8 +768,11 @@ func (h *Handler) Responses(c *gin.Context) {
 				UpstreamEndpoint: "/v1/responses",
 				Stream:           isStream,
 				ServiceTier:      serviceTier,
-			})
-			h.applyCooldown(account, resp.StatusCode, errBody, resp)
+			}
+			h.logUsageForRequest(c, logInput)
+			if !account.IsAPIKeyProvider() {
+				h.applyCooldown(account, resp.StatusCode, errBody, resp)
+			}
 
 			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
@@ -547,6 +781,32 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			return
+		}
+
+		if account.IsAPIKeyProvider() {
+			h.store.BindSessionAffinity(sessionID, account, proxyURL)
+			account.Mu().RLock()
+			c.Set("x-account-email", account.ProviderName)
+			account.Mu().RUnlock()
+			c.Set("x-account-proxy", proxyURL)
+			c.Set("x-model", model)
+			c.Set("x-reasoning-effort", reasoningEffort)
+			c.Set("x-service-tier", serviceTier)
+			h.proxyGenericOpenAIResponse(c, resp, account, &database.UsageLogInput{
+				AccountID:        account.ID(),
+				Endpoint:         "/v1/responses",
+				Model:            model,
+				DurationMs:       durationMs,
+				PromptTokens:     estimatePromptTokensFromBody(rawBody),
+				InputTokens:      estimatePromptTokensFromBody(rawBody),
+				ReasoningEffort:  reasoningEffort,
+				InboundEndpoint:  "/v1/responses",
+				UpstreamEndpoint: "/v1/responses",
+				Stream:           isStream,
+				ServiceTier:      serviceTier,
+			})
+			h.store.Release(account)
 			return
 		}
 
@@ -822,20 +1082,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextCompatibleAccountForSession(c.Request.Context(), sessionID, excludeAccounts, 30*time.Second, nil)
 		if account == nil {
-			// 排队等待可用账号（最多 30s）
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
-			if account == nil {
-				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
-					return
-				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
-				})
+			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 				return
 			}
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
+			})
+			return
 		}
 
 		start := time.Now()
@@ -860,7 +1116,13 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		// 透传下游请求头用于指纹学习
 		downstreamHeaders := c.Request.Header.Clone()
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		var resp *http.Response
+		var reqErr error
+		if account.IsAPIKeyProvider() {
+			resp, reqErr = ExecuteGenericOpenAIRequest(c.Request.Context(), account, "/v1/chat/completions", rawBody, proxyURL, isStream, downstreamHeaders)
+		} else {
+			resp, reqErr = ExecuteRequest(c.Request.Context(), account, codexBody, sessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		}
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -886,8 +1148,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
+			if !account.IsAPIKeyProvider() {
+				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
+					h.store.PersistUsageSnapshot(account, usagePct)
+				}
 			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -897,7 +1161,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/chat/completions", resp.StatusCode, model, account.ID(), errBody)
-			h.logUsageForRequest(c, &database.UsageLogInput{
+			logInput := &database.UsageLogInput{
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/chat/completions",
 				Model:            model,
@@ -908,8 +1172,14 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				UpstreamEndpoint: "/v1/responses",
 				Stream:           isStream,
 				ServiceTier:      serviceTier,
-			})
-			h.applyCooldown(account, resp.StatusCode, errBody, resp)
+			}
+			if account.IsAPIKeyProvider() {
+				logInput.UpstreamEndpoint = "/v1/chat/completions"
+			}
+			h.logUsageForRequest(c, logInput)
+			if !account.IsAPIKeyProvider() {
+				h.applyCooldown(account, resp.StatusCode, errBody, resp)
+			}
 
 			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
 				lastStatusCode = resp.StatusCode
@@ -918,6 +1188,32 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			}
 
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			return
+		}
+
+		if account.IsAPIKeyProvider() {
+			h.store.BindSessionAffinity(sessionID, account, proxyURL)
+			account.Mu().RLock()
+			c.Set("x-account-email", account.ProviderName)
+			account.Mu().RUnlock()
+			c.Set("x-account-proxy", proxyURL)
+			c.Set("x-model", model)
+			c.Set("x-reasoning-effort", reasoningEffort)
+			c.Set("x-service-tier", serviceTier)
+			h.proxyGenericOpenAIResponse(c, resp, account, &database.UsageLogInput{
+				AccountID:        account.ID(),
+				Endpoint:         "/v1/chat/completions",
+				Model:            model,
+				DurationMs:       durationMs,
+				PromptTokens:     estimatePromptTokensFromBody(rawBody),
+				InputTokens:      estimatePromptTokensFromBody(rawBody),
+				ReasoningEffort:  reasoningEffort,
+				InboundEndpoint:  "/v1/chat/completions",
+				UpstreamEndpoint: "/v1/chat/completions",
+				Stream:           isStream,
+				ServiceTier:      serviceTier,
+			})
+			h.store.Release(account)
 			return
 		}
 

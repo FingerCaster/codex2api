@@ -40,8 +40,14 @@ const (
 type Account struct {
 	mu             sync.RWMutex
 	DBID           int64 // 数据库 ID
+	Platform       string
+	Type           string
 	RefreshToken   string
 	AccessToken    string
+	BaseURL        string
+	APIKey         string
+	ProviderName   string
+	ExtraHeaders   map[string]string
 	ExpiresAt      time.Time
 	AccountID      string
 	Email          string
@@ -387,11 +393,35 @@ func (a *Account) IsAvailable() bool {
 	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
 		return false
 	}
+	if a.Type == "api_key" {
+		return a.BaseURL != "" && a.APIKey != ""
+	}
 	// 冷却期过了自动恢复
 	if a.Status == StatusCooldown && !time.Now().Before(a.CooldownUtil) {
 		return a.AccessToken != ""
 	}
 	return a.AccessToken != ""
+}
+
+func (a *Account) IsAPIKeyProvider() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.Type == "api_key" && a.BaseURL != "" && a.APIKey != ""
+}
+
+func (a *Account) GenericUpstream() (baseURL string, apiKey string, extraHeaders map[string]string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	baseURL = a.BaseURL
+	apiKey = a.APIKey
+	if len(a.ExtraHeaders) > 0 {
+		extraHeaders = make(map[string]string, len(a.ExtraHeaders))
+		for key, value := range a.ExtraHeaders {
+			extraHeaders[key] = value
+		}
+	}
+	return baseURL, apiKey, extraHeaders
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -483,6 +513,9 @@ func (a *Account) RuntimeStatus() string {
 		}
 		return "active" // 冷却过期，已恢复
 	default:
+		if a.Type == "api_key" && a.BaseURL != "" && a.APIKey != "" {
+			return "active"
+		}
 		if a.AccessToken != "" {
 			return "active"
 		}
@@ -1042,6 +1075,53 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 	for _, row := range rows {
 		rt := row.GetCredential("refresh_token")
 		at := row.GetCredential("access_token")
+		if row.Type == "api_key" {
+			baseURL := row.GetCredential("base_url")
+			apiKey := row.GetCredential("api_key")
+			if baseURL == "" || apiKey == "" {
+				log.Printf("[账号 %d] 缺少 base_url 或 api_key，跳过", row.ID)
+				continue
+			}
+
+			proxy := row.ProxyURL
+			if proxy == "" {
+				proxy = s.globalProxy
+			}
+
+			account := &Account{
+				DBID:         row.ID,
+				Platform:     row.Platform,
+				Type:         row.Type,
+				BaseURL:      baseURL,
+				APIKey:       apiKey,
+				ProviderName: row.GetCredential("provider_name"),
+				ProxyURL:     proxy,
+				HealthTier:   HealthTierHealthy,
+				AddedAt:      row.CreatedAt.UnixNano(),
+			}
+			if row.Locked {
+				atomic.StoreInt32(&account.Locked, 1)
+			}
+			if headers, ok := row.Credentials["extra_headers"].(map[string]interface{}); ok {
+				account.ExtraHeaders = make(map[string]string, len(headers))
+				for key, value := range headers {
+					if str, ok := value.(string); ok && strings.TrimSpace(str) != "" {
+						account.ExtraHeaders[key] = str
+					}
+				}
+			}
+			if row.CooldownUntil.Valid {
+				if time.Now().Before(row.CooldownUntil.Time) {
+					account.SetCooldownUntil(row.CooldownUntil.Time, row.CooldownReason)
+				} else if row.CooldownReason != "" {
+					if err := s.db.ClearCooldown(ctx, row.ID); err != nil {
+						log.Printf("[账号 %d] 清理过期冷却状态失败: %v", row.ID, err)
+					}
+				}
+			}
+			s.accounts = append(s.accounts, account)
+			continue
+		}
 		if rt == "" && at == "" {
 			log.Printf("[账号 %d] 缺少 refresh_token 和 access_token，跳过", row.ID)
 			continue
@@ -1054,6 +1134,8 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 
 		account := &Account{
 			DBID:         row.ID,
+			Platform:     row.Platform,
+			Type:         row.Type,
 			RefreshToken: rt,
 			ProxyURL:     proxy,
 			HealthTier:   HealthTierWarm,

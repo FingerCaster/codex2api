@@ -1870,6 +1870,20 @@ func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken stri
 	)
 }
 
+// InsertProviderAccount 插入通用上游账号节点（例如 base_url + api_key）
+func (db *DB) InsertProviderAccount(ctx context.Context, name string, platform string, accountType string, credentials map[string]interface{}, proxyURL string) (int64, error) {
+	credJSON, err := json.Marshal(credentials)
+	if err != nil {
+		return 0, err
+	}
+
+	return db.insertRowID(ctx,
+		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
+		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, $2, $3, $4, $5)`,
+		name, platform, accountType, credJSON, proxyURL,
+	)
+}
+
 // GetAllAccessTokens 获取所有已存在的 access_token（用于 AT 导入去重）
 func (db *DB) GetAllAccessTokens(ctx context.Context) (map[string]bool, error) {
 	rows, err := db.conn.QueryContext(ctx, `SELECT credentials FROM accounts`)

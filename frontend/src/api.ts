@@ -3,6 +3,7 @@ import type {
   AccountUsageDetail,
   AddAccountRequest,
   AddATAccountRequest,
+  AddProviderKeyRequest,
   AdminErrorResponse,
   APIKeysResponse,
   AccountsResponse,
@@ -99,6 +100,8 @@ export const api = {
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
     request<CreateAccountResponse>('/accounts/at', { method: 'POST', body: JSON.stringify(data) }),
+  addProviderKey: (data: AddProviderKeyRequest) =>
+    request<CreateAccountResponse>('/accounts/provider-key', { method: 'POST', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
   refreshAccount: (id: number) =>
