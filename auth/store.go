@@ -94,6 +94,7 @@ type Account struct {
 	TotalRequests  int64 // 累计总请求数
 	LastUsedAt     int64 // 最后使用时间（UnixNano）
 	Disabled       int32 // 原子标志，1 = 立即不可调度（401 时瞬间置位，无需等锁）
+	ManualDisabled int32 // 原子标志，1 = 管理员手动禁用，不参与调度
 	AddedAt        int64 // 加入号池的时间（UnixNano），用于过期清理
 	Locked         int32 // 原子标志，1 = 锁定，自动清理跳过此账号
 
@@ -376,6 +377,9 @@ func (a *Account) IsAvailable() bool {
 	if atomic.LoadInt32(&a.Disabled) != 0 {
 		return false
 	}
+	if atomic.LoadInt32(&a.ManualDisabled) != 0 {
+		return false
+	}
 
 	a.mu.RLock()
 	defer a.mu.RUnlock()
@@ -492,6 +496,9 @@ func (a *Account) IsBanned() bool {
 
 // RuntimeStatus 返回运行时状态字符串（供 admin API 使用）
 func (a *Account) RuntimeStatus() string {
+	if atomic.LoadInt32(&a.ManualDisabled) != 0 {
+		return "disabled"
+	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if a.healthTierLocked() == HealthTierBanned {
@@ -1102,6 +1109,9 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 			if row.Locked {
 				atomic.StoreInt32(&account.Locked, 1)
 			}
+			if row.Disabled {
+				atomic.StoreInt32(&account.ManualDisabled, 1)
+			}
 			if headers, ok := row.Credentials["extra_headers"].(map[string]interface{}); ok {
 				account.ExtraHeaders = make(map[string]string, len(headers))
 				for key, value := range headers {
@@ -1143,6 +1153,9 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		}
 		if row.Locked {
 			atomic.StoreInt32(&account.Locked, 1)
+		}
+		if row.Disabled {
+			atomic.StoreInt32(&account.ManualDisabled, 1)
 		}
 
 		// 尝试从 credentials 恢复已有的 AT
@@ -1646,6 +1659,21 @@ func (s *Store) FindByID(dbID int64) *Account {
 		}
 	}
 	return nil
+}
+
+// SetManualDisabled 更新运行时账号的手动禁用状态，并同步调度器
+func (s *Store) SetManualDisabled(dbID int64, disabled bool) bool {
+	acc := s.FindByID(dbID)
+	if acc == nil {
+		return false
+	}
+	if disabled {
+		atomic.StoreInt32(&acc.ManualDisabled, 1)
+	} else {
+		atomic.StoreInt32(&acc.ManualDisabled, 0)
+	}
+	s.fastSchedulerUpdate(acc)
+	return true
 }
 
 // MarkCooldown 标记账号进入冷却，并持久化到数据库

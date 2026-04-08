@@ -34,6 +34,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			status TEXT DEFAULT 'active',
 			cooldown_reason TEXT DEFAULT '',
 			cooldown_until TIMESTAMP NULL,
+			disabled INTEGER DEFAULT 0,
 			error_message TEXT DEFAULT '',
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -120,6 +121,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 	}{
 		{"accounts", "cooldown_reason", "TEXT DEFAULT ''"},
 		{"accounts", "cooldown_until", "TIMESTAMP NULL"},
+		{"accounts", "disabled", "INTEGER DEFAULT 0"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "reasoning_tokens", "INTEGER DEFAULT 0"},

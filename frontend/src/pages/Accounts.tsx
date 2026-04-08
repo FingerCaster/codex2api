@@ -44,7 +44,7 @@ export default function Accounts() {
   const { t } = useTranslation()
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
-  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'locked'>('all')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'team' | 'free'>('all')
   const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
@@ -133,6 +133,7 @@ export default function Accounts() {
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
   const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
+  const disabledAccounts = accounts.filter((account) => account.disabled).length
   const lockedAccounts = accounts.filter((account) => account.locked).length
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
@@ -149,6 +150,9 @@ export default function Accounts() {
         break
       case 'banned':
         if (account.status !== 'unauthorized') return false
+        break
+      case 'disabled':
+        if (!account.disabled) return false
         break
       case 'locked':
         if (!account.locked) return false
@@ -649,6 +653,17 @@ export default function Accounts() {
     }
   }
 
+  const handleToggleDisabled = async (account: AccountRow) => {
+    const newDisabled = !account.disabled
+    try {
+      await api.toggleAccountDisabled(account.id, newDisabled)
+      showToast(newDisabled ? t('accounts.disableSuccess') : t('accounts.enableSuccess'))
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.disableFailed', { error: getErrorMessage(error) }), 'error')
+    }
+  }
+
   const handleBatchDelete = async () => {
     if (selected.size === 0) return
     const confirmed = await confirm({
@@ -889,16 +904,17 @@ export default function Accounts() {
           )}
         />
 
-        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-4">
+        <div className="mb-4 grid grid-cols-2 gap-3 xl:grid-cols-5">
           <CompactStat label={t('accounts.totalAccounts')} chipLabel={t('accounts.filterAll')} value={totalAccounts} tone="neutral" />
           <CompactStat label={t('accounts.normalAccounts')} chipLabel={t('accounts.filterNormal')} value={normalAccounts} tone="success" />
           <CompactStat label={t('accounts.rateLimited')} chipLabel={t('accounts.filterRateLimited')} value={rateLimitedAccounts} tone="warning" />
           <CompactStat label={t('accounts.bannedAccounts')} chipLabel={t('accounts.filterBanned')} value={bannedAccounts} tone="danger" />
+          <CompactStat label={t('common.disabled')} chipLabel={t('accounts.filterDisabled')} value={disabledAccounts} tone="neutral" />
         </div>
 
         <div className="mb-4 flex flex-wrap items-center gap-2 rounded-2xl border border-border bg-white/55 px-4 py-3 text-[12px] text-muted-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.72)]">
           <span className="font-semibold text-foreground">{t('accounts.filter')}</span>
-          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
+          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['disabled', t('accounts.filterDisabled')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
             <button
               key={key}
               onClick={() => { setStatusFilter(key); setPage(1) }}
@@ -908,7 +924,7 @@ export default function Accounts() {
                   : 'bg-muted/50 text-muted-foreground hover:bg-muted'
               }`}
             >
-              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : lockedAccounts}
+              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : key === 'disabled' ? disabledAccounts : lockedAccounts}
             </button>
           ))}
         </div>
@@ -1042,6 +1058,11 @@ export default function Accounts() {
                               API
                             </span>
                           )}
+                          {account.disabled && (
+                            <span className="ml-1.5 inline-flex items-center rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-700 ring-1 ring-inset ring-slate-500/20 dark:bg-slate-900 dark:text-slate-300 dark:ring-slate-400/20">
+                              <Ban className="size-2.5 mr-0.5" />{t('accounts.disable')}
+                            </span>
+                          )}
                           {account.locked && (
                             <span className="ml-1.5 inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
                               <Lock className="size-2.5 mr-0.5" />{t('accounts.lock')}
@@ -1109,6 +1130,15 @@ export default function Accounts() {
                               title={account.type === 'api_key' ? t('accounts.providerRefreshDisabled') : account.at_only ? t('accounts.atRefreshDisabled') : t('accounts.refreshAccessToken')}
                             >
                               <RefreshCw className={`size-3.5 ${refreshingIds.has(account.id) ? 'animate-spin' : ''}`} />
+                            </Button>
+                            <Button
+                              variant={account.disabled ? 'default' : 'outline'}
+                              size="icon"
+                              className="h-7 w-8 px-0"
+                              onClick={() => void handleToggleDisabled(account)}
+                              title={account.disabled ? t('accounts.enableHint') : t('accounts.disableHint')}
+                            >
+                              <Ban className="size-3.5" />
                             </Button>
                             <Button
                               variant={account.locked ? 'default' : 'outline'}

@@ -56,6 +56,7 @@ export interface AccountRow {
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
   cooldown_until?: ISODateString
+  disabled?: boolean
   locked?: boolean
 }
 

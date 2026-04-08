@@ -37,7 +37,7 @@ type FastScheduler struct {
 	buckets      map[AccountHealthTier][]fastSchedulerEntry
 	positions    map[int64]fastSchedulerPosition
 	cursors      [3]atomic.Uint64
-	provenBounds [3]int          // 每个 tier 桶中验证过的账号数量（排在前面）
+	provenBounds [3]int           // 每个 tier 桶中验证过的账号数量（排在前面）
 	provenCurs   [3]atomic.Uint64 // 验证账号专用 round-robin 游标
 }
 
@@ -346,6 +346,9 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	}
 
 	available := a.Status != StatusError && tier != HealthTierBanned && a.AccessToken != ""
+	if atomic.LoadInt32(&a.ManualDisabled) != 0 {
+		available = false
+	}
 	if a.Status == StatusCooldown && now.Before(a.CooldownUtil) {
 		available = false
 	}

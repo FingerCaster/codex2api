@@ -104,6 +104,8 @@ export const api = {
     request<CreateAccountResponse>('/accounts/provider-key', { method: 'POST', body: JSON.stringify(data) }),
   deleteAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}`, { method: 'DELETE' }),
+  toggleAccountDisabled: (id: number, disabled: boolean) =>
+    request<MessageResponse>(`/accounts/${id}/disable`, { method: 'POST', body: JSON.stringify({ disabled }) }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
   toggleAccountLock: (id: number, locked: boolean) =>

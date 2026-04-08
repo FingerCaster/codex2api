@@ -26,6 +26,7 @@ type AccountRow struct {
 	CooldownReason string
 	CooldownUntil  sql.NullTime
 	ErrorMessage   string
+	Disabled       bool
 	Locked         bool
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
@@ -205,6 +206,7 @@ func (db *DB) migrate(ctx context.Context) error {
 
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_reason VARCHAR(50) DEFAULT '';
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS cooldown_until TIMESTAMPTZ NULL;
+	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS disabled BOOLEAN DEFAULT FALSE;
 	ALTER TABLE accounts ADD COLUMN IF NOT EXISTS locked BOOLEAN DEFAULT FALSE;
 
 	CREATE INDEX IF NOT EXISTS idx_accounts_status ON accounts(status);
@@ -1600,7 +1602,7 @@ func (db *DB) GetAccountRequestCounts(ctx context.Context) (map[int64]*AccountRe
 // ListActive 获取所有状态为 active 的账号
 func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	query := `
-		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(locked, false), created_at, updated_at
+		SELECT id, name, platform, type, credentials, proxy_url, status, cooldown_reason, cooldown_until, error_message, COALESCE(disabled, false), COALESCE(locked, false), created_at, updated_at
 		FROM accounts
 		WHERE status = 'active'
 		ORDER BY id
@@ -1629,6 +1631,7 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 			&a.CooldownReason,
 			&cooldownUntilRaw,
 			&a.ErrorMessage,
+			&a.Disabled,
 			&a.Locked,
 			&createdAtRaw,
 			&updatedAtRaw,
@@ -1653,9 +1656,15 @@ func (db *DB) ListActive(ctx context.Context) ([]*AccountRow, error) {
 	return accounts, rows.Err()
 }
 
+// SetAccountDisabled 设置账号的手动禁用状态
+func (db *DB) SetAccountDisabled(ctx context.Context, id int64, disabled bool) error {
+	_, err := db.conn.ExecContext(ctx, `UPDATE accounts SET disabled = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, disabled, id)
+	return err
+}
+
 // SetAccountLocked 设置账号的锁定状态
 func (db *DB) SetAccountLocked(ctx context.Context, id int64, locked bool) error {
-	_, err := db.conn.ExecContext(ctx, `UPDATE accounts SET locked = $1 WHERE id = $2`, locked, id)
+	_, err := db.conn.ExecContext(ctx, `UPDATE accounts SET locked = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2`, locked, id)
 	return err
 }
 
