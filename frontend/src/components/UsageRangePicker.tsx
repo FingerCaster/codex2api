@@ -119,6 +119,34 @@ export function getUsageRangeRequestRange(value: UsageRangeValue): { start: stri
         start: toLocalRFC3339(new Date(now.getTime() - 24 * 60 * 60 * 1000)),
         end: toLocalRFC3339(now),
       }
+    case '7d':
+      return {
+        start: toLocalRFC3339(startOfDay(addDays(now, -6))),
+        end: toLocalRFC3339(now),
+      }
+    case '14d':
+      return {
+        start: toLocalRFC3339(startOfDay(addDays(now, -13))),
+        end: toLocalRFC3339(now),
+      }
+    case '30d':
+      return {
+        start: toLocalRFC3339(startOfDay(addDays(now, -29))),
+        end: toLocalRFC3339(now),
+      }
+    case 'thisMonth':
+      return {
+        start: toLocalRFC3339(new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0)),
+        end: toLocalRFC3339(now),
+      }
+    case 'lastMonth': {
+      const start = new Date(now.getFullYear(), now.getMonth() - 1, 1, 0, 0, 0, 0)
+      const end = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59, 0)
+      return {
+        start: toLocalRFC3339(start),
+        end: toLocalRFC3339(end),
+      }
+    }
     default:
       return {
         start: toLocalRFC3339(startOfDay(parseDateInput(value.startDate))),
