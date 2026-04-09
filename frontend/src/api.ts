@@ -77,9 +77,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     headers.set('X-Admin-Key', adminKey)
   }
 
+  const method = (options.method ?? 'GET').toUpperCase()
+
   const res = await fetch(BASE + path, {
     ...options,
     headers,
+    cache: options.cache ?? (method === 'GET' || method === 'HEAD' ? 'no-store' : undefined),
   })
 
   if (!res.ok) {
