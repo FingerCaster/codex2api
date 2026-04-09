@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
 import PageHeader from '../components/PageHeader'
@@ -126,13 +126,14 @@ export default function Usage() {
     }, 400)
   }, [])
 
-  const requestRange = useMemo(
+  const getCurrentRequestRange = useCallback(
     () => getUsageRangeRequestRange(rangeValue),
     [rangeValue],
   )
 
   // 仅加载轻量统计（秒级）
   const loadStats = useCallback(async () => {
+    const requestRange = getCurrentRequestRange()
     const stats = await api.getUsageStats({
       start: requestRange.start,
       end: requestRange.end,
@@ -144,7 +145,7 @@ export default function Usage() {
       stream: filterStream || undefined,
     })
     return { stats }
-  }, [requestRange.end, requestRange.start, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [getCurrentRequestRange, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: UsageStats | null
@@ -166,6 +167,7 @@ export default function Usage() {
 
   // 服务端分页加载日志（每页仅传输 20 行）
   const loadLogs = useCallback(async () => {
+    const requestRange = getCurrentRequestRange()
     setLogsLoading(true)
     try {
       const res = await api.getUsageLogsPaged({
@@ -187,7 +189,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [requestRange.start, requestRange.end, page, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [getCurrentRequestRange, page, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
