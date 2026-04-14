@@ -45,6 +45,7 @@
     "create": "Create",
     "name": "Name",
     "key": "Key",
+    "status": "Status",
     "createdAt": "Created",
     "actions": "Actions",
     "syncingData": "Please wait while data is syncing.",
@@ -575,6 +576,10 @@
     "createKey": "Create Key",
     "keyCreated": "New key generated (shown once only)",
     "keyCreateSuccess": "Key created successfully",
+    "enableKey": "Enable",
+    "disableKey": "Disable",
+    "keyEnabled": "Key enabled",
+    "keyDisabled": "Key disabled",
     "keyDeleted": "Key deleted",
     "deleteKeyTitle": "Delete API Key",
     "deleteKeyDesc": "After deletion, all clients using this key will immediately lose access. Please confirm.",
@@ -604,7 +609,8 @@
     "responsesApi": "Responses API",
     "modelList": "Model List",
     "createFailed": "Create failed",
-    "deleteFailed": "Delete failed"
+    "deleteFailed": "Delete failed",
+    "toggleKeyFailed": "Failed to update key status"
   },
   "proxies": {
     "description": "Manage proxy pool with round-robin distribution to accounts",

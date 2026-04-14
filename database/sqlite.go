@@ -68,6 +68,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			name TEXT DEFAULT '',
 			key TEXT NOT NULL UNIQUE,
+			enabled INTEGER NOT NULL DEFAULT 1,
 			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
 		`CREATE TABLE IF NOT EXISTS system_settings (
@@ -149,6 +150,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "allow_remote_migration", "INTEGER DEFAULT 0"},
 		{"system_settings", "model_mapping", "TEXT DEFAULT '{}'"},
 		{"accounts", "locked", "INTEGER DEFAULT 0"},
+		{"api_keys", "enabled", "INTEGER NOT NULL DEFAULT 1"},
 		{"proxies", "test_ip", "TEXT DEFAULT ''"},
 		{"proxies", "test_location", "TEXT DEFAULT ''"},
 		{"proxies", "test_latency_ms", "INTEGER DEFAULT 0"},

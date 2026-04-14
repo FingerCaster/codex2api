@@ -421,3 +421,67 @@ func TestSQLiteTimeRangeQueriesHandleOffsetWindows(t *testing.T) {
 		t.Fatalf("offset 窗口图表聚合结果异常: len=%d, want 1", len(agg.Timeline))
 	}
 }
+
+func TestSQLiteAPIKeysEnabledToggle(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	firstID, err := db.InsertAPIKey(ctx, "alpha", "sk-alpha-12345678901234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey(alpha) 返回错误: %v", err)
+	}
+	_, err = db.InsertAPIKey(ctx, "beta", "sk-beta-12345678901234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey(beta) 返回错误: %v", err)
+	}
+
+	keys, err := db.ListAPIKeys(ctx)
+	if err != nil {
+		t.Fatalf("ListAPIKeys 返回错误: %v", err)
+	}
+	if len(keys) != 2 {
+		t.Fatalf("len(keys) = %d, want %d", len(keys), 2)
+	}
+	for _, key := range keys {
+		if !key.Enabled {
+			t.Fatalf("新建 API key 默认应为启用状态: %+v", key)
+		}
+	}
+
+	values, err := db.GetAllAPIKeyValues(ctx)
+	if err != nil {
+		t.Fatalf("GetAllAPIKeyValues 返回错误: %v", err)
+	}
+	if len(values) != 2 {
+		t.Fatalf("len(values) = %d, want %d", len(values), 2)
+	}
+
+	if err := db.UpdateAPIKeyEnabled(ctx, firstID, false); err != nil {
+		t.Fatalf("UpdateAPIKeyEnabled(false) 返回错误: %v", err)
+	}
+
+	keys, err = db.ListAPIKeys(ctx)
+	if err != nil {
+		t.Fatalf("禁用后 ListAPIKeys 返回错误: %v", err)
+	}
+	if !keys[1].Enabled {
+		t.Fatalf("未禁用的 key 不应受影响: %+v", keys[1])
+	}
+	if keys[0].Enabled {
+		t.Fatalf("禁用后的 key 仍显示为 enabled=true: %+v", keys[0])
+	}
+
+	values, err = db.GetAllAPIKeyValues(ctx)
+	if err != nil {
+		t.Fatalf("禁用后 GetAllAPIKeyValues 返回错误: %v", err)
+	}
+	if len(values) != 1 || values[0] != "sk-beta-12345678901234567890" {
+		t.Fatalf("禁用后鉴权 key 过滤异常: values=%v", values)
+	}
+}

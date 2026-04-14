@@ -214,6 +214,16 @@ export default function Settings() {
     }
   }
 
+  const handleToggleKeyDisabled = async (keyRow: APIKeyRow) => {
+    try {
+      await api.toggleAPIKeyDisabled(keyRow.id, keyRow.enabled)
+      showToast(keyRow.enabled ? t('settings.keyDisabled') : t('settings.keyEnabled'))
+      void reload()
+    } catch (error) {
+      showToast(`${t('settings.toggleKeyFailed')}: ${getErrorMessage(error)}`, 'error')
+    }
+  }
+
   const handleCopy = async (text: string) => {
     try {
       if (navigator.clipboard?.writeText) {
@@ -343,6 +353,7 @@ export default function Settings() {
                     <TableRow>
                       <TableHead className="text-[13px] font-semibold">{t('common.name')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('common.key')}</TableHead>
+                      <TableHead className="text-[13px] font-semibold">{t('common.status')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('common.createdAt')}</TableHead>
                       <TableHead className="text-[13px] font-semibold">{t('common.actions')}</TableHead>
                     </TableRow>
@@ -369,13 +380,23 @@ export default function Settings() {
                             </button>
                           </div>
                         </TableCell>
+                        <TableCell>
+                          <Badge variant={keyRow.enabled ? 'default' : 'secondary'}>
+                            {keyRow.enabled ? t('common.enabled') : t('common.disabled')}
+                          </Badge>
+                        </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
                           {formatRelativeTime(keyRow.created_at, { variant: 'compact' })}
                         </TableCell>
                         <TableCell>
-                          <Button variant="destructive" size="sm" onClick={() => void handleDeleteKey(keyRow.id)}>
-                            {t('common.delete')}
-                          </Button>
+                          <div className="flex items-center gap-2">
+                            <Button variant="outline" size="sm" onClick={() => void handleToggleKeyDisabled(keyRow)}>
+                              {keyRow.enabled ? t('settings.disableKey') : t('settings.enableKey')}
+                            </Button>
+                            <Button variant="destructive" size="sm" onClick={() => void handleDeleteKey(keyRow.id)}>
+                              {t('common.delete')}
+                            </Button>
+                          </div>
                         </TableCell>
                       </TableRow>
                     ))}

@@ -53,6 +53,8 @@ type Handler struct {
 	reqCountMu        sync.RWMutex
 	reqCountCache     map[int64]*database.AccountRequestCount
 	reqCountExpiresAt time.Time
+
+	invalidateAPIKeyCache func()
 }
 
 type chartCacheEntry struct {
@@ -86,6 +88,11 @@ func (h *Handler) SetPoolSizes(pgMaxConns, redisPoolSize int) {
 	h.redisPoolSize = redisPoolSize
 }
 
+// SetAPIKeyCacheInvalidator 设置 API Key 缓存失效回调。
+func (h *Handler) SetAPIKeyCacheInvalidator(fn func()) {
+	h.invalidateAPIKeyCache = fn
+}
+
 // RegisterRoutes 注册管理 API 路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api := r.Group("/api/admin")
@@ -115,6 +122,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/keys", h.ListAPIKeys)
 	api.POST("/keys", h.CreateAPIKey)
+	api.POST("/keys/:id/disable", h.ToggleAPIKeyDisabled)
 	api.DELETE("/keys/:id", h.DeleteAPIKey)
 	api.GET("/health", h.GetHealth)
 	api.GET("/ops/overview", h.GetOpsOverview)
@@ -1805,6 +1813,12 @@ func generateKey() string {
 	return "sk-" + hex.EncodeToString(b)
 }
 
+func (h *Handler) invalidateAPIKeys() {
+	if h.invalidateAPIKeyCache != nil {
+		h.invalidateAPIKeyCache()
+	}
+}
+
 // CreateAPIKey 创建新 API 密钥（增强版，带输入验证）
 func (h *Handler) CreateAPIKey(c *gin.Context) {
 	var req createKeyReq
@@ -1853,12 +1867,46 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 	// 记录安全审计日志
 	security.SecurityAuditLog("API_KEY_CREATED", fmt.Sprintf("id=%d name=%s ip=%s", id, security.SanitizeLog(req.Name), c.ClientIP()))
+	h.invalidateAPIKeys()
 
 	c.JSON(http.StatusOK, createAPIKeyResponse{
 		ID:   id,
 		Key:  key,
 		Name: req.Name,
 	})
+}
+
+// ToggleAPIKeyDisabled 切换 API 密钥启用状态
+func (h *Handler) ToggleAPIKeyDisabled(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效 ID")
+		return
+	}
+
+	var req struct {
+		Disabled bool `json:"disabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		writeError(c, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := h.db.UpdateAPIKeyEnabled(ctx, id, !req.Disabled); err != nil {
+		writeError(c, http.StatusInternalServerError, "更新失败: "+err.Error())
+		return
+	}
+
+	h.invalidateAPIKeys()
+
+	if req.Disabled {
+		writeMessage(c, http.StatusOK, "API 密钥已禁用")
+		return
+	}
+	writeMessage(c, http.StatusOK, "API 密钥已启用")
 }
 
 // DeleteAPIKey 删除 API 密钥
@@ -1876,6 +1924,7 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "删除失败: "+err.Error())
 		return
 	}
+	h.invalidateAPIKeys()
 	writeMessage(c, http.StatusOK, "已删除")
 }
 

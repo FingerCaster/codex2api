@@ -292,6 +292,7 @@ export interface APIKeyRow {
   name: string
   key: string
   raw_key: string
+  enabled: boolean
   created_at: ISODateString
 }
 

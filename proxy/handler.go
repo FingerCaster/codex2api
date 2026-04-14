@@ -123,7 +123,7 @@ func (h *Handler) refreshDBKeys() map[string]*database.APIKeyRow {
 
 	newMap := make(map[string]*database.APIKeyRow, len(rows))
 	for _, row := range rows {
-		if row == nil || row.Key == "" {
+		if row == nil || row.Key == "" || !row.Enabled {
 			continue
 		}
 		newMap[row.Key] = row
@@ -133,12 +133,21 @@ func (h *Handler) refreshDBKeys() map[string]*database.APIKeyRow {
 	return newMap
 }
 
+// InvalidateAPIKeyCache 立即清空 API Key 缓存，供管理后台变更后调用。
+func (h *Handler) InvalidateAPIKeyCache() {
+	h.dbKeysMu.Lock()
+	defer h.dbKeysMu.Unlock()
+	h.dbKeys = nil
+	h.dbKeysUntil = time.Time{}
+}
+
 func (h *Handler) resolveAPIKey(key string) (*database.APIKeyRow, bool) {
 	if h.configKeys[key] {
 		return &database.APIKeyRow{
-			ID:   0,
-			Name: "config",
-			Key:  key,
+			ID:      0,
+			Name:    "config",
+			Key:     key,
+			Enabled: true,
 		}, true
 	}
 	dbKeys := h.refreshDBKeys()

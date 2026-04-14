@@ -45,6 +45,7 @@
     "create": "创建",
     "name": "名称",
     "key": "密钥",
+    "status": "状态",
     "createdAt": "创建时间",
     "actions": "操作",
     "syncingData": "请稍候，数据正在同步。",
@@ -575,6 +576,10 @@
     "createKey": "创建密钥",
     "keyCreated": "新密钥已生成（仅显示一次）",
     "keyCreateSuccess": "密钥创建成功",
+    "enableKey": "启用",
+    "disableKey": "禁用",
+    "keyEnabled": "密钥已启用",
+    "keyDisabled": "密钥已禁用",
     "keyDeleted": "密钥已删除",
     "deleteKeyTitle": "删除 API 密钥",
     "deleteKeyDesc": "删除后，所有使用该密钥的客户端都会立即失去访问权限。请确认这是你要执行的操作。",
@@ -604,7 +609,8 @@
     "responsesApi": "Responses API",
     "modelList": "模型列表",
     "createFailed": "创建失败",
-    "deleteFailed": "删除失败"
+    "deleteFailed": "删除失败",
+    "toggleKeyFailed": "切换状态失败"
   },
   "proxies": {
     "description": "管理代理池，支持轮询分配给账号使用",

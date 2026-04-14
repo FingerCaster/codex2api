@@ -174,6 +174,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ name, ...(key ? { key } : {}) }),
     }),
+  toggleAPIKeyDisabled: (id: number, disabled: boolean) =>
+    request<MessageResponse>(`/keys/${id}/disable`, { method: 'POST', body: JSON.stringify({ disabled }) }),
   deleteAPIKey: (id: number) =>
     request<MessageResponse>(`/keys/${id}`, { method: 'DELETE' }),
   clearUsageLogs: () =>

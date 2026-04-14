@@ -152,6 +152,7 @@ func main() {
 	// 从环境变量读取 Codex 画像与 Beta 配置。
 	deviceCfg := proxy.DeviceProfileConfigFromEnv(os.Getenv)
 	handler := proxy.NewHandler(store, db, cfg, deviceCfg)
+	adminHandler.SetAPIKeyCacheInvalidator(handler.InvalidateAPIKeyCache)
 
 	// 注册 WebSocket 执行函数（避免 proxy ↔ wsrelay 循环依赖）
 	proxy.WebsocketExecuteFunc = wsrelay.ExecuteRequestWebsocket

@@ -53,6 +53,7 @@ type MaskedAPIKeyRow struct {
 	Name      string `json:"name"`
 	Key       string `json:"key"`
 	RawKey    string `json:"raw_key"`
+	Enabled   bool   `json:"enabled"`
 	CreatedAt string `json:"created_at"`
 }
 
@@ -63,6 +64,7 @@ func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
 		Name:      row.Name,
 		Key:       security.MaskAPIKey(row.Key),
 		RawKey:    row.Key,
+		Enabled:   row.Enabled,
 		CreatedAt: row.CreatedAt.Format(time.RFC3339),
 	}
 }

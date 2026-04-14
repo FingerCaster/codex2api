@@ -252,8 +252,10 @@ func (db *DB) migrate(ctx context.Context) error {
 		id         SERIAL PRIMARY KEY,
 		name       VARCHAR(255) DEFAULT '',
 		key        VARCHAR(255) NOT NULL UNIQUE,
+		enabled    BOOLEAN NOT NULL DEFAULT TRUE,
 		created_at TIMESTAMPTZ DEFAULT NOW()
 	);
+	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE;
 
 	CREATE TABLE IF NOT EXISTS system_settings (
 		id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
@@ -342,12 +344,13 @@ type APIKeyRow struct {
 	ID        int64     `json:"id"`
 	Name      string    `json:"name"`
 	Key       string    `json:"key"`
+	Enabled   bool      `json:"enabled"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
 // ListAPIKeys 获取所有 API 密钥
 func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT id, name, key, created_at FROM api_keys ORDER BY id`)
+	rows, err := db.conn.QueryContext(ctx, `SELECT id, name, key, enabled, created_at FROM api_keys ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -357,7 +360,7 @@ func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
 	for rows.Next() {
 		k := &APIKeyRow{}
 		var createdAtRaw interface{}
-		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &createdAtRaw); err != nil {
+		if err := rows.Scan(&k.ID, &k.Name, &k.Key, &k.Enabled, &createdAtRaw); err != nil {
 			return nil, err
 		}
 		k.CreatedAt, err = parseDBTimeValue(createdAtRaw)
@@ -367,6 +370,12 @@ func (db *DB) ListAPIKeys(ctx context.Context) ([]*APIKeyRow, error) {
 		keys = append(keys, k)
 	}
 	return keys, rows.Err()
+}
+
+// UpdateAPIKeyEnabled 更新 API 密钥启用状态
+func (db *DB) UpdateAPIKeyEnabled(ctx context.Context, id int64, enabled bool) error {
+	_, err := db.conn.ExecContext(ctx, `UPDATE api_keys SET enabled = $1 WHERE id = $2`, enabled, id)
+	return err
 }
 
 // InsertAPIKey 插入新 API 密钥
@@ -470,7 +479,11 @@ func (db *DB) DeleteAPIKey(ctx context.Context, id int64) error {
 
 // GetAllAPIKeyValues 获取所有密钥值（用于鉴权）
 func (db *DB) GetAllAPIKeyValues(ctx context.Context) ([]string, error) {
-	rows, err := db.conn.QueryContext(ctx, `SELECT key FROM api_keys`)
+	query := `SELECT key FROM api_keys WHERE enabled = true`
+	if db.isSQLite() {
+		query = `SELECT key FROM api_keys WHERE enabled = 1`
+	}
+	rows, err := db.conn.QueryContext(ctx, query)
 	if err != nil {
 		return nil, err
 	}
