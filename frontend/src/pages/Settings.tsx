@@ -367,6 +367,9 @@ export default function Settings() {
                             <span className="font-mono text-[14px]">
                               {visibleKeys.has(keyRow.id) ? keyRow.raw_key : keyRow.key}
                             </span>
+                            <Button variant="ghost" size="sm" onClick={() => void handleCopy(keyRow.raw_key)}>
+                              {t('common.copy')}
+                            </Button>
                             <button
                               onClick={() => setVisibleKeys(prev => {
                                 const next = new Set(prev)
