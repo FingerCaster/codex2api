@@ -16,6 +16,7 @@ import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Select } from '@/components/ui/select'
 import {
   Table,
   TableBody,
@@ -40,14 +41,33 @@ function getAccountDisplayName(account: Pick<AccountRow, 'id' | 'email' | 'provi
   return `ID ${account.id}`
 }
 
+type AccountPlanFilter = 'all' | 'pro' | 'plus' | 'team' | 'free'
+type AccountSortKey = 'requests' | 'usage' | 'importTime'
+type AccountSortValue = 'default' | 'requests_desc' | 'requests_asc' | 'usage_desc' | 'usage_asc' | 'importTime_desc' | 'importTime_asc'
+
+function normalizePlanType(planType?: string | null): string {
+  return (planType || '').trim().toLowerCase()
+}
+
+function matchesPlanFilter(planType: string | undefined, filter: AccountPlanFilter): boolean {
+  if (filter === 'all') return true
+
+  const normalized = normalizePlanType(planType)
+  if (filter === 'plus') {
+    return normalized.includes('plus')
+  }
+
+  return normalized === filter
+}
+
 export default function Accounts() {
   const { t } = useTranslation()
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
-  const [planFilter, setPlanFilter] = useState<'all' | 'pro' | 'team' | 'free'>('all')
-  const [sortKey, setSortKey] = useState<'requests' | 'usage' | 'importTime' | null>(null)
+  const [planFilter, setPlanFilter] = useState<AccountPlanFilter>('all')
+  const [sortKey, setSortKey] = useState<AccountSortKey | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
 
   const PAGE_SIZE = 20
@@ -115,7 +135,7 @@ export default function Accounts() {
 
   useEffect(() => {
     const hasMissingUsage = accounts.some(
-      (account) => account.plan_type?.toLowerCase() === 'free' && (account.usage_percent_7d === null || account.usage_percent_7d === undefined)
+      (account) => normalizePlanType(account.plan_type) === 'free' && (account.usage_percent_7d === null || account.usage_percent_7d === undefined)
     )
     if (!hasMissingUsage || usageBootstrapReloadedRef.current) {
       return
@@ -159,9 +179,8 @@ export default function Accounts() {
         break
     }
     // 套餐过滤
-    if (planFilter !== 'all') {
-      const plan = (account.plan_type || '').toLowerCase()
-      if (plan !== planFilter) return false
+    if (!matchesPlanFilter(account.plan_type, planFilter)) {
+      return false
     }
     // 搜索过滤
     if (searchQuery) {
@@ -188,9 +207,45 @@ export default function Accounts() {
     return sortDir === 'asc' ? diff : -diff
   })
 
+  const sortValue = sortKey ? `${sortKey}_${sortDir}` as AccountSortValue : 'default'
+
+  const sortOptions = useMemo(() => ([
+    { label: t('accounts.sortDefault'), value: 'default' },
+    { label: t('accounts.sortUsageDesc'), value: 'usage_desc' },
+    { label: t('accounts.sortUsageAsc'), value: 'usage_asc' },
+    { label: t('accounts.sortRequestsDesc'), value: 'requests_desc' },
+    { label: t('accounts.sortRequestsAsc'), value: 'requests_asc' },
+    { label: t('accounts.sortImportTimeDesc'), value: 'importTime_desc' },
+    { label: t('accounts.sortImportTimeAsc'), value: 'importTime_asc' },
+  ]), [t])
+
   const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / PAGE_SIZE))
   const pagedAccounts = sortedAccounts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
   const allPageSelected = pagedAccounts.length > 0 && pagedAccounts.every((a) => selected.has(a.id))
+
+  const handleSortChange = (value: string) => {
+    if (value === 'default') {
+      setSortKey(null)
+      setSortDir('desc')
+      setPage(1)
+      return
+    }
+
+    const [key, dir] = value.split('_') as [AccountSortKey, 'asc' | 'desc']
+    setSortKey(key)
+    setSortDir(dir)
+    setPage(1)
+  }
+
+  const toggleSort = (key: AccountSortKey) => {
+    if (sortKey === key) {
+      setSortDir((current) => current === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortKey(key)
+      setSortDir('desc')
+    }
+    setPage(1)
+  }
 
   const toggleSelect = (id: number) => {
     setSelected((prev) => {
@@ -937,7 +992,7 @@ export default function Accounts() {
           <SchedulerChip label={t('status.unauthorized')} value={bannedAccounts} tone="neutral" />
         </div>
 
-        <div className="mb-4 flex items-center gap-2">
+        <div className="mb-4 flex flex-wrap items-center gap-2">
           <div className="relative w-64">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 size-4 text-muted-foreground pointer-events-none" />
             <Input
@@ -948,7 +1003,7 @@ export default function Accounts() {
             />
           </div>
           <div className="flex items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5">
-            {(['all', 'pro', 'team', 'free'] as const).map((key) => (
+            {(['all', 'pro', 'plus', 'team', 'free'] as const).map((key) => (
               <button
                 key={key}
                 onClick={() => { setPlanFilter(key); setPage(1) }}
@@ -961,6 +1016,17 @@ export default function Accounts() {
                 {key === 'all' ? t('accounts.filterAll') : key.charAt(0).toUpperCase() + key.slice(1)}
               </button>
             ))}
+          </div>
+          <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/30 px-2 py-1">
+            <span className="text-[12px] font-medium text-muted-foreground">{t('accounts.sort')}</span>
+            <div className="w-[180px]">
+              <Select
+                value={sortValue}
+                onValueChange={handleSortChange}
+                options={sortOptions}
+                compact
+              />
+            </div>
           </div>
         </div>
 
@@ -1014,19 +1080,19 @@ export default function Accounts() {
                       <TableHead className="text-[13px] font-semibold">{t('accounts.status')}</TableHead>
                       <TableHead
                         className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                        onClick={() => { if (sortKey === 'requests') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('requests'); setSortDir('desc') }; setPage(1) }}
+                        onClick={() => toggleSort('requests')}
                       >
                         {t('accounts.requests')} {sortKey === 'requests' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
                       </TableHead>
                       <TableHead
                         className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                        onClick={() => { if (sortKey === 'usage') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('usage'); setSortDir('desc') }; setPage(1) }}
+                        onClick={() => toggleSort('usage')}
                       >
                         {t('accounts.usage')} {sortKey === 'usage' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
                       </TableHead>
                       <TableHead
                         className="text-[13px] font-semibold cursor-pointer select-none hover:text-primary transition-colors"
-                        onClick={() => { if (sortKey === 'importTime') { setSortDir(d => d === 'asc' ? 'desc' : 'asc') } else { setSortKey('importTime'); setSortDir('desc') }; setPage(1) }}
+                        onClick={() => toggleSort('importTime')}
                       >
                         {t('accounts.importTime')} {sortKey === 'importTime' ? (sortDir === 'desc' ? '↓' : '↑') : ''}
                       </TableHead>
