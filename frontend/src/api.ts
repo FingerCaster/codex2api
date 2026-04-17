@@ -18,6 +18,7 @@ import type {
   StatsResponse,
   CPAExportEntry,
   SystemSettings,
+  UpdateAccountSchedulerRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
   UsageStats,
@@ -111,8 +112,14 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/disable`, { method: 'POST', body: JSON.stringify({ disabled }) }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  updateAccountScheduler: (id: number, data: UpdateAccountSchedulerRequest) =>
+    request<MessageResponse>(`/accounts/${id}/scheduler`, { method: 'PATCH', body: JSON.stringify(data) }),
   toggleAccountLock: (id: number, locked: boolean) =>
     request<MessageResponse>(`/accounts/${id}/lock`, { method: 'POST', body: JSON.stringify({ locked }) }),
+  resetAccountStatus: (id: number) =>
+    request<MessageResponse>(`/accounts/${id}/reset-status`, { method: 'POST' }),
+  batchResetStatus: (ids: number[]) =>
+    request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number) =>
     request<AccountUsageDetail>(`/accounts/${id}/usage`),
   getHealth: () => request<HealthResponse>('/health'),

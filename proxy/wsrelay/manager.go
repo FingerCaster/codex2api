@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/proxy"
 	"github.com/gorilla/websocket"
 )
 
@@ -178,6 +179,9 @@ type Manager struct {
 
 	// pool key 级别串行化，避免同一逻辑 session 在 acquire 阶段竞争同一条连接
 	keyLocks sync.Map
+
+	// 可选的探活函数（用于测试替换），nil 时使用默认 probeConnection
+	probeFunc func(wc *WsConnection) bool
 }
 
 // NewManager 创建连接池管理器
@@ -214,13 +218,18 @@ func (m *Manager) cleanupLoop() {
 	}
 }
 
-// evictExpired 清理过期连接和会话
+// evictExpired 清理过期连接、会话和对应的 keyLocks
 func (m *Manager) evictExpired() {
+	// 收集仍存活的 pool key
+	activeKeys := make(map[string]struct{})
+
 	m.connections.Range(func(key, value any) bool {
 		wc := value.(*WsConnection)
 		if wc.IsExpired() || !wc.IsConnected() {
 			m.connections.Delete(key)
 			wc.Close()
+		} else {
+			activeKeys[key.(string)] = struct{}{}
 		}
 		return true
 	})
@@ -230,6 +239,16 @@ func (m *Manager) evictExpired() {
 		if s.IsExpired() || !s.IsConnected() {
 			m.sessions.Delete(key)
 			s.Close()
+		} else {
+			activeKeys[key.(string)] = struct{}{}
+		}
+		return true
+	})
+
+	// 清理不再关联任何存活连接/会话的 keyLocks，防止 sync.Map 无限膨胀
+	m.keyLocks.Range(func(key, _ any) bool {
+		if _, alive := activeKeys[key.(string)]; !alive {
+			m.keyLocks.Delete(key)
 		}
 		return true
 	})
@@ -316,10 +335,22 @@ func (m *Manager) AcquireConnection(
 		if v, ok := m.connections.Load(key); ok {
 			wc := v.(*WsConnection)
 			if canReuseConnection(wc) {
-				pr := wc.session.AddPendingRequest(sessionKey)
-				wc.Touch()
+				// 发送 Ping 探活，确认连接真正存活
+				if m.probe(wc) {
+					pr := wc.session.AddPendingRequest(sessionKey)
+					wc.Touch()
+					lock.Unlock()
+					return wc, pr, nil
+				}
+				// 探活失败，清理死连接
+				m.connections.Delete(key)
+				m.sessions.Delete(key)
+				m.keyLocks.Delete(key)
+				wc.Close()
 				lock.Unlock()
-				return wc, pr, nil
+				// 直接重新获取锁创建新连接，不等待
+				lock = m.keyLock(key)
+				continue
 			}
 			if wc.IsConnected() && !wc.IsExpired() && wc.session != nil {
 				lock.Unlock()
@@ -367,6 +398,30 @@ func canReuseConnection(wc *WsConnection) bool {
 	return wc.session.PendingCount() == 0
 }
 
+// probeConnection 发送 Ping 检测连接是否真正存活
+func probeConnection(wc *WsConnection) bool {
+	wc.writeMu.Lock()
+	defer wc.writeMu.Unlock()
+
+	if !wc.IsConnected() || wc.conn == nil {
+		return false
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	err := wc.conn.WriteControl(websocket.PingMessage, []byte{}, deadline)
+	return err == nil
+}
+
+// probe 调用探活函数���支持测试替换）
+func (m *Manager) probe(wc *WsConnection) bool {
+	m.mu.RLock()
+	fn := m.probeFunc
+	m.mu.RUnlock()
+	if fn != nil {
+		return fn(wc)
+	}
+	return probeConnection(wc)
+}
+
 // createConnection 创建新 WebSocket 连接
 func (m *Manager) createConnection(
 	ctx context.Context,
@@ -382,10 +437,10 @@ func (m *Manager) createConnection(
 		EnableCompression: m.dialer.EnableCompression,
 	}
 
-	// 配置代理
+	// 配置代理（Resin 反代模式下跳过，URL 已包含 Resin 地址）
 	proxyURL := effectiveProxyURL(account, proxyOverride)
 
-	if proxyURL != "" {
+	if !proxy.IsResinEnabled() && proxyURL != "" {
 		proxyURLParsed, err := url.Parse(proxyURL)
 		if err != nil {
 			return nil, fmt.Errorf("parse proxy URL failed: %w", err)
@@ -448,6 +503,7 @@ func (m *Manager) RemoveConnection(accountID int64, wsURL string, sessionKey str
 		wc.Close()
 	}
 	m.sessions.Delete(key)
+	m.keyLocks.Delete(key)
 }
 
 // poolKey 生成连接池键

@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/proxy"
@@ -85,8 +86,18 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		return nil, fmt.Errorf("构建 WebSocket URL 失败: %w", err)
 	}
 
+	// Resin 反向代理：改写 WS URL 为 Resin 反代地址
+	if proxy.IsResinEnabled() {
+		wsURL = proxy.BuildWebSocketURL(wsURL)
+	}
+
 	// 准备请求头
 	headers := e.prepareWebsocketHeaders(accessToken, accountIDStr, sessionID, apiKey, deviceCfg, ginHeaders)
+
+	// Resin 反代：注入账号身份头
+	if proxy.IsResinEnabled() {
+		headers.Set("X-Resin-Account", proxy.ResinAccountID(account))
+	}
 
 	// 获取或创建连接
 	wc, pr, err := e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
@@ -94,22 +105,29 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		return nil, err
 	}
 
-	// 发送请求
-	if err := e.sendRequest(wc, wsBody, pr.RequestID); err != nil {
-		// 发送失败，尝试重连一次
+	// 发送请求，失败时最多重试 2 次（重建连接）
+	sendErr := e.sendRequest(wc, wsBody, pr.RequestID)
+	for retries := 0; sendErr != nil && retries < 2; retries++ {
 		wc.session.RemovePendingRequest(pr.RequestID)
 		e.manager.RemoveConnection(account.ID(), wsURL, sessionID, proxyOverride)
+
+		// 短暂退避，避免瞬间重连风暴
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(time.Duration(retries+1) * 200 * time.Millisecond):
+		}
 
 		wc, pr, err = e.manager.AcquireConnection(ctx, account, wsURL, sessionID, headers, proxyOverride)
 		if err != nil {
 			return nil, err
 		}
-
-		if err := e.sendRequest(wc, wsBody, pr.RequestID); err != nil {
-			wc.session.RemovePendingRequest(pr.RequestID)
-			e.manager.ReleaseConnection(wc)
-			return nil, fmt.Errorf("发送 WebSocket 请求失败: %w", err)
-		}
+		sendErr = e.sendRequest(wc, wsBody, pr.RequestID)
+	}
+	if sendErr != nil {
+		wc.session.RemovePendingRequest(pr.RequestID)
+		e.manager.ReleaseConnection(wc)
+		return nil, fmt.Errorf("发送 WebSocket 请求失败: %w", sendErr)
 	}
 
 	// 启动心跳

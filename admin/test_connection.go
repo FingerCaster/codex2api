@@ -90,30 +90,19 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		if !account.IsAPIKeyProvider() {
-			if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
-			}
-			switch resp.StatusCode {
-			case http.StatusUnauthorized:
-				h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
-			case http.StatusTooManyRequests:
-				h.store.MarkCooldown(account, 5*time.Minute, "rate_limited")
-			}
-		}
+		proxy.SyncCodexUsageState(h.store, account, resp)
 		errBody, _ := io.ReadAll(resp.Body)
+		switch resp.StatusCode {
+		case http.StatusUnauthorized:
+			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
+		case http.StatusTooManyRequests:
+			proxy.Apply429Cooldown(h.store, account, errBody, resp)
+		}
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
 		return
 	}
 
-	usagePct := 0.0
-	hasUsage := false
-	if !account.IsAPIKeyProvider() {
-		usagePct, hasUsage = proxy.ParseCodexUsageHeaders(resp, account)
-		if hasUsage {
-			h.store.PersistUsageSnapshot(account, usagePct)
-		}
-	}
+	usageState := proxy.SyncCodexUsageState(h.store, account, resp)
 
 	// 解析 SSE 流
 	hasContent := false
@@ -135,9 +124,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				sendTestEvent(c, testEvent{Type: "content", Text: delta})
 			}
 		case "response.completed":
-			usage := gjson.GetBytes(data, "response.usage")
-			if usage.Exists() {
-				promptTokens = int(usage.Get("prompt_tokens").Int())
+				usage := gjson.GetBytes(data, "response.usage")
+				if usage.Exists() {
+					promptTokens = int(usage.Get("prompt_tokens").Int())
 				completionTokens = int(usage.Get("completion_tokens").Int())
 				totalTokens = int(usage.Get("total_tokens").Int())
 				inputTokens = int(usage.Get("input_tokens").Int())
@@ -157,13 +146,17 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				if outputTokens == 0 {
 					outputTokens = completionTokens
 				}
-				if totalTokens == 0 {
-					totalTokens = inputTokens + outputTokens
+					if totalTokens == 0 {
+						totalTokens = inputTokens + outputTokens
+					}
 				}
-			}
-			// 只有用量未耗尽时才重置状态
-			if !account.IsAPIKeyProvider() && (!hasUsage || usagePct < 100) {
-				h.store.ClearCooldown(account)
+				// 测试成功即重置冷却状态，用量限制由调度器自行判断
+				if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
+					h.store.ClearCooldown(account)
+				}
+			// 如果上游未返回用量头，清除旧的用量缓存，避免显示过期数据
+			if !usageState.HasUsage7d && !usageState.HasUsage5h {
+				account.ClearUsageCache()
 			}
 			duration := time.Since(start).Milliseconds()
 			if totalTokens == 0 && hasContent {
@@ -313,30 +306,23 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				return
 			}
 			defer resp.Body.Close()
-			io.ReadAll(resp.Body) // 消费 body
+			body, _ := io.ReadAll(resp.Body)
 
 			switch resp.StatusCode {
 			case http.StatusOK:
-				usagePct, hasUsage := proxy.ParseCodexUsageHeaders(resp, acc)
-				if hasUsage {
-					h.store.PersistUsageSnapshot(acc, usagePct)
-				}
-				// 只有用量未耗尽时才重置状态，避免把 100% 用量的账号放回可调度池
-				if !hasUsage || usagePct < 100 {
+				usageState := proxy.SyncCodexUsageState(h.store, acc, resp)
+				// 测试成功即重置冷却状态，用量限制由调度器自行判断
+				if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
 					h.store.ClearCooldown(acc)
 				}
 				atomic.AddInt64(&successCount, 1)
 			case http.StatusUnauthorized:
-				if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, acc); ok {
-					h.store.PersistUsageSnapshot(acc, usagePct)
-				}
+				proxy.SyncCodexUsageState(h.store, acc, resp)
 				h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
 				atomic.AddInt64(&bannedCount, 1)
 			case http.StatusTooManyRequests:
-				if usagePct, ok := proxy.ParseCodexUsageHeaders(resp, acc); ok {
-					h.store.PersistUsageSnapshot(acc, usagePct)
-				}
-				h.store.MarkCooldown(acc, 5*time.Minute, "rate_limited")
+				proxy.SyncCodexUsageState(h.store, acc, resp)
+				proxy.Apply429Cooldown(h.store, acc, body, resp)
 				atomic.AddInt64(&rateLimitCount, 1)
 			default:
 				atomic.AddInt64(&failedCount, 1)

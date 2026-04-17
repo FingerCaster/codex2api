@@ -98,6 +98,7 @@ export default function Usage() {
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
   const [clearing, setClearing] = useState(false)
   const [rangeValue, setRangeValue] = useState(() => createUsageRangeValue('all'))
   const [logs, setLogs] = useState<UsageLog[]>([])
@@ -113,7 +114,7 @@ export default function Usage() {
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = false
-  const PAGE_SIZE = 20
+  const pageSizeOptions = [10, 20, 50, 100]
   const searchTimer = useRef<ReturnType<typeof setTimeout>>(null)
 
   // 搜索防抖：输入停止 400ms 后触发查询
@@ -165,7 +166,7 @@ export default function Usage() {
     }
   }, [])
 
-  // 服务端分页加载日志（每页仅传输 20 行）
+  // 服务端分页加载日志
   const loadLogs = useCallback(async () => {
     const requestRange = getCurrentRequestRange()
     setLogsLoading(true)
@@ -174,7 +175,7 @@ export default function Usage() {
         start: requestRange.start,
         end: requestRange.end,
         page,
-        pageSize: PAGE_SIZE,
+        pageSize,
         email: searchEmail || undefined,
         model: filterModel || undefined,
         endpoint: filterEndpoint || undefined,
@@ -189,7 +190,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [getCurrentRequestRange, page, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [getCurrentRequestRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -208,7 +209,15 @@ export default function Usage() {
   }, [reloadSilently])
 
   const { stats } = data
-  const totalPages = Math.max(1, Math.ceil(logsTotal / PAGE_SIZE))
+  const totalPages = Math.max(1, Math.ceil(logsTotal / pageSize))
+  const currentPage = Math.min(page, totalPages)
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages)
+    }
+  }, [page, totalPages])
+
   const totalRequests = stats?.total_requests ?? 0
   const totalTokens = stats?.total_tokens ?? 0
   const totalPromptTokens = stats?.total_prompt_tokens ?? 0
@@ -642,11 +651,16 @@ export default function Usage() {
                 </Table>
               </div>
               <Pagination
-                page={page}
+                page={currentPage}
                 totalPages={totalPages}
                 onPageChange={setPage}
                 totalItems={logsTotal}
-                pageSize={PAGE_SIZE}
+                pageSize={pageSize}
+                pageSizeOptions={pageSizeOptions}
+                onPageSizeChange={(nextPageSize) => {
+                  setPageSize(nextPageSize)
+                  setPage(1)
+                }}
               />
             </StateShell>
           </CardContent>

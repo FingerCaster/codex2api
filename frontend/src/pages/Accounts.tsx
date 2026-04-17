@@ -25,7 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
@@ -62,15 +62,15 @@ function matchesPlanFilter(planType: string | undefined, filter: AccountPlanFilt
 
 export default function Accounts() {
   const { t } = useTranslation()
+  const pageSizeOptions = [10, 20, 50, 100]
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(20)
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
   const [planFilter, setPlanFilter] = useState<AccountPlanFilter>('all')
   const [sortKey, setSortKey] = useState<AccountSortKey | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
-
-  const PAGE_SIZE = 20
   const [addForm, setAddForm] = useState<AddAccountRequest>({
     refresh_token: '',
     proxy_url: '',
@@ -85,6 +85,12 @@ export default function Accounts() {
   const [cleaningError, setCleaningError] = useState(false)
   const [testingAccount, setTestingAccount] = useState<AccountRow | null>(null)
   const [usageAccount, setUsageAccount] = useState<AccountRow | null>(null)
+  const [editingAccount, setEditingAccount] = useState<AccountRow | null>(null)
+  const [editSubmitting, setEditSubmitting] = useState(false)
+  const [scoreMode, setScoreMode] = useState<'default' | 'custom'>('default')
+  const [scoreInput, setScoreInput] = useState('')
+  const [concurrencyMode, setConcurrencyMode] = useState<'default' | 'custom'>('default')
+  const [concurrencyInput, setConcurrencyInput] = useState('')
   const [importing, setImporting] = useState(false)
   const [showImportPicker, setShowImportPicker] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -219,8 +225,9 @@ export default function Accounts() {
     { label: t('accounts.sortImportTimeAsc'), value: 'importTime_asc' },
   ]), [t])
 
-  const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / PAGE_SIZE))
-  const pagedAccounts = sortedAccounts.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+  const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize))
+  const currentPage = Math.min(page, totalPages)
+  const pagedAccounts = sortedAccounts.slice((currentPage - 1) * pageSize, currentPage * pageSize)
   const allPageSelected = pagedAccounts.length > 0 && pagedAccounts.every((a) => selected.has(a.id))
 
   const handleSortChange = (value: string) => {
@@ -246,6 +253,12 @@ export default function Accounts() {
     }
     setPage(1)
   }
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages)
+    }
+  }, [page, totalPages])
 
   const toggleSelect = (id: number) => {
     setSelected((prev) => {
@@ -783,6 +796,31 @@ export default function Accounts() {
     void reload()
   }
 
+  const handleResetStatus = async (account: AccountRow) => {
+    try {
+      await api.resetAccountStatus(account.id)
+      showToast(t('accounts.resetStatusSuccess'))
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.resetStatusFailed', { error: getErrorMessage(error) }), 'error')
+    }
+  }
+
+  const handleBatchResetStatus = async () => {
+    if (selected.size === 0) return
+    setBatchLoading(true)
+    try {
+      const result = await api.batchResetStatus(Array.from(selected))
+      showToast(t('accounts.batchResetStatusDone', { success: result.success, fail: result.failed }))
+      setSelected(new Set())
+      void reload()
+    } catch (error) {
+      showToast(t('accounts.resetStatusFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setBatchLoading(false)
+    }
+  }
+
   const handleBatchTest = async () => {
     setBatchTesting(true)
     try {
@@ -858,6 +896,73 @@ export default function Accounts() {
       showToast(t('accounts.cleanErrorFailed', { error: getErrorMessage(error) }), 'error')
     } finally {
       setCleaningError(false)
+    }
+  }
+
+  const openSchedulerEditor = (account: AccountRow) => {
+    setEditingAccount(account)
+    setScoreMode(account.score_bias_override === null || account.score_bias_override === undefined ? 'default' : 'custom')
+    setScoreInput(account.score_bias_override === null || account.score_bias_override === undefined ? '' : String(account.score_bias_override))
+    setConcurrencyMode(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? 'default' : 'custom')
+    setConcurrencyInput(account.base_concurrency_override === null || account.base_concurrency_override === undefined ? '' : String(account.base_concurrency_override))
+  }
+
+  const closeSchedulerEditor = (force = false) => {
+    if (editSubmitting && !force) return
+    setEditingAccount(null)
+    setScoreMode('default')
+    setScoreInput('')
+    setConcurrencyMode('default')
+    setConcurrencyInput('')
+  }
+
+  const parsedScoreBias = scoreMode === 'custom' ? parseIntegerInput(scoreInput) : null
+  const parsedBaseConcurrency = concurrencyMode === 'custom' ? parseIntegerInput(concurrencyInput) : null
+  const scoreInputInvalid = scoreMode === 'custom' && (parsedScoreBias === null || parsedScoreBias < -200 || parsedScoreBias > 200)
+  const concurrencyInputInvalid = concurrencyMode === 'custom' && (parsedBaseConcurrency === null || parsedBaseConcurrency < 1 || parsedBaseConcurrency > 50)
+
+  const editPreview = useMemo(() => {
+    if (!editingAccount) return null
+
+    const rawScore = Math.round(editingAccount.scheduler_score ?? 0)
+    const appliedBias = scoreMode === 'custom'
+      ? (parsedScoreBias ?? getEffectiveScoreBias(editingAccount))
+      : getDefaultScoreBias(editingAccount.plan_type)
+    const baseConcurrency = concurrencyMode === 'custom'
+      ? (parsedBaseConcurrency ?? getEffectiveBaseConcurrency(editingAccount))
+      : getEffectiveBaseConcurrency(editingAccount)
+
+    return {
+      rawScore,
+      dispatchScore: computePreviewDispatchScore(editingAccount, rawScore, appliedBias),
+      healthTier: editingAccount.health_tier,
+      dynamicConcurrency: computePreviewDynamicConcurrency(editingAccount, baseConcurrency),
+      appliedBias,
+      baseConcurrency,
+    }
+  }, [editingAccount, scoreMode, parsedScoreBias, concurrencyMode, parsedBaseConcurrency])
+
+  const handleSaveScheduler = async () => {
+    if (!editingAccount) return
+    if (scoreInputInvalid || concurrencyInputInvalid) {
+      showToast(t('accounts.schedulerInvalidInput'), 'error')
+      return
+    }
+
+    setEditSubmitting(true)
+    try {
+      const payload = {
+        score_bias_override: scoreMode === 'custom' ? parsedScoreBias : null,
+        base_concurrency_override: concurrencyMode === 'custom' ? parsedBaseConcurrency : null,
+      }
+      await api.updateAccountScheduler(editingAccount.id, payload)
+      showToast(t('accounts.schedulerSaveSuccess'))
+      await reload()
+      closeSchedulerEditor(true)
+    } catch (error) {
+      showToast(t('accounts.schedulerSaveFailed', { error: getErrorMessage(error) }), 'error')
+    } finally {
+      setEditSubmitting(false)
     }
   }
 
@@ -1043,6 +1148,9 @@ export default function Accounts() {
               <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(false)}>
                 <Unlock className="size-3 mr-1" />{t('accounts.unlock')}
               </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchResetStatus()}>
+                <RotateCcw className="size-3 mr-1" />{t('accounts.batchResetStatus')}
+              </Button>
               <Button variant="destructive" size="sm" disabled={batchLoading} onClick={() => void handleBatchDelete()}>
                 {t('accounts.batchDelete')}
               </Button>
@@ -1149,7 +1257,7 @@ export default function Accounts() {
                             <div className="text-[11px] text-muted-foreground">
                               {t('accounts.healthSummary', {
                                 health: formatHealthTier(account.health_tier, t),
-                                score: Math.round(account.scheduler_score ?? 0),
+                                score: Math.round(getDispatchScore(account)),
                                 concurrency: account.dynamic_concurrency_limit ?? '-',
                               })}
                             </div>
@@ -1169,6 +1277,15 @@ export default function Accounts() {
                         <TableCell className="text-[14px] text-muted-foreground">{formatRelativeTime(account.updated_at)}</TableCell>
                         <TableCell className="text-right">
                           <div className="flex items-center gap-1 justify-end">
+                            <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-7 w-8 px-0"
+                              onClick={() => openSchedulerEditor(account)}
+                              title={t('accounts.editScheduler')}
+                            >
+                              <Pencil className="size-3.5" />
+                            </Button>
                             <Button
                               variant="outline"
                               size="icon"
@@ -1216,6 +1333,15 @@ export default function Accounts() {
                               {account.locked ? <Lock className="size-3.5" /> : <Unlock className="size-3.5" />}
                             </Button>
                             <Button
+                              variant="outline"
+                              size="icon"
+                              className="h-7 w-8 px-0"
+                              onClick={() => void handleResetStatus(account)}
+                              title={t('accounts.resetStatusHint')}
+                            >
+                              <RotateCcw className="size-3.5" />
+                            </Button>
+                            <Button
                               variant="destructive"
                               size="icon"
                               className="h-7 w-8 px-0"
@@ -1232,11 +1358,16 @@ export default function Accounts() {
                 </Table>
               </div>
               <Pagination
-                page={page}
+                page={currentPage}
                 totalPages={totalPages}
                 onPageChange={setPage}
-                totalItems={accounts.length}
-                pageSize={PAGE_SIZE}
+                totalItems={sortedAccounts.length}
+                pageSize={pageSize}
+                pageSizeOptions={pageSizeOptions}
+                onPageSizeChange={(nextPageSize) => {
+                  setPageSize(nextPageSize)
+                  setPage(1)
+                }}
               />
             </StateShell>
           </CardContent>
@@ -1703,6 +1834,112 @@ export default function Accounts() {
         )}
 
         <Modal
+          show={Boolean(editingAccount)}
+          title={t('accounts.schedulerEditTitle')}
+          contentClassName="sm:max-w-[680px]"
+          onClose={closeSchedulerEditor}
+          footer={(
+            <>
+              <Button variant="outline" onClick={() => closeSchedulerEditor()} disabled={editSubmitting}>
+                {t('common.cancel')}
+              </Button>
+              <Button onClick={() => void handleSaveScheduler()} disabled={editSubmitting || scoreInputInvalid || concurrencyInputInvalid}>
+                {editSubmitting ? t('common.saving') : t('common.save')}
+              </Button>
+            </>
+          )}
+        >
+          {editingAccount && editPreview ? (
+            <div className="space-y-5">
+              <div className="rounded-xl border border-border bg-muted/30 px-4 py-3 text-sm text-muted-foreground">
+                <div className="font-semibold text-foreground">{editingAccount.email || `ID ${editingAccount.id}`}</div>
+                <div className="mt-1">{t('accounts.schedulerEditDesc', { plan: editingAccount.plan_type || '-' })}</div>
+              </div>
+
+              <div className="grid gap-4 md:grid-cols-2">
+                <div className="rounded-xl border border-border p-4">
+                  <div className="text-sm font-semibold text-foreground">{t('accounts.schedulerScoreLabel')}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">{t('accounts.schedulerScoreHint')}</div>
+                  <div className="mt-3 flex gap-2">
+                    <TogglePill
+                      active={scoreMode === 'default'}
+                      onClick={() => setScoreMode('default')}
+                      label={t('accounts.schedulerScoreAuto')}
+                    />
+                    <TogglePill
+                      active={scoreMode === 'custom'}
+                      onClick={() => setScoreMode('custom')}
+                      label={t('accounts.schedulerCustom')}
+                    />
+                  </div>
+                  {scoreMode === 'default' ? (
+                    <div className="mt-3 rounded-lg border border-dashed border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                      {t('accounts.schedulerScoreAutoValue', { value: formatSignedNumber(getDefaultScoreBias(editingAccount.plan_type)) })}
+                    </div>
+                  ) : (
+                    <div className="mt-3 space-y-2">
+                      <Input
+                        inputMode="numeric"
+                        value={scoreInput}
+                        onChange={(event: ChangeEvent<HTMLInputElement>) => setScoreInput(event.target.value)}
+                        placeholder={t('accounts.schedulerScorePlaceholder')}
+                      />
+                      <div className={`text-xs ${scoreInputInvalid ? 'text-red-500' : 'text-muted-foreground'}`}>
+                        {scoreInputInvalid ? t('accounts.schedulerScoreRange') : t('accounts.schedulerCustomValuePreview', { value: formatSignedNumber(parsedScoreBias ?? getEffectiveScoreBias(editingAccount)) })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                <div className="rounded-xl border border-border p-4">
+                  <div className="text-sm font-semibold text-foreground">{t('accounts.schedulerConcurrencyLabel')}</div>
+                  <div className="mt-1 text-xs text-muted-foreground">{t('accounts.schedulerConcurrencyHint')}</div>
+                  <div className="mt-3 flex gap-2">
+                    <TogglePill
+                      active={concurrencyMode === 'default'}
+                      onClick={() => setConcurrencyMode('default')}
+                      label={t('accounts.schedulerConcurrencyAuto')}
+                    />
+                    <TogglePill
+                      active={concurrencyMode === 'custom'}
+                      onClick={() => setConcurrencyMode('custom')}
+                      label={t('accounts.schedulerCustom')}
+                    />
+                  </div>
+                  {concurrencyMode === 'default' ? (
+                    <div className="mt-3 rounded-lg border border-dashed border-border bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                      {t('accounts.schedulerConcurrencyAutoValue', { value: getEffectiveBaseConcurrency(editingAccount) })}
+                    </div>
+                  ) : (
+                    <div className="mt-3 space-y-2">
+                      <Input
+                        inputMode="numeric"
+                        value={concurrencyInput}
+                        onChange={(event: ChangeEvent<HTMLInputElement>) => setConcurrencyInput(event.target.value)}
+                        placeholder={t('accounts.schedulerConcurrencyPlaceholder')}
+                      />
+                      <div className={`text-xs ${concurrencyInputInvalid ? 'text-red-500' : 'text-muted-foreground'}`}>
+                        {concurrencyInputInvalid ? t('accounts.schedulerConcurrencyRange') : t('accounts.schedulerCustomValuePreview', { value: parsedBaseConcurrency ?? getEffectiveBaseConcurrency(editingAccount) })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-xl border border-border bg-white/60 px-4 py-4 dark:bg-white/5">
+                <div className="text-sm font-semibold text-foreground">{t('accounts.schedulerPreviewTitle')}</div>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  <PreviewItem label={t('accounts.schedulerPreviewRawScore')} value={String(editPreview.rawScore)} />
+                  <PreviewItem label={t('accounts.schedulerPreviewDispatchScore')} value={String(editPreview.dispatchScore)} />
+                  <PreviewItem label={t('accounts.schedulerPreviewHealthTier')} value={formatHealthTier(editPreview.healthTier, t)} />
+                  <PreviewItem label={t('accounts.schedulerPreviewDynamicConcurrency')} value={String(editPreview.dynamicConcurrency)} />
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </Modal>
+
+        <Modal
           show={importProgress.show}
           title={importProgress.done ? t('accounts.importDone') : t('accounts.importingProgress')}
           contentClassName="sm:max-w-[420px]"
@@ -1758,6 +1995,122 @@ function downloadBlob(blob: Blob, filename: string) {
   a.click()
   document.body.removeChild(a)
   URL.revokeObjectURL(url)
+}
+
+function TogglePill({
+  active,
+  onClick,
+  label,
+}: {
+  active: boolean
+  onClick: () => void
+  label: string
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`rounded-full px-3 py-1.5 text-xs font-semibold transition-colors ${
+        active
+          ? 'bg-primary text-primary-foreground'
+          : 'bg-muted/50 text-muted-foreground hover:bg-muted'
+      }`}
+    >
+      {label}
+    </button>
+  )
+}
+
+function PreviewItem({
+  label,
+  value,
+}: {
+  label: string
+  value: string
+}) {
+  return (
+    <div className="rounded-lg border border-border bg-muted/20 px-3 py-3">
+      <div className="text-[11px] font-semibold text-muted-foreground">{label}</div>
+      <div className="mt-1 text-base font-semibold text-foreground">{value}</div>
+    </div>
+  )
+}
+
+function parseIntegerInput(value: string): number | null {
+  const trimmed = value.trim()
+  if (!trimmed || !/^-?\d+$/.test(trimmed)) {
+    return null
+  }
+
+  return Number.parseInt(trimmed, 10)
+}
+
+function getDispatchScore(account: AccountRow): number {
+  return account.dispatch_score ?? account.scheduler_score ?? 0
+}
+
+function getDefaultScoreBias(planType?: string): number {
+  switch ((planType || '').toLowerCase()) {
+    case 'pro':
+    case 'plus':
+    case 'team':
+      return 50
+    default:
+      return 0
+  }
+}
+
+function getEffectiveScoreBias(account: AccountRow): number {
+  if (typeof account.score_bias_effective === 'number') {
+    return account.score_bias_effective
+  }
+  if (typeof account.score_bias_override === 'number') {
+    return account.score_bias_override
+  }
+  return getDefaultScoreBias(account.plan_type)
+}
+
+function getEffectiveBaseConcurrency(account: AccountRow): number {
+  if (typeof account.base_concurrency_effective === 'number' && account.base_concurrency_effective > 0) {
+    return account.base_concurrency_effective
+  }
+  if (typeof account.base_concurrency_override === 'number' && account.base_concurrency_override > 0) {
+    return account.base_concurrency_override
+  }
+  if (typeof account.dynamic_concurrency_limit === 'number' && account.dynamic_concurrency_limit > 0) {
+    return account.dynamic_concurrency_limit
+  }
+  return 1
+}
+
+function computePreviewDispatchScore(account: AccountRow, rawScore: number, appliedBias: number): number {
+  if (
+    (account.health_tier === 'healthy' || account.health_tier === 'warm') &&
+    (account.status === 'active' || account.status === 'ready')
+  ) {
+    return rawScore + appliedBias
+  }
+  return rawScore
+}
+
+function computePreviewDynamicConcurrency(account: AccountRow, baseConcurrency: number): number {
+  switch (account.health_tier) {
+    case 'healthy':
+      return baseConcurrency
+    case 'warm':
+      return Math.max(1, Math.floor(baseConcurrency / 2))
+    case 'risky':
+      return 1
+    case 'banned':
+      return 0
+    default:
+      return account.dynamic_concurrency_limit ?? baseConcurrency
+  }
+}
+
+function formatSignedNumber(value: number): string {
+  if (value > 0) return `+${value}`
+  return String(value)
 }
 
 function CompactStat({
@@ -2102,6 +2455,13 @@ function TestConnectionModal({
             >
               {formattedErrorMsg}
             </pre>
+          </div>
+        )}
+
+        {status === 'success' && (
+          <div className="flex items-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-700 dark:border-emerald-900/50 dark:bg-emerald-950/30 dark:text-emerald-400">
+            <RotateCcw className="size-4 shrink-0" />
+            {t('accounts.testAutoReset')}
           </div>
         )}
       </div>
