@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 	"time"
@@ -54,6 +55,16 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()
 	targetAPIKeyID := int64(7)
+
+	accountCredentials := []string{
+		`{"email":"plus@example.com","plan_type":"plus"}`,
+		`{"email":"free@example.com","plan_type":"free"}`,
+	}
+	for idx, credentials := range accountCredentials {
+		if _, err := db.conn.ExecContext(ctx, `INSERT INTO accounts (id, name, credentials, proxy_url) VALUES ($1, $2, $3, '')`, idx+1, "test", credentials); err != nil {
+			t.Fatalf("插入测试账号返回错误: %v", err)
+		}
+	}
 
 	logs := []*UsageLogInput{
 		{
@@ -113,6 +124,12 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 			if usageLog.APIKeyMasked != "sk-a****...****1111" {
 				t.Fatalf("APIKeyMasked = %q, want %q", usageLog.APIKeyMasked, "sk-a****...****1111")
 			}
+			if usageLog.AccountPlanType != "plus" {
+				t.Fatalf("AccountPlanType = %q, want %q", usageLog.AccountPlanType, "plus")
+			}
+			if usageLog.AccountEmail != "plus@example.com" {
+				t.Fatalf("AccountEmail = %q, want %q", usageLog.AccountEmail, "plus@example.com")
+			}
 		}
 	}
 	if !foundSnapshot {
@@ -143,6 +160,30 @@ func TestUsageLogsFilterByAPIKeyID(t *testing.T) {
 		if usageLog.APIKeyName != "Team A" {
 			t.Fatalf("APIKeyName = %q, want %q", usageLog.APIKeyName, "Team A")
 		}
+		if usageLog.AccountPlanType != "plus" {
+			t.Fatalf("AccountPlanType = %q, want %q", usageLog.AccountPlanType, "plus")
+		}
+	}
+}
+
+func TestUsageLogsMarshalAccountPlanType(t *testing.T) {
+	logEntry := &UsageLog{
+		ID:              1,
+		AccountEmail:    "plus@example.com",
+		AccountPlanType: "plus",
+	}
+
+	data, err := json.Marshal(logEntry)
+	if err != nil {
+		t.Fatalf("json.Marshal 返回错误: %v", err)
+	}
+
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal 返回错误: %v", err)
+	}
+	if got := decoded["account_plan_type"]; got != "plus" {
+		t.Fatalf("account_plan_type = %v, want %q", got, "plus")
 	}
 }
 

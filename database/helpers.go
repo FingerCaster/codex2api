@@ -139,6 +139,10 @@ func accountEmailFromRawCredentials(raw interface{}) string {
 	return credentialString(raw, "email")
 }
 
+func accountPlanTypeFromRawCredentials(raw interface{}) string {
+	return credentialString(raw, "plan_type")
+}
+
 func (db *DB) isSQLite() bool {
 	return db != nil && db.driver == "sqlite"
 }

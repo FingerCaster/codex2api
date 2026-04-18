@@ -93,6 +93,24 @@ function formatUsageAPIKeyLabel(name?: string, maskedKey?: string): string {
   return `${trimmedKey.slice(0, 4)}...${trimmedKey.slice(-4)}`
 }
 
+function normalizePlanType(planType?: string | null): string {
+  return (planType || '').trim().toLowerCase()
+}
+
+function getPlanBadgeClassName(planType?: string | null): string {
+  const normalized = normalizePlanType(planType)
+  if (normalized === 'free') {
+    return 'border-transparent bg-slate-500/12 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'
+  }
+  if (normalized === 'plus') {
+    return 'border-transparent bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400'
+  }
+  if (normalized === 'pro' || normalized === 'team' || normalized === 'teamplus') {
+    return 'border-transparent bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400'
+  }
+  return 'border-transparent bg-amber-500/12 text-amber-600 dark:bg-amber-500/20 dark:text-amber-400'
+}
+
 export default function Usage() {
   const { t } = useTranslation()
   const { toast, showToast } = useToast()
@@ -572,7 +590,14 @@ export default function Usage() {
                           </div>
                         </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
-                          {log.account_email || '-'}
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span>{log.account_email || '-'}</span>
+                            {normalizePlanType(log.account_plan_type) && (
+                              <Badge variant="outline" className={`text-[11px] font-medium ${getPlanBadgeClassName(log.account_plan_type)}`}>
+                                {normalizePlanType(log.account_plan_type)}
+                              </Badge>
+                            )}
+                          </div>
                         </TableCell>
                         <TableCell className="text-[14px] text-muted-foreground">
                           <span className="block max-w-[180px] truncate whitespace-nowrap" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>

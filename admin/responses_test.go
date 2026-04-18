@@ -384,31 +384,31 @@ func TestAccountsResponse(t *testing.T) {
 
 func TestAccountResponseFields(t *testing.T) {
 	resp := accountResponse{
-		ID:                      1,
-		Name:                    "Test Account",
-		Email:                   "test@example.com",
-		PlanType:                "plus",
-		Status:                  "active",
-		HealthTier:              "healthy",
-		SchedulerScore:          95.5,
-		ConcurrencyCap:          4,
-		ProxyURL:                "http://proxy:8080",
-		CreatedAt:               time.Now().Format(time.RFC3339),
-		UpdatedAt:               time.Now().Format(time.RFC3339),
-		ActiveRequests:          2,
-		TotalRequests:           100,
-		LastUsedAt:              time.Now().Format(time.RFC3339),
-		SuccessRequests:         95,
-		ErrorRequests:           5,
-		UsagePercent7d:          floatPtr(75.5),
-		UsagePercent5h:          floatPtr(50.0),
-		Reset5hAt:               time.Now().Format(time.RFC3339),
-		Reset7dAt:               time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339),
-		ScoreBreakdown:          schedulerBreakdownResponse{},
-		LastUnauthorizedAt:      time.Now().Format(time.RFC3339),
-		LastRateLimitedAt:       time.Now().Format(time.RFC3339),
-		LastTimeoutAt:           time.Now().Format(time.RFC3339),
-		LastServerErrorAt:       time.Now().Format(time.RFC3339),
+		ID:                 1,
+		Name:               "Test Account",
+		Email:              "test@example.com",
+		PlanType:           "plus",
+		Status:             "active",
+		HealthTier:         "healthy",
+		SchedulerScore:     95.5,
+		ConcurrencyCap:     4,
+		ProxyURL:           "http://proxy:8080",
+		CreatedAt:          time.Now().Format(time.RFC3339),
+		UpdatedAt:          time.Now().Format(time.RFC3339),
+		ActiveRequests:     2,
+		TotalRequests:      100,
+		LastUsedAt:         time.Now().Format(time.RFC3339),
+		SuccessRequests:    95,
+		ErrorRequests:      5,
+		UsagePercent7d:     floatPtr(75.5),
+		UsagePercent5h:     floatPtr(50.0),
+		Reset5hAt:          time.Now().Format(time.RFC3339),
+		Reset7dAt:          time.Now().Add(7 * 24 * time.Hour).Format(time.RFC3339),
+		ScoreBreakdown:     schedulerBreakdownResponse{},
+		LastUnauthorizedAt: time.Now().Format(time.RFC3339),
+		LastRateLimitedAt:  time.Now().Format(time.RFC3339),
+		LastTimeoutAt:      time.Now().Format(time.RFC3339),
+		LastServerErrorAt:  time.Now().Format(time.RFC3339),
 	}
 
 	if resp.Name != "Test Account" {
@@ -453,10 +453,11 @@ func TestUsageLogsResponse(t *testing.T) {
 	resp := usageLogsResponse{
 		Logs: []*database.UsageLog{
 			{
-				ID:           1,
-				APIKeyID:     3,
-				APIKeyName:   "Team A",
-				APIKeyMasked: "sk-a****...****1111",
+				ID:              1,
+				APIKeyID:        3,
+				APIKeyName:      "Team A",
+				APIKeyMasked:    "sk-a****...****1111",
+				AccountPlanType: "plus",
 			},
 		},
 	}
@@ -486,6 +487,9 @@ func TestUsageLogsResponse(t *testing.T) {
 	}
 	if got := decoded.Logs[0]["api_key_masked"]; got != "sk-a****...****1111" {
 		t.Fatalf("api_key_masked = %v, want %q", got, "sk-a****...****1111")
+	}
+	if got := decoded.Logs[0]["account_plan_type"]; got != "plus" {
+		t.Fatalf("account_plan_type = %v, want %q", got, "plus")
 	}
 }
 

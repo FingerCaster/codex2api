@@ -271,6 +271,7 @@ export interface UsageLog {
   api_key_name: string
   api_key_masked: string
   account_email: string
+  account_plan_type: string
   created_at: ISODateString
 }
 

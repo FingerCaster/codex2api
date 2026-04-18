@@ -710,6 +710,7 @@ type UsageLog struct {
 	APIKeyName       string    `json:"api_key_name"`
 	APIKeyMasked     string    `json:"api_key_masked"`
 	AccountEmail     string    `json:"account_email"`
+	AccountPlanType  string    `json:"account_plan_type"`
 	CreatedAt        time.Time `json:"created_at"`
 }
 
@@ -1124,6 +1125,7 @@ func (db *DB) ListRecentUsageLogs(ctx context.Context, limit int) ([]*UsageLog, 
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
+		l.AccountPlanType = accountPlanTypeFromRawCredentials(credentialRaw)
 		l.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 		if err != nil {
 			return nil, err
@@ -1363,6 +1365,7 @@ func (db *DB) ListUsageLogsByTimeRange(ctx context.Context, start, end time.Time
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
+		l.AccountPlanType = accountPlanTypeFromRawCredentials(credentialRaw)
 		l.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 		if err != nil {
 			return nil, err
@@ -1546,6 +1549,7 @@ func (db *DB) ListUsageLogsByTimeRangePaged(ctx context.Context, f UsageLogFilte
 			return nil, err
 		}
 		l.AccountEmail = accountEmailFromRawCredentials(credentialRaw)
+		l.AccountPlanType = accountPlanTypeFromRawCredentials(credentialRaw)
 		l.CreatedAt, err = parseDBTimeValue(createdAtRaw)
 		if err != nil {
 			return nil, err
