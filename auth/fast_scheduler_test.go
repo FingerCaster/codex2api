@@ -120,6 +120,33 @@ func TestFastSchedulerUpdateMovesAccountBetweenBuckets(t *testing.T) {
 	}
 }
 
+func TestFastSchedulerIncludesAPIKeyAccounts(t *testing.T) {
+	acc := &Account{
+		DBID:                    1322,
+		Type:                    "api_key",
+		BaseURL:                 "https://api.9527code.com",
+		APIKey:                  "sk-test",
+		Status:                  StatusReady,
+		HealthTier:              HealthTierHealthy,
+		SchedulerScore:          100,
+		DispatchScore:           100,
+		BaseConcurrencyEffective: 2,
+		DynamicConcurrencyLimit: 2,
+	}
+
+	scheduler := NewFastScheduler(2)
+	scheduler.Rebuild([]*Account{acc})
+
+	got := scheduler.Acquire()
+	if got == nil {
+		t.Fatal("Acquire() returned nil for api_key account")
+	}
+	if got.DBID != acc.DBID {
+		t.Fatalf("Acquire() picked dbID=%d, want %d", got.DBID, acc.DBID)
+	}
+	scheduler.Release(got)
+}
+
 func TestFastSchedulerSkipsStaleBucketEntryWithoutUpdate(t *testing.T) {
 	acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
 	scheduler := NewFastScheduler(1)

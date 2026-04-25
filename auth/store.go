@@ -438,7 +438,7 @@ func (a *Account) dispatchBonusEligibleLocked(now time.Time, tier AccountHealthT
 	if a.usageExhaustedLocked() {
 		return false
 	}
-	if a.AccessToken == "" {
+	if a.AccessToken == "" && !(a.Type == "api_key" && a.BaseURL != "" && a.APIKey != "") {
 		return false
 	}
 	return true
@@ -1391,6 +1391,8 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 				HealthTier:   HealthTierHealthy,
 				AddedAt:      row.CreatedAt.UnixNano(),
 			}
+			account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
+			account.BaseConcurrencyOverride = reflectOptionalInt64Field(row, "BaseConcurrencyOverride")
 			if row.Locked {
 				atomic.StoreInt32(&account.Locked, 1)
 			}

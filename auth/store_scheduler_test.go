@@ -56,6 +56,25 @@ func TestAccountScoreBiasOverrideReplacesPlanDefault(t *testing.T) {
 	}
 }
 
+func TestAPIKeyAccountScoreBiasOverrideApplies(t *testing.T) {
+	acc := &Account{
+		Type:              "api_key",
+		BaseURL:           "https://api.example.com",
+		APIKey:            "sk-test",
+		Status:            StatusReady,
+		ScoreBiasOverride: int64Ptr(30),
+	}
+
+	recomputeTestAccount(acc, 6)
+
+	if acc.DispatchScore != 130 {
+		t.Fatalf("DispatchScore = %v, want 130", acc.DispatchScore)
+	}
+	if acc.ScoreBiasEffective != 30 {
+		t.Fatalf("ScoreBiasEffective = %d, want 30", acc.ScoreBiasEffective)
+	}
+}
+
 func TestAccountRiskyTierDoesNotApplyScoreBias(t *testing.T) {
 	acc := &Account{
 		AccessToken:        "token",

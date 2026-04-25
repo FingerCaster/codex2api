@@ -377,7 +377,8 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 	if score == 0 && a.SchedulerScore != 0 {
 		score = a.SchedulerScore
 	}
-	if score == 0 && tier != HealthTierBanned && a.AccessToken != "" && a.Status != StatusError {
+	hasCredential := a.AccessToken != "" || (a.Type == "api_key" && a.BaseURL != "" && a.APIKey != "")
+	if score == 0 && tier != HealthTierBanned && hasCredential && a.Status != StatusError {
 		rawScore := 100.0
 		appliedBias := a.effectiveScoreBiasLocked(now, tier)
 		score = rawScore + float64(appliedBias)
@@ -390,7 +391,7 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 		limit = concurrencyLimitForTier(baseConcurrencyEffective, tier)
 	}
 
-	available := a.Status != StatusError && tier != HealthTierBanned && a.AccessToken != ""
+	available := a.Status != StatusError && tier != HealthTierBanned && hasCredential
 	if atomic.LoadInt32(&a.ManualDisabled) != 0 {
 		available = false
 	}
