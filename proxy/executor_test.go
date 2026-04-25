@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/codex2api/auth"
@@ -141,6 +142,32 @@ func TestShouldTransparentRetryStream(t *testing.T) {
 	}
 	if shouldTransparentRetryStream(retryable, 0, 2, false, context.Canceled, nil) {
 		t.Fatal("expected retry to stop when downstream context is canceled")
+	}
+}
+
+func TestGetGenericPooledClientUsesStandardTransport(t *testing.T) {
+	genericClientPool = sync.Map{}
+
+	account := &auth.Account{DBID: 1322}
+	client := getGenericPooledClient(account, "")
+	if client == nil {
+		t.Fatal("expected generic client, got nil")
+	}
+	if _, ok := client.Transport.(*http.Transport); !ok {
+		t.Fatalf("expected generic upstream to use *http.Transport, got %T", client.Transport)
+	}
+}
+
+func TestGetPooledClientUsesUTLSTransport(t *testing.T) {
+	clientPool = sync.Map{}
+
+	account := &auth.Account{DBID: 42}
+	client := getPooledClient(account, "")
+	if client == nil {
+		t.Fatal("expected codex client, got nil")
+	}
+	if _, ok := client.Transport.(*utlsRoundTripper); !ok {
+		t.Fatalf("expected codex upstream to use *utlsRoundTripper, got %T", client.Transport)
 	}
 }
 

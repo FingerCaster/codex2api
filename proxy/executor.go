@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -35,6 +36,7 @@ func (e *poolEntry) touch() {
 }
 
 var clientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL
+var genericClientPool sync.Map // map[string]*poolEntry, key = accountID|proxyURL
 
 // clientPoolTTL 未使用超过此时间的 Client 将被淘汰
 const clientPoolTTL = 5 * time.Minute
@@ -54,11 +56,16 @@ func init() {
 }
 
 func evictExpiredClients() {
+	evictExpiredClientsFromPool(&clientPool)
+	evictExpiredClientsFromPool(&genericClientPool)
+}
+
+func evictExpiredClientsFromPool(pool *sync.Map) {
 	cutoff := time.Now().Add(-clientPoolTTL).UnixNano()
-	clientPool.Range(func(key, value any) bool {
+	pool.Range(func(key, value any) bool {
 		entry := value.(*poolEntry)
 		if entry.lastUsed.Load() < cutoff {
-			clientPool.Delete(key)
+			pool.Delete(key)
 			entry.client.CloseIdleConnections()
 		}
 		return true
@@ -81,8 +88,16 @@ func shouldRecyclePooledClient(err error) bool {
 }
 
 func recyclePooledClient(account *auth.Account, proxyURL string) {
+	recycleClientFromPool(&clientPool, account, proxyURL)
+}
+
+func recycleGenericPooledClient(account *auth.Account, proxyURL string) {
+	recycleClientFromPool(&genericClientPool, account, proxyURL)
+}
+
+func recycleClientFromPool(pool *sync.Map, account *auth.Account, proxyURL string) {
 	key := clientPoolKey(account, proxyURL)
-	if v, ok := clientPool.LoadAndDelete(key); ok {
+	if v, ok := pool.LoadAndDelete(key); ok {
 		v.(*poolEntry).client.CloseIdleConnections()
 	}
 }
@@ -123,6 +138,58 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 		return e.client
 	}
 	return entry.client
+}
+
+func getGenericPooledClient(account *auth.Account, proxyURL string) *http.Client {
+	key := clientPoolKey(account, proxyURL)
+	if v, ok := genericClientPool.Load(key); ok {
+		entry := v.(*poolEntry)
+		entry.touch()
+		return entry.client
+	}
+
+	transport := newGenericTransport(proxyURL)
+	entry := &poolEntry{
+		client: &http.Client{
+			Transport: transport,
+			Timeout:   0,
+		},
+	}
+	entry.touch()
+
+	if v, loaded := genericClientPool.LoadOrStore(key, entry); loaded {
+		e := v.(*poolEntry)
+		e.touch()
+		return e.client
+	}
+	return entry.client
+}
+
+func newGenericTransport(proxyURL string) *http.Transport {
+	baseDialer := &net.Dialer{
+		Timeout:   10 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}
+
+	transport := &http.Transport{
+		DialContext:           baseDialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          20,
+		MaxIdleConnsPerHost:   10,
+		MaxConnsPerHost:       20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	if proxyURL != "" {
+		if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
+			transport.Proxy = nil
+			transport.DialContext = baseDialer.DialContext
+		}
+	}
+
+	return transport
 }
 
 // Codex 上游常量

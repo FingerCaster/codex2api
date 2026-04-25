@@ -51,11 +51,12 @@ func ExecuteGenericOpenAIRequest(ctx context.Context, account *auth.Account, end
 		req.Header.Set(key, value)
 	}
 
-	client := getPooledClient(account, proxyURL)
+	// 通用 OpenAI 兼容上游不强制使用 uTLS + HTTP/2，避免仅支持 HTTP/1.1 的站点报错。
+	client := getGenericPooledClient(account, proxyURL)
 	resp, err := client.Do(req)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+			recycleGenericPooledClient(account, proxyURL)
 		}
 		return nil, ErrUpstream(0, "请求上游失败", err)
 	}
