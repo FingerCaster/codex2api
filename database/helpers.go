@@ -136,7 +136,10 @@ func credentialString(raw interface{}, key string) string {
 }
 
 func accountEmailFromRawCredentials(raw interface{}) string {
-	return credentialString(raw, "email")
+	if email := strings.TrimSpace(credentialString(raw, "email")); email != "" {
+		return email
+	}
+	return strings.TrimSpace(credentialString(raw, "provider_name"))
 }
 
 func accountPlanTypeFromRawCredentials(raw interface{}) string {
