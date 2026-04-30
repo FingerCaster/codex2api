@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -37,6 +38,18 @@ type Handler struct {
 	dbKeysMu    sync.RWMutex
 	dbKeys      map[string]*database.APIKeyRow
 	dbKeysUntil time.Time
+}
+
+func loadLegacyConfigKeys() map[string]bool {
+	keys := make(map[string]bool)
+	for _, raw := range strings.Split(os.Getenv("CODEX_API_KEYS"), ",") {
+		key := strings.TrimSpace(raw)
+		if key == "" {
+			continue
+		}
+		keys[key] = true
+	}
+	return keys
 }
 
 func (h *Handler) nextAccountForSession(sessionID string, apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
@@ -178,7 +191,7 @@ func noAvailableAnthropicAccountMessage(model string) string {
 func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
 	return &Handler{
 		store:      store,
-		configKeys: make(map[string]bool), // 不再使用硬编码，但保留结构以向后兼容逻辑
+		configKeys: loadLegacyConfigKeys(),
 		db:         db,
 		cfg:        cfg,
 		deviceCfg:  deviceCfg,
