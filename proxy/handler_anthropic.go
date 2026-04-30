@@ -102,15 +102,23 @@ func (h *Handler) Messages(c *gin.Context) {
 
 	// 2. 翻译请求: Anthropic → Codex
 	modelMappingJSON := h.store.GetModelMapping()
-	codexBody, originalModel, err := TranslateAnthropicToCodex(rawBody, modelMappingJSON)
+	codexBody, originalModel, err := TranslateAnthropicToCodexWithModels(rawBody, modelMappingJSON, h.supportedModelIDs(c.Request.Context()))
 	if err != nil {
 		sendAnthropicError(c, http.StatusBadRequest, "invalid_request_error", "Request translation failed: "+err.Error())
 		return
 	}
+	effectiveModel := effectiveRequestModel(codexBody, model)
+	if isImageOnlyModel(effectiveModel) {
+		sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", fmt.Sprintf("model %s is only supported on /v1/images/generations and /v1/images/edits", effectiveModel))
+		return
+	}
+	accountFilter := accountFilterForModel(effectiveModel)
 
 	// 提取 reasoning effort（从翻译后的 codex body 中）
 	reasoningEffort := extractReasoningEffort(codexBody)
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
+	apiKeyID := requestAPIKeyID(c)
+	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -120,15 +128,19 @@ func (h *Handler) Messages(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextCompatibleAccountForSession(c.Request.Context(), sessionID, excludeAccounts, 30*time.Second, func(acc *auth.Account) bool {
-			return !acc.IsAPIKeyProvider()
-		})
+		predicate := func(acc *auth.Account) bool {
+			if acc == nil || acc.IsAPIKeyProvider() {
+				return false
+			}
+			return accountFilter == nil || accountFilter(acc)
+		}
+		account, stickyProxyURL := h.nextCompatibleAccountForSession(c.Request.Context(), affinityKey, excludeAccounts, 30*time.Second, predicate)
 		if account == nil {
 			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
 				return
 			}
-			sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", "No compatible OAuth accounts available")
+			sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel))
 			return
 		}
 
@@ -165,7 +177,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
@@ -188,7 +200,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, string(errBody))
@@ -197,6 +209,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				AccountID:        account.ID(),
 				Endpoint:         "/v1/messages",
 				Model:            model,
+				EffectiveModel:   effectiveModel,
 				StatusCode:       resp.StatusCode,
 				DurationMs:       durationMs,
 				ReasoningEffort:  reasoningEffort,
@@ -227,7 +240,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		c.Set("x-account-email", account.Email)
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
-		c.Set("x-model", model)
+		c.Set("x-model", effectiveModel)
 		c.Set("x-reasoning-effort", reasoningEffort)
 
 		var firstTokenMs int
@@ -367,7 +380,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			continue
 		}
 
-		h.store.BindSessionAffinity(sessionID, account, proxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
@@ -390,6 +403,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			AccountID:        account.ID(),
 			Endpoint:         "/v1/messages",
 			Model:            model,
+			EffectiveModel:   effectiveModel,
 			StatusCode:       logStatusCode,
 			DurationMs:       totalDuration,
 			FirstTokenMs:     firstTokenMs,

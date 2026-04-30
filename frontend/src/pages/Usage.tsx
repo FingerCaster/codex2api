@@ -1,19 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
+import { getTimeRangeISO } from '../components/DashboardUsageCharts'
+import type { TimeRangeKey } from '../components/DashboardUsageCharts'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
 import ToastNotice from '../components/ToastNotice'
-import UsageRangePicker, { createUsageRangeValue, getUsageRangeLabel, getUsageRangeRequestRange } from '../components/UsageRangePicker'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import type { APIKeyRow, UsageLog, UsageStats } from '../types'
+import { formatCompactEmail } from '../lib/utils'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
 import {
   Table,
   TableBody,
@@ -22,34 +25,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X } from 'lucide-react'
+import { Activity, Box, Clock, Zap, AlertTriangle, Search, Brain, DatabaseZap, X, Image as ImageIcon } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
 function formatTokens(value?: number | null): string {
   if (value === undefined || value === null) return '0'
   return value.toLocaleString()
-}
-
-// Claude 模型 → Codex 模型映射（与后端 defaultAnthropicModelMap 一致）
-const CLAUDE_MODEL_MAP: Record<string, string> = {
-  'claude-opus-4-6': 'gpt-5.4',
-  'claude-opus-4-6-20250610': 'gpt-5.4',
-  'claude-haiku-4-5-20251001': 'gpt-5.4-mini',
-  'claude-haiku-4-5': 'gpt-5.4-mini',
-  'claude-sonnet-4-6': 'gpt-5.3-codex',
-  'claude-sonnet-4-5-20250929': 'gpt-5.2-codex',
-  'claude-opus-4-5-20251101': 'gpt-5.3-codex',
-  'claude-sonnet-4-5-20250514': 'gpt-5.4',
-  'claude-sonnet-4-5': 'gpt-5.4',
-  'claude-sonnet-4-20250514': 'gpt-5.4',
-  'claude-sonnet-4': 'gpt-5.4',
-  'claude-opus-4-20250514': 'gpt-5.4',
-  'claude-opus-4': 'gpt-5.4',
-}
-
-function getCodexModel(model: string): string {
-  return CLAUDE_MODEL_MAP[model] || 'gpt-5.4'
 }
 
 function getStatusBadgeClassName(statusCode: number): string {
@@ -70,6 +52,8 @@ function getStatusBadgeClassName(statusCode: number): string {
   }
   return 'border-transparent bg-slate-500/14 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'
 }
+
+const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
 
 function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
   return apiKey.name ? `${apiKey.name} · ${apiKey.key}` : apiKey.key
@@ -93,23 +77,71 @@ function formatUsageAPIKeyLabel(name?: string, maskedKey?: string): string {
   return `${trimmedKey.slice(0, 4)}...${trimmedKey.slice(-4)}`
 }
 
-function normalizePlanType(planType?: string | null): string {
-  return (planType || '').trim().toLowerCase()
+function isImageUsageLog(log: UsageLog): boolean {
+  const endpoint = log.inbound_endpoint || log.endpoint || ''
+  return endpoint.includes('/images/') || log.model?.startsWith('gpt-image-') || (log.image_count ?? 0) > 0
 }
 
-function getPlanBadgeClassName(planType?: string | null): string {
-  const normalized = normalizePlanType(planType)
-  if (normalized === 'free') {
-    return 'border-transparent bg-slate-500/12 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'
-  }
-  if (normalized === 'plus') {
-    return 'border-transparent bg-blue-500/12 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400'
-  }
-  if (normalized === 'pro' || normalized === 'team' || normalized === 'teamplus') {
-    return 'border-transparent bg-emerald-500/12 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400'
-  }
-  return 'border-transparent bg-amber-500/12 text-amber-600 dark:bg-amber-500/20 dark:text-amber-400'
+function formatImageBytes(bytes?: number | null): string {
+  if (!bytes || bytes <= 0) return ''
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`
 }
+
+function imageResolution(log: UsageLog): string {
+  if (log.image_width > 0 && log.image_height > 0) {
+    return `${log.image_width}×${log.image_height}`
+  }
+  return log.image_size || ''
+}
+
+function ImageUsageBadge({ log }: { log: UsageLog }) {
+  const { t } = useTranslation()
+  const rows = [
+    { label: t('usage.imageTooltipCount'), value: log.image_count > 0 ? String(log.image_count) : '' },
+    { label: t('usage.imageTooltipResolution'), value: imageResolution(log) },
+    { label: t('usage.imageTooltipBytes'), value: formatImageBytes(log.image_bytes) },
+    { label: t('usage.imageTooltipFormat'), value: log.image_format?.toUpperCase() || '' },
+    { label: t('usage.imageTooltipRequestSize'), value: log.image_size || '' },
+  ].filter((row) => row.value)
+  const title = rows.length > 0
+    ? rows.map((row) => `${row.label}: ${row.value}`).join('\n')
+    : t('usage.imageTooltipNoDetails')
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span
+          aria-label={title}
+          tabIndex={0}
+          className="inline-flex w-fit shrink-0 cursor-help items-center justify-center gap-0.5 rounded-full border border-transparent bg-cyan-500/12 px-2 py-0.5 text-[11px] font-semibold whitespace-nowrap text-cyan-700 transition-colors dark:bg-cyan-500/20 dark:text-cyan-300 [&>svg]:pointer-events-none [&>svg]:size-3"
+        >
+          <ImageIcon className="size-3" />
+          {t('usage.imageRequest')}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top" sideOffset={6} className="max-w-64 p-2.5">
+        <div className="space-y-1.5">
+          <div className="font-semibold">{t('usage.imageTooltipTitle')}</div>
+          {rows.length > 0 ? rows.map((row) => (
+            <div key={row.label} className="flex min-w-44 items-center justify-between gap-4">
+              <span className="text-background/70">{row.label}</span>
+              <span className="font-geist-mono tabular-nums">{row.value}</span>
+            </div>
+          )) : (
+            <div className="text-background/70">{t('usage.imageTooltipNoDetails')}</div>
+          )}
+        </div>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+const usageTableHeadClass = 'text-[12px] font-semibold'
+const usageTableTextClass = 'text-[14px]'
+const usageTableMonoClass = 'font-geist-mono text-[13px] tabular-nums'
+const usageTableBadgeClass = 'text-[13px]'
 
 export default function Usage() {
   const { t } = useTranslation()
@@ -118,7 +150,7 @@ export default function Usage() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [clearing, setClearing] = useState(false)
-  const [rangeValue, setRangeValue] = useState(() => createUsageRangeValue('all'))
+  const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
@@ -130,6 +162,7 @@ export default function Usage() {
   const [filterFast, setFilterFast] = useState('')
   const [filterStream, setFilterStream] = useState<'' | 'true' | 'false'>('')
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
+  const [modelOptions, setModelOptions] = useState<string[]>([])
   const [apiKeyLoadFailed, setAPIKeyLoadFailed] = useState(false)
   const showFastFilter = false
   const pageSizeOptions = [10, 20, 50, 100]
@@ -145,26 +178,11 @@ export default function Usage() {
     }, 400)
   }, [])
 
-  const getCurrentRequestRange = useCallback(
-    () => getUsageRangeRequestRange(rangeValue),
-    [rangeValue],
-  )
-
   // 仅加载轻量统计（秒级）
   const loadStats = useCallback(async () => {
-    const requestRange = getCurrentRequestRange()
-    const stats = await api.getUsageStats({
-      start: requestRange.start,
-      end: requestRange.end,
-      email: searchEmail || undefined,
-      model: filterModel || undefined,
-      endpoint: filterEndpoint || undefined,
-      apiKeyId: filterApiKeyId || undefined,
-      fast: filterFast || undefined,
-      stream: filterStream || undefined,
-    })
+    const stats = await api.getUsageStats()
     return { stats }
-  }, [getCurrentRequestRange, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: UsageStats | null
@@ -186,14 +204,11 @@ export default function Usage() {
 
   // 服务端分页加载日志
   const loadLogs = useCallback(async () => {
-    const requestRange = getCurrentRequestRange()
     setLogsLoading(true)
     try {
+      const { start, end } = getTimeRangeISO(timeRange)
       const res = await api.getUsageLogsPaged({
-        start: requestRange.start,
-        end: requestRange.end,
-        page,
-        pageSize,
+        start, end, page, pageSize,
         email: searchEmail || undefined,
         model: filterModel || undefined,
         endpoint: filterEndpoint || undefined,
@@ -208,7 +223,7 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [getCurrentRequestRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [timeRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   // 首次加载 + timeRange/page 变更时重新拉取日志
   useEffect(() => {
@@ -218,6 +233,26 @@ export default function Usage() {
   useEffect(() => {
     void loadAPIKeys()
   }, [loadAPIKeys])
+
+  useEffect(() => {
+    let active = true
+    const loadModels = async () => {
+      try {
+        const response = await api.getModels()
+        if (!active) return
+        const models = response.items && response.items.length > 0
+          ? response.items.filter((item) => item.enabled).map((item) => item.id)
+          : response.models ?? []
+        setModelOptions(models)
+      } catch {
+        if (active) setModelOptions([])
+      }
+    }
+    void loadModels()
+    return () => {
+      active = false
+    }
+  }, [])
 
   useEffect(() => {
     const timer = window.setInterval(() => {
@@ -240,17 +275,14 @@ export default function Usage() {
   const totalTokens = stats?.total_tokens ?? 0
   const totalPromptTokens = stats?.total_prompt_tokens ?? 0
   const totalCompletionTokens = stats?.total_completion_tokens ?? 0
+  const todayRequests = stats?.today_requests ?? 0
   const rpm = stats?.rpm ?? 0
   const tpm = stats?.tpm ?? 0
   const errorRate = stats?.error_rate ?? 0
   const avgDurationMs = stats?.avg_duration_ms ?? 0
-  const errorRequests = Math.round(totalRequests * errorRate / 100)
-  const successRequests = Math.max(0, totalRequests - errorRequests)
+  const successRequests = totalRequests - Math.round(totalRequests * errorRate / 100)
   const showAPIKeyFilter = !apiKeyLoadFailed && apiKeys.length > 0
   const hasActiveFilters = Boolean(searchInput || filterModel || filterEndpoint || filterApiKeyId || filterStream || filterFast)
-  const selectedAPIKey = apiKeys.find((apiKey) => String(apiKey.id) === filterApiKeyId) ?? null
-  const selectedAPIKeyLabel = selectedAPIKey ? formatAPIKeyOptionLabel(selectedAPIKey) : ''
-  const selectedRangeLabel = getUsageRangeLabel(rangeValue, (key) => t(key))
   const apiKeyOptions = [
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
@@ -273,40 +305,22 @@ export default function Usage() {
           onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
         />
 
-        <div className="mb-4 flex items-start justify-between gap-4 rounded-2xl border border-border bg-card/70 px-4 py-4 max-sm:flex-col">
-          <div>
-            <div className="text-[13px] font-medium text-foreground">{t('usage.rangeTitle')}</div>
-            <div className="mt-1 text-xs text-muted-foreground">
-              {selectedAPIKeyLabel
-                ? t('usage.rangeSummaryWithKey', { range: selectedRangeLabel, name: selectedAPIKeyLabel })
-                : t('usage.rangeSummary', { range: selectedRangeLabel })}
-            </div>
-          </div>
-          <UsageRangePicker
-            value={rangeValue}
-            onApply={(nextValue) => {
-              setRangeValue(nextValue)
-              setPage(1)
-            }}
-          />
-        </div>
-
         {/* Top stats: 2 columns */}
         <div className="grid grid-cols-2 gap-3 mb-3 max-sm:grid-cols-1">
           <Card className="py-0">
             <CardContent className="flex flex-col gap-2 p-4">
               <div className="flex items-center justify-between gap-3">
-                <span className="text-[11px] font-bold tracking-[0.12em] uppercase text-muted-foreground">{t('usage.totalRequestsCard')}</span>
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalRequestsCard')}</span>
                 <div className="size-10 flex items-center justify-center rounded-xl bg-primary/12 text-primary">
                   <Activity className="size-[18px]" />
                 </div>
               </div>
-              <div className="text-[28px] font-bold leading-none tracking-tighter">
+              <div className="text-[26px] font-bold leading-none">
                 {formatTokens(totalRequests)}
               </div>
               <div className="text-[12px] text-muted-foreground leading-relaxed">
                 <span className="text-[hsl(var(--success))]">● {t('usage.success')}: {formatTokens(successRequests)}</span>
-                <span className="ml-2 text-muted-foreground">● {t('usage.errors')}: {formatTokens(errorRequests)}</span>
+                <span className="ml-2 text-muted-foreground">● {t('usage.today')}: {formatTokens(todayRequests)}</span>
               </div>
             </CardContent>
           </Card>
@@ -314,12 +328,12 @@ export default function Usage() {
           <Card className="py-0">
             <CardContent className="flex flex-col gap-2 p-4">
               <div className="flex items-center justify-between gap-3">
-                <span className="text-[11px] font-bold tracking-[0.12em] uppercase text-muted-foreground">{t('usage.totalTokensCard')}</span>
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.totalTokensCard')}</span>
                 <div className="size-10 flex items-center justify-center rounded-xl bg-[hsl(var(--info-bg))] text-[hsl(var(--info))]">
                   <Box className="size-[18px]" />
                 </div>
               </div>
-              <div className="text-[28px] font-bold leading-none tracking-tighter">
+              <div className="text-[26px] font-bold leading-none">
                 {formatTokens(totalTokens)}
               </div>
               <div className="text-[12px] text-muted-foreground leading-relaxed">
@@ -335,12 +349,12 @@ export default function Usage() {
           <Card className="py-0">
             <CardContent className="flex flex-col gap-2 p-4">
               <div className="flex items-center justify-between gap-3">
-                <span className="text-[11px] font-bold tracking-[0.12em] uppercase text-muted-foreground">RPM</span>
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">RPM</span>
                 <div className="size-10 flex items-center justify-center rounded-xl bg-[hsl(var(--success-bg))] text-[hsl(var(--success))]">
                   <Clock className="size-[18px]" />
                 </div>
               </div>
-              <div className="text-[28px] font-bold leading-none tracking-tighter">
+              <div className="text-[26px] font-bold leading-none">
                 {Math.round(rpm)}
               </div>
               <div className="text-[12px] text-muted-foreground">{t('usage.rpmDesc')}</div>
@@ -350,12 +364,12 @@ export default function Usage() {
           <Card className="py-0">
             <CardContent className="flex flex-col gap-2 p-4">
               <div className="flex items-center justify-between gap-3">
-                <span className="text-[11px] font-bold tracking-[0.12em] uppercase text-muted-foreground">TPM</span>
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">TPM</span>
                 <div className="size-10 flex items-center justify-center rounded-xl bg-destructive/12 text-destructive">
                   <Zap className="size-[18px]" />
                 </div>
               </div>
-              <div className="text-[28px] font-bold leading-none tracking-tighter">
+              <div className="text-[26px] font-bold leading-none">
                 {formatTokens(tpm)}
               </div>
               <div className="text-[12px] text-muted-foreground">{t('usage.tpmDesc')}</div>
@@ -365,12 +379,12 @@ export default function Usage() {
           <Card className="py-0">
             <CardContent className="flex flex-col gap-2 p-4">
               <div className="flex items-center justify-between gap-3">
-                <span className="text-[11px] font-bold tracking-[0.12em] uppercase text-muted-foreground">{t('usage.errorRateCard')}</span>
+                <span className="text-[11px] font-bold uppercase text-muted-foreground">{t('usage.errorRateCard')}</span>
                 <div className="size-10 flex items-center justify-center rounded-xl bg-[hsl(36_72%_40%/0.12)] text-[hsl(36,72%,40%)]">
                   <AlertTriangle className="size-[18px]" />
                 </div>
               </div>
-              <div className="text-[28px] font-bold leading-none tracking-tighter">
+              <div className="text-[26px] font-bold leading-none">
                 {errorRate.toFixed(1)}%
               </div>
               <div className="text-[12px] text-muted-foreground">{t('usage.avgLatencyInline', { value: Math.round(avgDurationMs) })}</div>
@@ -380,10 +394,26 @@ export default function Usage() {
 
         {/* Logs table */}
         <Card>
-          <CardContent className="p-6">
+          <CardContent className="p-4">
             <div className="flex items-center justify-between gap-4 mb-4 flex-wrap">
               <div className="flex items-center gap-3">
                 <h3 className="text-base font-semibold text-foreground">{t('usage.requestLogs')}</h3>
+                <div className="inline-flex rounded-lg border border-border bg-muted/50 p-0.5">
+                  {TIME_RANGE_OPTIONS.map((key) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => { setTimeRange(key); setPage(1) }}
+                      className={`px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 ${
+                        timeRange === key
+                          ? 'bg-background text-foreground shadow-sm border border-border'
+                          : 'text-muted-foreground hover:text-foreground'
+                      }`}
+                    >
+                      {t(`dashboard.timeRange${key.toUpperCase()}`)}
+                    </button>
+                  ))}
+                </div>
               </div>
               <div className="flex items-center gap-3">
                 <span className="text-xs text-muted-foreground">{logsLoading ? t('common.loading') : t('usage.recordsCount', { count: logsTotal })}</span>
@@ -420,9 +450,9 @@ export default function Usage() {
             </div>
 
             {/* 筛选栏 */}
-            <div className="flex items-center gap-2 mb-4 flex-wrap">
+            <div className="toolbar-surface mb-4 flex flex-wrap items-center gap-2">
               {/* 搜索框 */}
-              <div className="relative w-80">
+              <div className="relative w-72 max-sm:w-full">
                 <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 size-3.5 text-muted-foreground pointer-events-none" />
                 <Input
                   className="pl-8 h-8 rounded-lg text-[13px]"
@@ -438,12 +468,12 @@ export default function Usage() {
                 compact
                 value={filterModel}
                 onValueChange={(v) => { setFilterModel(v); setPage(1) }}
-                placeholder={t('usage.allModels')}
-                options={[
-                  { label: t('usage.allModels'), value: '' },
-                  ...['gpt-5.4', 'gpt-5.4-mini', 'gpt-5', 'gpt-5-codex', 'gpt-5-codex-mini', 'gpt-5.1', 'gpt-5.1-codex', 'gpt-5.1-codex-mini', 'gpt-5.1-codex-max', 'gpt-5.2', 'gpt-5.2-codex', 'gpt-5.3-codex'].map((m) => ({ label: m, value: m })),
-                ]}
-              />
+	                placeholder={t('usage.allModels')}
+	                options={[
+	                  { label: t('usage.allModels'), value: '' },
+	                  ...modelOptions.map((m) => ({ label: m, value: m })),
+	                ]}
+	              />
 
               {/* 端点下拉 */}
               <Select
@@ -456,6 +486,8 @@ export default function Usage() {
                   { label: t('usage.allEndpoints'), value: '' },
                   { label: '/v1/chat/completions', value: '/v1/chat/completions' },
                   { label: '/v1/responses', value: '/v1/responses' },
+                  { label: '/v1/images/generations', value: '/v1/images/generations' },
+                  { label: '/v1/images/edits', value: '/v1/images/edits' },
                   { label: '/v1/messages', value: '/v1/messages' },
                 ]}
               />
@@ -525,21 +557,22 @@ export default function Usage() {
               emptyTitle={t('usage.emptyTitle')}
               emptyDescription={hasActiveFilters ? t('usage.emptyFilteredDesc') : t('usage.emptyDesc')}
             >
-              <div className="overflow-auto border border-border rounded-xl">
+              <div className="data-table-shell">
+                <TooltipProvider>
                 <Table>
                   <TableHeader>
                     <TableRow>
-                      <TableHead className="text-[14px] font-semibold">{t('usage.tableStatus')}</TableHead>
-                      <TableHead className="text-[14px] font-semibold">{t('usage.tableModel')}</TableHead>
-                      <TableHead className="text-[14px] font-semibold">{t('usage.tableAccount')}</TableHead>
-                      <TableHead className="text-[14px] font-semibold">{t('usage.tableApiKey')}</TableHead>
-                      <TableHead className="text-[16px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableEndpoint')}</TableHead>
-                      <TableHead className="text-[14px] font-semibold">{t('usage.tableType')}</TableHead>
-                      <TableHead className="text-[14px] font-semibold">{t('usage.tableToken')}</TableHead>
-                      <TableHead className="text-[14px] font-semibold">{t('usage.tableCached')}</TableHead>
-                      <TableHead className="text-[16px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableFirstToken')}</TableHead>
-                      <TableHead className="text-[16px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableDuration')}</TableHead>
-                      <TableHead className="text-[13px] font-semibold" style={{ fontFamily: "'Geist Mono', monospace" }}>{t('usage.tableTime')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableStatus')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableModel')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableAccount')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableApiKey')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableEndpoint')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableType')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableToken')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableCached')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableFirstToken')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableDuration')}</TableHead>
+                      <TableHead className={usageTableHeadClass}>{t('usage.tableTime')}</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -549,19 +582,19 @@ export default function Usage() {
                         <TableCell>
                           <Badge
                             variant="outline"
-                            className={`text-[14px] ${getStatusBadgeClassName(log.status_code)}`}
+                            className={`${usageTableBadgeClass} ${getStatusBadgeClassName(log.status_code)}`}
                           >
                             {log.status_code}
                           </Badge>
                         </TableCell>
                         <TableCell>
                           <div className="flex items-center gap-1.5 flex-wrap">
-                            <Badge variant="outline" className="text-[14px]">
+                            <Badge variant="outline" className={usageTableBadgeClass}>
                               {log.model || '-'}
                             </Badge>
-                            {log.model && log.model.startsWith('claude') && (
+                            {log.effective_model && log.effective_model !== log.model && (
                               <Badge variant="outline" className="text-[11px] font-medium border-transparent bg-blue-500/10 text-blue-600 dark:bg-blue-500/20 dark:text-blue-400">
-                                → {getCodexModel(log.model)}
+                                → {log.effective_model}
                               </Badge>
                             )}
                             {log.reasoning_effort && (
@@ -578,6 +611,9 @@ export default function Usage() {
                                 {log.reasoning_effort}
                               </Badge>
                             )}
+                            {isImageUsageLog(log) && (
+                              <ImageUsageBadge log={log} />
+                            )}
                             {log.service_tier === 'fast' && (
                               <Badge
                                 variant="outline"
@@ -589,23 +625,16 @@ export default function Usage() {
                             )}
                           </div>
                         </TableCell>
-                        <TableCell className="text-[14px] text-muted-foreground">
-                          <div className="flex items-center gap-1.5 flex-wrap">
-                            <span>{log.account_email || '-'}</span>
-                            {normalizePlanType(log.account_plan_type) && (
-                              <Badge variant="outline" className={`text-[11px] font-medium ${getPlanBadgeClassName(log.account_plan_type)}`}>
-                                {normalizePlanType(log.account_plan_type)}
-                              </Badge>
-                            )}
-                          </div>
+                        <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
+                          {formatCompactEmail(log.account_email)}
                         </TableCell>
-                        <TableCell className="text-[14px] text-muted-foreground">
+                        <TableCell className={`${usageTableTextClass} text-muted-foreground`}>
                           <span className="block max-w-[180px] truncate whitespace-nowrap" title={formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}>
                             {formatUsageAPIKeyLabel(log.api_key_name, log.api_key_masked) || t('usage.unknownApiKey')}
                           </span>
                         </TableCell>
                         <TableCell>
-                          <div className="text-[16px] leading-relaxed" style={{ fontFamily: "'Geist Mono', monospace" }}>
+                          <div className={`${usageTableMonoClass} leading-relaxed`}>
                             <span className="text-muted-foreground">
                               {log.inbound_endpoint || log.endpoint || '-'}
                             </span>
@@ -617,7 +646,7 @@ export default function Usage() {
                         <TableCell>
                           <Badge
                             variant="outline"
-                            className="text-[13px]"
+                            className={usageTableBadgeClass}
                             style={{
                               background: log.stream ? 'rgba(99, 102, 241, 0.12)' : 'rgba(107, 114, 128, 0.12)',
                               color: log.stream ? '#6366f1' : '#6b7280',
@@ -629,7 +658,7 @@ export default function Usage() {
                         </TableCell>
                         <TableCell>
                           {log.status_code < 400 && (log.input_tokens > 0 || log.output_tokens > 0) ? (
-                            <div className="text-[14px] leading-relaxed">
+                            <div className={`${usageTableMonoClass} leading-relaxed`}>
                               <span className="text-blue-500">↓{formatTokens(log.input_tokens)}</span>
                               <span className="mx-1 text-border">|</span>
                               <span className="text-emerald-500">↑{formatTokens(log.output_tokens)}</span>
@@ -641,32 +670,32 @@ export default function Usage() {
                               )}
                             </div>
                           ) : (
-                            <span className="text-[14px] text-muted-foreground">-</span>
+                            <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
                         </TableCell>
                         <TableCell>
                           {log.cached_tokens > 0 ? (
-                            <Badge variant="outline" className="text-[13px] gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400">
+                            <Badge variant="outline" className={`${usageTableBadgeClass} gap-1 border-transparent bg-indigo-500/10 text-indigo-600 dark:bg-indigo-500/20 dark:text-indigo-400`}>
                               <DatabaseZap className="size-3.5" />
                               {formatTokens(log.cached_tokens)}
                             </Badge>
                           ) : (
-                            <span className="text-[14px] text-muted-foreground">-</span>
+                            <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>
                           )}
                         </TableCell>
                         <TableCell>
                           {log.first_token_ms > 0 ? (
-                            <span className={`text-[16px] ${log.first_token_ms > 5000 ? 'text-red-500' : log.first_token_ms > 2000 ? 'text-amber-500' : 'text-emerald-500'}`} style={{ fontFamily: "'Geist Mono', monospace" }}>
+                            <span className={`${usageTableMonoClass} ${log.first_token_ms > 5000 ? 'text-red-500' : log.first_token_ms > 2000 ? 'text-amber-500' : 'text-emerald-500'}`}>
                               {log.first_token_ms > 1000 ? `${(log.first_token_ms / 1000).toFixed(1)}s` : `${log.first_token_ms}ms`}
                             </span>
-                          ) : <span className="text-[16px] text-muted-foreground" style={{ fontFamily: "'Geist Mono', monospace" }}>-</span>}
+                          ) : <span className={`${usageTableMonoClass} text-muted-foreground`}>-</span>}
                         </TableCell>
                         <TableCell>
-                          <span className={`text-[16px] ${log.duration_ms > 30000 ? 'text-red-500' : log.duration_ms > 10000 ? 'text-amber-500' : 'text-muted-foreground'}`} style={{ fontFamily: "'Geist Mono', monospace" }}>
+                          <span className={`${usageTableMonoClass} ${log.duration_ms > 30000 ? 'text-red-500' : log.duration_ms > 10000 ? 'text-amber-500' : 'text-muted-foreground'}`}>
                             {log.duration_ms > 1000 ? `${(log.duration_ms / 1000).toFixed(1)}s` : `${log.duration_ms}ms`}
                           </span>
                         </TableCell>
-                        <TableCell className="text-[12px] text-muted-foreground whitespace-nowrap" style={{ fontFamily: "'Geist Mono', monospace" }}>
+                        <TableCell className={`${usageTableMonoClass} text-muted-foreground whitespace-nowrap`}>
                           {formatBeijingTime(log.created_at)}
                         </TableCell>
                       </TableRow>
@@ -674,6 +703,7 @@ export default function Usage() {
                     })}
                   </TableBody>
                 </Table>
+                </TooltipProvider>
               </div>
               <Pagination
                 page={currentPage}

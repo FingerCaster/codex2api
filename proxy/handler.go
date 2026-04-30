@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -38,22 +39,26 @@ type Handler struct {
 	dbKeysUntil time.Time
 }
 
-func (h *Handler) nextAccountForSession(sessionID string, exclude map[int64]bool) (*auth.Account, string) {
+func (h *Handler) nextAccountForSession(sessionID string, apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
+	return h.nextAccountForSessionWithFilter(sessionID, apiKeyID, exclude, nil)
+}
+
+func (h *Handler) nextAccountForSessionWithFilter(sessionID string, apiKeyID int64, exclude map[int64]bool, filter auth.AccountFilter) (*auth.Account, string) {
 	if h == nil || h.store == nil {
 		return nil, ""
 	}
-	return h.store.NextForSession(sessionID, exclude)
+	return h.store.NextForSessionWithFilter(sessionID, apiKeyID, exclude, filter)
 }
 
 func (h *Handler) nextCompatibleAccountForSession(ctx context.Context, sessionID string, exclude map[int64]bool, timeout time.Duration, predicate func(*auth.Account) bool) (*auth.Account, string) {
 	waited := false
 	for {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, exclude)
+		account, stickyProxyURL := h.nextAccountForSession(sessionID, 0, exclude)
 		if account == nil {
 			if waited {
 				return nil, ""
 			}
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(ctx, sessionID, timeout, exclude)
+			account, stickyProxyURL = h.store.WaitForSessionAvailable(ctx, sessionID, timeout, 0, exclude)
 			waited = true
 			if account == nil {
 				return nil, ""
@@ -105,6 +110,69 @@ const (
 	contextAPIKeyName   = "apiKeyName"
 	contextAPIKeyMasked = "apiKeyMasked"
 )
+
+func requestAPIKeyID(c *gin.Context) int64 {
+	if c == nil {
+		return 0
+	}
+	if value, exists := c.Get(contextAPIKeyID); exists && value != nil {
+		switch typed := value.(type) {
+		case int64:
+			return typed
+		case int:
+			return int64(typed)
+		}
+	}
+	return 0
+}
+
+func sessionAffinityKey(sessionID string, apiKeyID int64) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" || apiKeyID <= 0 {
+		return sessionID
+	}
+	return fmt.Sprintf("%s::api-key:%d", sessionID, apiKeyID)
+}
+
+const proOnlySparkModel = "gpt-5.3-codex-spark"
+
+func isProOnlyModel(model string) bool {
+	return strings.EqualFold(strings.TrimSpace(model), proOnlySparkModel)
+}
+
+func accountFilterForModel(model string) auth.AccountFilter {
+	if !isProOnlyModel(model) {
+		return nil
+	}
+	return func(account *auth.Account) bool {
+		if account == nil {
+			return false
+		}
+		return strings.EqualFold(strings.TrimSpace(account.GetPlanType()), "pro")
+	}
+}
+
+func effectiveRequestModel(body []byte, fallback string) string {
+	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	if model != "" {
+		return model
+	}
+	return strings.TrimSpace(fallback)
+}
+
+func noAvailableAccountMessage(model string) string {
+	if isProOnlyModel(model) {
+		return "无可用 Pro 账号，gpt-5.3-codex-spark 仅支持 Pro 订阅账号"
+	}
+	return "无可用账号，请稍后重试"
+}
+
+func noAvailableAnthropicAccountMessage(model string) string {
+	if isProOnlyModel(model) {
+		return "No available Pro account for gpt-5.3-codex-spark"
+	}
+	return "No available accounts, please retry later"
+}
 
 // NewHandler 创建处理器
 func NewHandler(store *auth.Store, db *database.DB, cfg *config.Config, deviceCfg *DeviceProfileConfig) *Handler {
@@ -549,6 +617,114 @@ func shouldTransparentRetryStream(outcome streamOutcome, attempt int, maxRetries
 	return true
 }
 
+func imageGenerationOutputKey(item gjson.Result) string {
+	if key := strings.TrimSpace(item.Get("id").String()); key != "" {
+		return key
+	}
+	result := strings.TrimSpace(item.Get("result").String())
+	if result == "" {
+		return ""
+	}
+	return strings.TrimSpace(item.Get("output_format").String()) + "|" + result
+}
+
+func extractResponseImageGenerationOutput(data []byte, seen map[string]struct{}) (json.RawMessage, bool) {
+	if len(data) == 0 || !gjson.ValidBytes(data) {
+		return nil, false
+	}
+	if gjson.GetBytes(data, "type").String() != "response.output_item.done" {
+		return nil, false
+	}
+	item := gjson.GetBytes(data, "item")
+	if !item.Exists() || !item.IsObject() || item.Get("type").String() != "image_generation_call" {
+		return nil, false
+	}
+	if strings.TrimSpace(item.Get("result").String()) == "" {
+		return nil, false
+	}
+	key := imageGenerationOutputKey(item)
+	if key != "" && seen != nil {
+		if _, ok := seen[key]; ok {
+			return nil, false
+		}
+		seen[key] = struct{}{}
+	}
+	raw := []byte(item.Raw)
+	var output map[string]any
+	if err := json.Unmarshal(raw, &output); err == nil && addImageStatsToMap(output) {
+		if annotated, err := json.Marshal(output); err == nil {
+			raw = annotated
+		}
+	}
+	return json.RawMessage(raw), true
+}
+
+func appendMissingResponseImageOutputs(responseJSON []byte, imageOutputs []json.RawMessage) []byte {
+	if len(responseJSON) == 0 {
+		return responseJSON
+	}
+	var response map[string]any
+	if err := json.Unmarshal(responseJSON, &response); err != nil {
+		return responseJSON
+	}
+
+	seen := make(map[string]struct{})
+	changed := false
+	outputs, _ := response["output"].([]any)
+	for _, rawOutput := range outputs {
+		outputMap, ok := rawOutput.(map[string]any)
+		if !ok {
+			continue
+		}
+		if firstNonEmptyAnyString(outputMap["type"]) != "image_generation_call" {
+			continue
+		}
+		outputBytes, err := json.Marshal(outputMap)
+		if err != nil {
+			continue
+		}
+		item := gjson.ParseBytes(outputBytes)
+		if key := imageGenerationOutputKey(item); key != "" {
+			seen[key] = struct{}{}
+		}
+		if addImageStatsToMap(outputMap) {
+			changed = true
+		}
+	}
+
+	for _, rawImage := range imageOutputs {
+		if len(rawImage) == 0 || !gjson.ValidBytes(rawImage) {
+			continue
+		}
+		item := gjson.ParseBytes(rawImage)
+		key := imageGenerationOutputKey(item)
+		if key != "" {
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+		}
+		var decoded any
+		if err := json.Unmarshal(rawImage, &decoded); err != nil {
+			continue
+		}
+		if outputMap, ok := decoded.(map[string]any); ok {
+			addImageStatsToMap(outputMap)
+		}
+		outputs = append(outputs, decoded)
+		changed = true
+	}
+	if !changed {
+		return responseJSON
+	}
+	response["output"] = outputs
+	merged, err := json.Marshal(response)
+	if err != nil {
+		return responseJSON
+	}
+	return merged
+}
+
 // RegisterRoutes 注册路由
 func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	auth := h.authMiddleware()
@@ -559,6 +735,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	v1.POST("/chat/completions", h.ChatCompletions)
 	v1.POST("/responses", h.Responses)
 	v1.POST("/responses/compact", h.ResponsesCompact)
+	v1.POST("/images/generations", h.ImagesGenerations)
+	v1.POST("/images/edits", h.ImagesEdits)
 	v1.POST("/messages", h.Messages)
 	v1.GET("/models", h.ListModels)
 
@@ -566,8 +744,22 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	r.POST("/chat/completions", auth, h.ChatCompletions)
 	r.POST("/responses", auth, h.Responses)
 	r.POST("/responses/compact", auth, h.ResponsesCompact)
+	r.POST("/images/generations", auth, h.ImagesGenerations)
+	r.POST("/images/edits", auth, h.ImagesEdits)
 	r.POST("/messages", auth, h.Messages)
 	r.GET("/models", auth, h.ListModels)
+
+	codexDirect := r.Group("/backend-api/codex")
+	codexDirect.Use(auth)
+	codexDirect.POST("/responses", h.Responses)
+	codexDirect.POST("/responses/*subpath", func(c *gin.Context) {
+		subpath := strings.TrimSpace(c.Param("subpath"))
+		if subpath == "/compact" || strings.HasPrefix(subpath, "/compact/") {
+			h.ResponsesCompact(c)
+			return
+		}
+		h.Responses(c)
+	})
 }
 
 // authMiddleware API Key 鉴权中间件（增强版，带安全日志）
@@ -666,7 +858,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -699,6 +891,8 @@ func (h *Handler) Responses(c *gin.Context) {
 	rawBody = normalizeServiceTierField(rawBody)
 	isStream := gjson.GetBytes(rawBody, "stream").Bool()
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
+	apiKeyID := requestAPIKeyID(c)
+	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -707,6 +901,12 @@ func (h *Handler) Responses(c *gin.Context) {
 
 	// 2. 准备上游请求体（Unmarshal→map→Marshal，一次序列化）
 	codexBody, expandedInputRaw := PrepareResponsesBody(rawBody)
+	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
+		return
+	}
+	effectiveModel := effectiveRequestModel(codexBody, model)
+	accountFilter := accountFilterForModel(effectiveModel)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -716,16 +916,20 @@ func (h *Handler) Responses(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextCompatibleAccountForSession(c.Request.Context(), sessionID, excludeAccounts, 30*time.Second, nil)
+		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
-			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+			// 排队等待可用账号（最多 30s）
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			if account == nil {
+				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
+				})
 				return
 			}
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
-			})
-			return
 		}
 
 		start := time.Now()
@@ -764,7 +968,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			// 不可重试的结构化错误直接返回
@@ -786,7 +990,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
@@ -861,6 +1065,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		var writeErr error
 		wroteAnyBody := false
 		var responseJSON []byte
+		var imageLogInfo imageUsageLogInfo
 
 		if isStream {
 			// 流式透传 + TTFT 跟踪
@@ -893,6 +1098,9 @@ func (h *Handler) Responses(c *gin.Context) {
 				if eventType == "response.output_text.delta" {
 					deltaCharCount += len(parsed.Get("delta").String())
 				}
+				if image, ok := extractImageFromOutputItemDone(data, model); ok {
+					imageLogInfo = mergeImageUsageLogInfo(imageLogInfo, imageUsageLogInfoFromImage(image))
+				}
 
 				// 提取 usage + service_tier
 				if eventType == "response.completed" {
@@ -919,9 +1127,14 @@ func (h *Handler) Responses(c *gin.Context) {
 		} else {
 			// 非流式收集
 			var lastResponseData []byte
+			imageOutputs := make([]json.RawMessage, 0, 1)
+			seenImageOutputs := make(map[string]struct{})
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
+				if imageOutput, ok := extractResponseImageGenerationOutput(data, seenImageOutputs); ok {
+					imageOutputs = append(imageOutputs, imageOutput)
+				}
 				if !ttftRecorded && eventType == "response.output_text.delta" {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
@@ -953,6 +1166,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				responseObj := gjson.GetBytes(lastResponseData, "response")
 				if responseObj.Exists() {
 					responseJSON = []byte(responseObj.Raw)
+					responseJSON = appendMissingResponseImageOutputs(responseJSON, imageOutputs)
+					imageLogInfo = imageUsageLogInfoFromResponseJSON(responseJSON)
 				}
 			}
 		}
@@ -974,7 +1189,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			continue
 		}
 
-		h.store.BindSessionAffinity(sessionID, account, proxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/responses, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
@@ -1025,6 +1240,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
+		applyImageUsageLogInfo(logInput, imageLogInfo)
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
@@ -1061,7 +1277,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ResponsesAPIValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1086,9 +1302,15 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		api.SendMissingFieldError(c, "model")
 		return
 	}
+	if isImageOnlyModel(model) {
+		sendImageOnlyModelError(c, model)
+		return
+	}
 
 	rawBody = normalizeServiceTierField(rawBody)
 	sessionID := ResolveSessionID(c.Request.Header, rawBody)
+	apiKeyID := requestAPIKeyID(c)
+	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 	reasoningEffort := extractReasoningEffort(rawBody)
 	serviceTier := extractServiceTier(rawBody)
 	if serviceTier != "" {
@@ -1100,6 +1322,12 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 	// 准备上游请求体
 	codexBody, _ := PrepareCompactResponsesBody(rawBody)
+	if err := validateResponsesImageGenerationSizes(codexBody); err != nil {
+		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidParameter, err.Error(), api.ErrorTypeInvalidRequest))
+		return
+	}
+	effectiveModel := effectiveRequestModel(codexBody, model)
+	accountFilter := accountFilterForModel(effectiveModel)
 
 	// 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1109,16 +1337,16 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool)
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextAccountForSession(sessionID, excludeAccounts)
+		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), sessionID, 30*time.Second, excludeAccounts)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, gin.H{
-					"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
+					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
 				})
 				return
 			}
@@ -1146,7 +1374,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			if !IsRetryableError(reqErr) && classifyTransportFailure(reqErr) == "" {
@@ -1167,7 +1395,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, model, account.ID(), errBody)
@@ -1256,7 +1484,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// Validate request
 	validator := api.NewValidator(rawBody)
 	rules := api.ChatCompletionValidationRules()
-	rules["model"] = append(rules["model"], api.ModelValidator(SupportedModels))
+	rules["model"] = append(rules["model"], api.ModelValidator(h.supportedModelIDs(c.Request.Context())))
 	result := validator.ValidateRequest(rules)
 	if !result.Valid {
 		api.SendError(c, validator.ToAPIError())
@@ -1274,6 +1502,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	model := gjson.GetBytes(rawBody, "model").String()
 	if model == "" {
 		model = "gpt-5.4"
+	}
+	if isImageOnlyModel(model) {
+		sendImageOnlyModelError(c, model)
+		return
 	}
 
 	// 验证 model 参数
@@ -1297,8 +1529,12 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		api.SendError(c, api.NewAPIError(api.ErrCodeInvalidRequest, "Request translation failed: "+err.Error(), api.ErrorTypeInvalidRequest))
 		return
 	}
+	effectiveModel := effectiveRequestModel(codexBody, model)
+	accountFilter := accountFilterForModel(effectiveModel)
 
 	sessionID := ResolveSessionID(c.Request.Header, codexBody)
+	apiKeyID := requestAPIKeyID(c)
+	affinityKey := sessionAffinityKey(sessionID, apiKeyID)
 
 	// 3. 带重试的上游请求
 	maxRetries := h.getMaxRetries()
@@ -1308,16 +1544,20 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	excludeAccounts := make(map[int64]bool) // 重试时排除已失败的账号
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		account, stickyProxyURL := h.nextCompatibleAccountForSession(c.Request.Context(), sessionID, excludeAccounts, 30*time.Second, nil)
+		account, stickyProxyURL := h.nextAccountForSessionWithFilter(affinityKey, apiKeyID, excludeAccounts, accountFilter)
 		if account == nil {
-			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-				h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+			// 排队等待可用账号（最多 30s）
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			if account == nil {
+				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error": gin.H{"message": noAvailableAccountMessage(effectiveModel), "type": "server_error"},
+				})
 				return
 			}
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"},
-			})
-			return
 		}
 
 		start := time.Now()
@@ -1356,7 +1596,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			// 不可重试的结构化错误直接返回
@@ -1378,7 +1618,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
-			h.store.UnbindSessionAffinity(sessionID, account.ID())
+			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
 
 			log.Printf("上游返回错误 (attempt %d, status %d): %s", attempt+1, resp.StatusCode, string(errBody))
@@ -1574,7 +1814,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			continue
 		}
 
-		h.store.BindSessionAffinity(sessionID, account, proxyURL)
+		h.store.BindSessionAffinity(affinityKey, account, proxyURL)
 		logStatusCode := outcome.logStatusCode
 		if outcome.logStatusCode != http.StatusOK {
 			log.Printf("流异常结束 (account %d, /v1/chat/completions, status %d): %s，已转发约 %d 字符", account.ID(), outcome.logStatusCode, outcome.failureMessage, deltaCharCount)
@@ -2194,18 +2434,16 @@ func (h *Handler) handleUpstreamError(c *gin.Context, account *auth.Account, sta
 	h.sendUpstreamError(c, statusCode, body)
 }
 
-// SupportedModels 支持的模型列表（全局共享）
-var SupportedModels = []string{
-	"gpt-5.4", "gpt-5.4-mini", "gpt-5", "gpt-5-codex", "gpt-5-codex-mini",
-	"gpt-5.1", "gpt-5.1-codex", "gpt-5.1-codex-mini", "gpt-5.1-codex-max",
-	"gpt-5.2", "gpt-5.2-codex", "gpt-5.3-codex",
-}
-
 // ListModels 列出可用模型
 func (h *Handler) ListModels(c *gin.Context) {
-	models := make([]api.Model, 0, len(SupportedModels))
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	modelIDs := h.supportedModelIDs(ctx)
+	models := make([]api.Model, 0, len(modelIDs))
 	now := time.Now().Unix()
-	for _, id := range SupportedModels {
+	for _, id := range modelIDs {
 		models = append(models, api.Model{
 			ID:      id,
 			Object:  "model",
@@ -2214,4 +2452,8 @@ func (h *Handler) ListModels(c *gin.Context) {
 		})
 	}
 	api.SendList(c, "list", models)
+}
+
+func (h *Handler) supportedModelIDs(ctx context.Context) []string {
+	return SupportedModelIDs(ctx, h.db)
 }

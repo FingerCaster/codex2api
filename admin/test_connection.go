@@ -58,14 +58,20 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		return
 	}
 
+	testModel := strings.TrimSpace(c.Query("model"))
+	if testModel == "" {
+		testModel = h.connectionTestModel(c.Request.Context())
+	} else if !proxy.IsTextTestModelID(c.Request.Context(), h.db, testModel) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的测试模型: " + testModel})
+		return
+	}
+
 	// 设置 SSE 响应头
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
 	c.Header("X-Accel-Buffering", "no")
 	c.Writer.Flush()
-
-	testModel := h.store.GetTestModel()
 
 	// 发送 test_start
 	sendTestEvent(c, testEvent{Type: "test_start", Model: testModel})
@@ -79,9 +85,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	var resp *http.Response
 	var reqErr error
 	if account.IsAPIKeyProvider() {
-		resp, reqErr = proxy.ExecuteGenericOpenAIRequest(c.Request.Context(), account, "/v1/responses", payload, "", true, nil)
+		resp, reqErr = proxy.ExecuteGenericOpenAIRequest(c.Request.Context(), account, "/v1/responses", payload, h.store.ResolveProxyForAccount(account), true, nil)
 	} else {
-		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", "", "", nil, nil)
+		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	}
 	if reqErr != nil {
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("请求失败: %s", reqErr.Error())})
@@ -113,7 +119,11 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	var outputTokens int
 	var reasoningTokens int
 	var cachedTokens int
-	_ = proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+	gotTerminal := false
+	sentTerminal := false
+	var lastUpstreamEvent []byte
+	readErr := proxy.ReadSSEStream(resp.Body, func(data []byte) bool {
+		lastUpstreamEvent = append(lastUpstreamEvent[:0], data...)
 		eventType := gjson.GetBytes(data, "type").String()
 
 		switch eventType {
@@ -123,10 +133,34 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				hasContent = true
 				sendTestEvent(c, testEvent{Type: "content", Text: delta})
 			}
+		case "response.output_text.done":
+			if !hasContent {
+				text := gjson.GetBytes(data, "text").String()
+				if text != "" {
+					hasContent = true
+					sendTestEvent(c, testEvent{Type: "content", Text: text})
+				}
+			}
+		case "response.content_part.done":
+			if !hasContent {
+				text := gjson.GetBytes(data, "part.text").String()
+				if text != "" {
+					hasContent = true
+					sendTestEvent(c, testEvent{Type: "content", Text: text})
+				}
+			}
+		case "response.output_item.done":
+			if !hasContent {
+				text := extractOutputItemText(gjson.GetBytes(data, "item"))
+				if text != "" {
+					hasContent = true
+					sendTestEvent(c, testEvent{Type: "content", Text: text})
+				}
+			}
 		case "response.completed":
-				usage := gjson.GetBytes(data, "response.usage")
-				if usage.Exists() {
-					promptTokens = int(usage.Get("prompt_tokens").Int())
+			usage := gjson.GetBytes(data, "response.usage")
+			if usage.Exists() {
+				promptTokens = int(usage.Get("prompt_tokens").Int())
 				completionTokens = int(usage.Get("completion_tokens").Int())
 				totalTokens = int(usage.Get("total_tokens").Int())
 				inputTokens = int(usage.Get("input_tokens").Int())
@@ -146,14 +180,32 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				if outputTokens == 0 {
 					outputTokens = completionTokens
 				}
-					if totalTokens == 0 {
-						totalTokens = inputTokens + outputTokens
-					}
+				if totalTokens == 0 {
+					totalTokens = inputTokens + outputTokens
 				}
-				// 测试成功即重置冷却状态，用量限制由调度器自行判断
-				if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
-					h.store.ClearCooldown(account)
+			}
+			gotTerminal = true
+			if status := gjson.GetBytes(data, "response.status").String(); status == "failed" || status == "incomplete" {
+				sentTerminal = true
+				sendTestEvent(c, testEvent{Type: "error", Error: formatUpstreamTestError(data, "上游返回 "+status)})
+				return false
+			}
+			if !hasContent {
+				text := extractCompletedOutputText(data)
+				if text != "" {
+					hasContent = true
+					sendTestEvent(c, testEvent{Type: "content", Text: text})
 				}
+			}
+			if !hasContent {
+				sentTerminal = true
+				sendTestEvent(c, testEvent{Type: "error", Error: formatNoOutputUpstreamError(data)})
+				return false
+			}
+			// 测试成功即重置冷却状态，用量限制由调度器自行判断
+			if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
+				h.store.ClearCooldown(account)
+			}
 			// 如果上游未返回用量头，清除旧的用量缓存，避免显示过期数据
 			if !usageState.HasUsage7d && !usageState.HasUsage5h {
 				account.ClearUsageCache()
@@ -190,20 +242,28 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				Text: fmt.Sprintf("\n\n--- 耗时 %dms ---", duration),
 			})
 			sendTestEvent(c, testEvent{Type: "test_complete", Success: true})
+			sentTerminal = true
 			return false
 		case "response.failed":
-			errMsg := gjson.GetBytes(data, "response.status_details.error.message").String()
-			if errMsg == "" {
-				errMsg = "上游返回 response.failed"
-			}
-			sendTestEvent(c, testEvent{Type: "error", Error: errMsg})
+			gotTerminal = true
+			sentTerminal = true
+			sendTestEvent(c, testEvent{Type: "error", Error: formatUpstreamTestError(data, "上游返回 response.failed")})
+			return false
+		case "error":
+			gotTerminal = true
+			sentTerminal = true
+			sendTestEvent(c, testEvent{Type: "error", Error: formatUpstreamTestError(data, "上游返回 error 事件")})
 			return false
 		}
 		return true
 	})
 
-	if !hasContent {
-		sendTestEvent(c, testEvent{Type: "error", Error: "未收到模型输出"})
+	if readErr != nil && !sentTerminal {
+		sendTestEvent(c, testEvent{Type: "error", Error: "读取上游流失败: " + readErr.Error()})
+		return
+	}
+	if !gotTerminal && !sentTerminal {
+		sendTestEvent(c, testEvent{Type: "error", Error: formatMissingTerminalUpstreamError(lastUpstreamEvent)})
 	}
 }
 
@@ -262,6 +322,142 @@ func estimateSimpleTokens(text string) int {
 	return count
 }
 
+func extractCompletedOutputText(data []byte) string {
+	if text := gjson.GetBytes(data, "response.output_text").String(); text != "" {
+		return text
+	}
+	return extractOutputItemText(gjson.GetBytes(data, "response"))
+}
+
+func extractOutputItemText(item gjson.Result) string {
+	var b strings.Builder
+	writeTextFromOutputItem(&b, item)
+	return b.String()
+}
+
+func writeTextFromOutputItem(b *strings.Builder, item gjson.Result) {
+	if !item.Exists() {
+		return
+	}
+	switch item.Get("type").String() {
+	case "output_text", "text":
+		b.WriteString(item.Get("text").String())
+	case "message", "assistant":
+		writeTextFromContentArray(b, item.Get("content"))
+	default:
+		if output := item.Get("output"); output.IsArray() {
+			output.ForEach(func(_, child gjson.Result) bool {
+				writeTextFromOutputItem(b, child)
+				return true
+			})
+		}
+		writeTextFromContentArray(b, item.Get("content"))
+	}
+}
+
+func writeTextFromContentArray(b *strings.Builder, content gjson.Result) {
+	if !content.IsArray() {
+		return
+	}
+	content.ForEach(func(_, part gjson.Result) bool {
+		partType := part.Get("type").String()
+		if partType == "output_text" || partType == "text" {
+			b.WriteString(part.Get("text").String())
+		}
+		return true
+	})
+}
+
+func formatUpstreamTestError(data []byte, fallback string) string {
+	msg := firstNonEmptyGJSONString(data,
+		"response.status_details.error.message",
+		"response.error.message",
+		"error.message",
+		"message",
+		"response.incomplete_details.reason",
+		"response.status_details.message",
+	)
+	if msg == "" {
+		msg = fallback
+	}
+
+	code := firstNonEmptyGJSONString(data,
+		"response.status_details.error.code",
+		"response.error.code",
+		"error.code",
+	)
+	if code != "" && !strings.Contains(msg, code) {
+		msg += " (code: " + code + ")"
+	}
+
+	return formatUpstreamEventDetail(msg, data)
+}
+
+func formatNoOutputUpstreamError(data []byte) string {
+	msg := "上游已完成但没有返回文本输出"
+	if status := gjson.GetBytes(data, "response.status").String(); status != "" && status != "completed" {
+		msg = "上游响应状态: " + status
+	}
+	if reason := gjson.GetBytes(data, "response.incomplete_details.reason").String(); reason != "" {
+		msg += " (" + reason + ")"
+	}
+	return formatUpstreamEventDetail(msg, data)
+}
+
+func formatMissingTerminalUpstreamError(lastEvent []byte) string {
+	if len(lastEvent) == 0 {
+		return "上游流结束但未收到任何事件"
+	}
+	return formatUpstreamEventDetail("上游流提前结束，未收到 response.completed 或 response.failed", lastEvent)
+}
+
+func firstNonEmptyGJSONString(data []byte, paths ...string) string {
+	for _, path := range paths {
+		if value := strings.TrimSpace(gjson.GetBytes(data, path).String()); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func formatUpstreamEventDetail(message string, data []byte) string {
+	if len(data) == 0 {
+		return message
+	}
+	detail := string(data)
+	var parsed any
+	if err := json.Unmarshal(data, &parsed); err == nil {
+		if pretty, err := json.MarshalIndent(parsed, "", "  "); err == nil {
+			detail = string(pretty)
+		}
+	}
+	return message + "\n\n上游事件:\n" + truncate(detail, 3000)
+}
+
+func isSupportedConnectionTestModel(model string) bool {
+	if strings.Contains(strings.ToLower(model), "image") {
+		return false
+	}
+	for _, supported := range proxy.SupportedModels {
+		if model == supported {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) connectionTestModel(ctx context.Context) string {
+	model := strings.TrimSpace(h.store.GetTestModel())
+	if proxy.IsTextTestModelID(ctx, h.db, model) {
+		return model
+	}
+	models := proxy.TextTestModelIDs(ctx, h.db)
+	if len(models) > 0 {
+		return models[0]
+	}
+	return "gpt-5.4"
+}
+
 // BatchTest 批量测试所有账号连接
 // POST /api/admin/accounts/batch-test
 func (h *Handler) BatchTest(c *gin.Context) {
@@ -271,7 +467,7 @@ func (h *Handler) BatchTest(c *gin.Context) {
 		return
 	}
 
-	testModel := h.store.GetTestModel()
+	testModel := h.connectionTestModel(c.Request.Context())
 	payload := buildTestPayload(testModel)
 	concurrency := h.store.GetTestConcurrency()
 
@@ -288,8 +484,12 @@ func (h *Handler) BatchTest(c *gin.Context) {
 		// 跳过没有 token 的账号
 		account.Mu().RLock()
 		hasToken := account.AccessToken != ""
+		hasRefreshToken := account.RefreshToken != ""
 		account.Mu().RUnlock()
 		if !hasToken {
+			if !hasRefreshToken {
+				h.store.MarkError(account, "批量测试失败: 账号缺少 access_token 和 refresh_token")
+			}
 			atomic.AddInt64(&failedCount, 1)
 			continue
 		}
@@ -300,8 +500,9 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			resp, err := proxy.ExecuteRequest(context.Background(), acc, payload, "", "", "", nil, nil)
+			resp, err := proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 			if err != nil {
+				h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
 				atomic.AddInt64(&failedCount, 1)
 				return
 			}
@@ -325,6 +526,9 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				proxy.Apply429Cooldown(h.store, acc, body, resp)
 				atomic.AddInt64(&rateLimitCount, 1)
 			default:
+				if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
+					h.store.MarkError(acc, fmt.Sprintf("批量测试上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+				}
 				atomic.AddInt64(&failedCount, 1)
 			}
 		}(account)
@@ -339,4 +543,26 @@ func (h *Handler) BatchTest(c *gin.Context) {
 		"banned":       bannedCount,
 		"rate_limited": rateLimitCount,
 	})
+}
+
+func shouldMarkBatchTestAccountError(statusCode int, body []byte) bool {
+	msg := strings.ToLower(string(body))
+	if statusCode == http.StatusForbidden {
+		return true
+	}
+	if statusCode == http.StatusBadRequest {
+		for _, needle := range []string{
+			"invalid_grant",
+			"invalid_client",
+			"unauthorized_client",
+			"access_denied",
+			"account_deactivated",
+			"unsupported_country_region_territory",
+		} {
+			if strings.Contains(msg, needle) {
+				return true
+			}
+		}
+	}
+	return false
 }

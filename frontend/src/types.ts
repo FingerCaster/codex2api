@@ -6,13 +6,18 @@ export interface ToastState {
   type: ToastType
 }
 
-export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'paused' | string
+export type AccountStatus = 'active' | 'ready' | 'cooldown' | 'error' | 'refreshing' | 'paused' | string
 
 export interface StatsResponse {
   total: number
   available: number
   error: number
   today_requests: number
+}
+
+export interface AccountUsageWindow {
+  requests: number
+  tokens: number
 }
 
 export interface AccountRow {
@@ -34,6 +39,7 @@ export interface AccountRow {
   base_concurrency_override?: number | null
   base_concurrency_effective?: number
   dynamic_concurrency_limit?: number
+  allowed_api_key_ids?: number[]
   scheduler_breakdown?: {
     unauthorized_penalty: number
     rate_limit_penalty: number
@@ -58,6 +64,8 @@ export interface AccountRow {
   error_requests?: number
   usage_percent_7d?: number | null
   usage_percent_5h?: number | null
+  usage_5h_detail?: AccountUsageWindow
+  usage_7d_detail?: AccountUsageWindow
   reset_5h_at?: ISODateString
   reset_7d_at?: ISODateString
   cooldown_until?: ISODateString
@@ -91,6 +99,7 @@ export interface AddProviderKeyRequest {
 export interface UpdateAccountSchedulerRequest {
   score_bias_override: number | null
   base_concurrency_override: number | null
+  allowed_api_key_ids?: number[] | null
 }
 
 export interface AccountModelStat {
@@ -222,6 +231,36 @@ export interface SystemSettings {
   resin_platform_name: string
 }
 
+export interface ModelInfo {
+  id: string
+  enabled: boolean
+  category: string
+  source: string
+  pro_only: boolean
+  api_key_auth_available: boolean
+  last_seen_at?: string
+  updated_at?: string
+}
+
+export interface ModelsResponse {
+  models: string[]
+  items?: ModelInfo[]
+  last_synced_at?: string
+  source_url: string
+  warning?: string
+}
+
+export interface ModelSyncResponse {
+  added: number
+  updated: number
+  unchanged: number
+  skipped: string[]
+  models: string[]
+  items: ModelInfo[]
+  last_synced_at: string
+  source_url: string
+}
+
 export interface CPAExportEntry {
   type: string
   email: string
@@ -252,6 +291,7 @@ export interface UsageLog {
   account_id: number
   endpoint: string
   model: string
+  effective_model: string
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
@@ -270,6 +310,12 @@ export interface UsageLog {
   api_key_id: number
   api_key_name: string
   api_key_masked: string
+  image_count: number
+  image_width: number
+  image_height: number
+  image_bytes: number
+  image_format: string
+  image_size: string
   account_email: string
   account_plan_type: string
   created_at: ISODateString
@@ -318,6 +364,105 @@ export interface CreateAPIKeyResponse {
   id: number
   key: string
   name: string
+}
+
+export interface ImagePromptTemplate {
+  id: number
+  name: string
+  prompt: string
+  model: string
+  size: string
+  quality: string
+  output_format: string
+  background: string
+  style: string
+  tags: string[]
+  favorite: boolean
+  usage_count: number
+  last_used_at?: ISODateString
+  created_at: ISODateString
+  updated_at: ISODateString
+}
+
+export interface ImageAsset {
+  id: number
+  job_id: number
+  template_id: number
+  filename: string
+  proxy_url?: string
+  thumbnail_url?: string
+  mime_type: string
+  bytes: number
+  width: number
+  height: number
+  model: string
+  requested_size: string
+  actual_size: string
+  quality: string
+  output_format: string
+  revised_prompt: string
+  created_at: ISODateString
+  cache_b64_json?: string
+}
+
+export interface ImageGenerationJob {
+  id: number
+  status: 'queued' | 'running' | 'succeeded' | 'failed' | string
+  prompt: string
+  params_json: string
+  api_key_id: number
+  api_key_name: string
+  api_key_masked: string
+  error_message: string
+  duration_ms: number
+  created_at: ISODateString
+  started_at?: ISODateString
+  completed_at?: ISODateString
+  assets?: ImageAsset[]
+}
+
+export interface ImagePromptTemplatesResponse {
+  templates: ImagePromptTemplate[]
+}
+
+export interface ImageJobResponse {
+  job: ImageGenerationJob
+}
+
+export interface ImageJobsResponse {
+  jobs: ImageGenerationJob[]
+  total: number
+}
+
+export interface ImageAssetsResponse {
+  assets: ImageAsset[]
+  total: number
+}
+
+export interface ImagePromptTemplatePayload {
+  name?: string
+  prompt?: string
+  model?: string
+  size?: string
+  quality?: string
+  output_format?: string
+  background?: string
+  style?: string
+  tags?: string[]
+  favorite?: boolean
+}
+
+export interface CreateImageJobPayload {
+  prompt: string
+  model?: string
+  size?: string
+  quality?: string
+  output_format?: string
+  background?: string
+  style?: string
+  upscale?: string
+  api_key_id?: number
+  template_id?: number
 }
 
 export type ApiListResponse<K extends string, T> = {
