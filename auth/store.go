@@ -579,6 +579,8 @@ func (a *Account) IsAvailable() bool {
 		return false
 	}
 	if atomic.LoadInt32(&a.ManualDisabled) != 0 {
+		return false
+	}
 	if atomic.LoadInt32(&a.DispatchPaused) != 0 {
 		return false
 	}
@@ -599,20 +601,8 @@ func (a *Account) IsAvailable() bool {
 	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
 		return false
 	}
-	if a.Type == "api_key" {
-		return a.BaseURL != "" && a.APIKey != ""
 	if a.premium5hRateLimitedLocked(time.Now()) {
 		return false
-	}
-	if a.premium5hRateLimitedLocked(time.Now()) {
-		return false
-	}
-	// 冷却期过了自动恢复
-	if a.Status == StatusCooldown && !time.Now().Before(a.CooldownUtil) {
-		if a.Type == "api_key" {
-			return a.BaseURL != "" && a.APIKey != ""
-		}
-		return a.AccessToken != ""
 	}
 	if a.Type == "api_key" {
 		return a.BaseURL != "" && a.APIKey != ""

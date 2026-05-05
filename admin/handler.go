@@ -414,7 +414,6 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 			ProxyURL:                 row.ProxyURL,
 			Disabled:                 row.Disabled,
 			Enabled:                  row.Enabled,
-			Disabled:                 row.Disabled,
 			Locked:                   row.Locked,
 			AllowedAPIKeyIDs:         row.GetCredentialInt64Slice("allowed_api_key_ids"),
 			ScoreBiasOverride:        nullableInt64Pointer(row.ScoreBiasOverride),

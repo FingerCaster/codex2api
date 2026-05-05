@@ -8,7 +8,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"

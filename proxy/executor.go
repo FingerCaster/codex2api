@@ -231,7 +231,7 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 }
 
 func getGenericPooledClient(account *auth.Account, proxyURL string) *http.Client {
-	key := clientPoolKey(account, proxyURL)
+	key := fmt.Sprintf("%d|%s", account.ID(), strings.TrimSpace(proxyURL))
 	if v, ok := genericClientPool.Load(key); ok {
 		entry := v.(*poolEntry)
 		entry.touch()

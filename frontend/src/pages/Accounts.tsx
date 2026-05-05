@@ -45,10 +45,6 @@ type AccountPlanFilter = 'all' | 'pro' | 'plus' | 'team' | 'free'
 type AccountSortKey = 'requests' | 'usage' | 'importTime'
 type AccountSortValue = 'default' | 'requests_desc' | 'requests_asc' | 'usage_desc' | 'usage_asc' | 'importTime_desc' | 'importTime_asc'
 
-function normalizePlanType(planType?: string | null): string {
-  return (planType || '').trim().toLowerCase()
-}
-
 function matchesPlanFilter(planType: string | undefined, filter: AccountPlanFilter): boolean {
   if (filter === 'all') return true
 
@@ -199,7 +195,6 @@ export default function Accounts() {
   const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
   const rateLimitedAccounts = accounts.filter((account) => account.status === 'rate_limited' || account.status === 'usage_exhausted').length
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
-  const disabledAccounts = accounts.filter((account) => account.disabled).length
   const errorAccounts = accounts.filter((account) => account.status === 'error').length
   const disabledAccounts = accounts.filter((account) => account.enabled === false).length
   const lockedAccounts = accounts.filter((account) => account.locked).length
