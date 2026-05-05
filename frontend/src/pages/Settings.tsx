@@ -231,6 +231,7 @@ export default function Settings() {
     proxy_pool_enabled: false,
     fast_scheduler_enabled: false,
     max_retries: 2,
+    max_rate_limit_retries: 1,
     allow_remote_migration: false,
     database_driver: 'postgres',
     database_label: 'PostgreSQL',
@@ -239,6 +240,15 @@ export default function Settings() {
     model_mapping: '{}',
     resin_url: '',
     resin_platform_name: '',
+    prompt_filter_enabled: false,
+    prompt_filter_mode: 'monitor',
+    prompt_filter_threshold: 50,
+    prompt_filter_strict_threshold: 90,
+    prompt_filter_log_matches: true,
+    prompt_filter_max_text_length: 81920,
+    prompt_filter_sensitive_words: '',
+    prompt_filter_custom_patterns: '[]',
+    prompt_filter_disabled_patterns: '[]',
   })
   const [savingSettings, setSavingSettings] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
@@ -422,6 +432,15 @@ export default function Settings() {
                     onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_retries: parseInt(e.target.value) || 0 }))}
                   />
                 </SettingField>
+                <SettingField label={t('settings.maxRateLimitRetries')} description={t('settings.maxRateLimitRetriesRange')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={10}
+                    value={settingsForm.max_rate_limit_retries}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, max_rate_limit_retries: parseInt(e.target.value) || 0 }))}
+                  />
+                </SettingField>
               </div>
             </SettingsCard>
 
@@ -554,6 +573,24 @@ export default function Settings() {
                     disabled={!canConfigureRemoteMigration}
                     onValueChange={(value) => setSettingsForm((f) => ({ ...f, allow_remote_migration: value === 'true' }))}
                     options={booleanOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.promptFilterEnabled')} description={t('settings.promptFilterEnabledDesc')}>
+                  <Select
+                    value={settingsForm.prompt_filter_enabled ? 'true' : 'false'}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, prompt_filter_enabled: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.promptFilterMode')} description={t('settings.promptFilterModeDesc')}>
+                  <Select
+                    value={settingsForm.prompt_filter_mode}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, prompt_filter_mode: value }))}
+                    options={[
+                      { label: t('promptFilter.modeMonitor'), value: 'monitor' },
+                      { label: t('promptFilter.modeWarn'), value: 'warn' },
+                      { label: t('promptFilter.modeBlock'), value: 'block' },
+                    ]}
                   />
                 </SettingField>
               </div>

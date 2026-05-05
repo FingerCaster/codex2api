@@ -1,4 +1,4 @@
-import type { ChangeEvent, DragEvent } from 'react'
+import type { ChangeEvent, DragEvent, ReactNode } from 'react'
 import { useCallback, useEffect, useRef, useState, useMemo } from 'react'
 import { api, getAdminKey } from '../api'
 import Modal from '../components/Modal'
@@ -25,7 +25,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy } from 'lucide-react'
+import { Plus, RefreshCw, Trash2, Zap, FlaskConical, Ban, Timer, AlertTriangle, Upload, Download, ArrowDownToLine, KeyRound, ExternalLink, FileText, FileJson, BarChart3, Search, Fingerprint, FolderOpen, Lock, Unlock, RotateCcw, Pencil, Check, ChevronDown, Copy, Power, PowerOff, Hourglass } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import AccountUsageModal from '../components/AccountUsageModal'
 
@@ -66,9 +66,9 @@ export default function Accounts() {
   const [showAdd, setShowAdd] = useState(false)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
-  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'disabled' | 'error' | 'locked'>('all')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'error' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
-  const [planFilter, setPlanFilter] = useState<AccountPlanFilter>('all')
+  const [planFilter, setPlanFilter] = useState<AccountPlanFilter | 'prolite'>('all')
   const [sortKey, setSortKey] = useState<AccountSortKey | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -81,7 +81,9 @@ export default function Accounts() {
   const [authJsonExportingIds, setAuthJsonExportingIds] = useState<Set<number>>(new Set())
   const [authJsonModal, setAuthJsonModal] = useState<{ account: AccountRow; json: string } | null>(null)
   const [batchLoading, setBatchLoading] = useState(false)
+  const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchTesting, setBatchTesting] = useState(false)
+  const [lockingSubscriptionAccounts, setLockingSubscriptionAccounts] = useState(false)
   const [cleaningBanned, setCleaningBanned] = useState(false)
   const [cleaningRateLimited, setCleaningRateLimited] = useState(false)
   const [cleaningError, setCleaningError] = useState(false)
@@ -156,7 +158,7 @@ export default function Accounts() {
         return false
       }
 
-      const plan = (account.plan_type || '').toLowerCase()
+      const plan = normalizePlanType(account.plan_type)
       const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
       const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
 
@@ -199,7 +201,9 @@ export default function Accounts() {
   const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
   const disabledAccounts = accounts.filter((account) => account.disabled).length
   const errorAccounts = accounts.filter((account) => account.status === 'error').length
+  const disabledAccounts = accounts.filter((account) => account.enabled === false).length
   const lockedAccounts = accounts.filter((account) => account.locked).length
+  const subscriptionAccountsToLock = accounts.filter((account) => isSubscriptionPlan(account.plan_type) && !account.locked)
   const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
   const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
   const riskyAccounts = accounts.filter((account) => account.health_tier === 'risky').length
@@ -221,12 +225,18 @@ export default function Accounts() {
       case 'error':
         if (account.status !== 'error') return false
         break
+      case 'disabled':
+        if (account.enabled !== false) return false
+        break
       case 'locked':
         if (!account.locked) return false
         break
     }
-    // 套餐过滤
-    if (!matchesPlanFilter(account.plan_type, planFilter)) {
+    // 套餐过滤：保留 plus 模糊匹配，同时支持 prolite 独立过滤
+    if (planFilter === 'prolite') {
+      const plan = (account.plan_type || '').toLowerCase().trim()
+      if (plan !== 'prolite') return false
+    } else if (!matchesPlanFilter(account.plan_type, planFilter)) {
       return false
     }
     // 搜索过滤
@@ -812,14 +822,42 @@ export default function Accounts() {
     }
   }
 
-  const handleToggleDisabled = async (account: AccountRow) => {
-    const newDisabled = !account.disabled
+  const handleLockSubscriptionAccounts = async () => {
+    const candidates = accounts.filter((account) => isSubscriptionPlan(account.plan_type) && !account.locked)
+    if (candidates.length === 0) {
+      showToast(t('accounts.noSubscriptionAccountsToLock'))
+      return
+    }
+
+    setBatchLoading(true)
+    setLockingSubscriptionAccounts(true)
+    let success = 0
+    let fail = 0
     try {
-      await api.toggleAccountDisabled(account.id, newDisabled)
-      showToast(newDisabled ? t('accounts.disableSuccess') : t('accounts.enableSuccess'))
+      for (const account of candidates) {
+        try {
+          await api.toggleAccountLock(account.id, true)
+          success++
+        } catch {
+          fail++
+        }
+      }
+      showToast(t('accounts.lockSubscriptionAccountsDone', { success, fail }))
+      void reload()
+    } finally {
+      setBatchLoading(false)
+      setLockingSubscriptionAccounts(false)
+    }
+  }
+
+  const handleToggleEnabled = async (account: AccountRow) => {
+    const nextEnabled = account.enabled === false || account.disabled === true
+    try {
+      await api.toggleAccountEnabled(account.id, nextEnabled)
+      showToast(nextEnabled ? t('accounts.enableSuccess') : t('accounts.disableSuccess'))
       void reload()
     } catch (error) {
-      showToast(t('accounts.disableFailed', { error: getErrorMessage(error) }), 'error')
+      showToast(t('accounts.enableFailed', { error: getErrorMessage(error) }), 'error')
     }
   }
 
@@ -850,22 +888,27 @@ export default function Accounts() {
     void reload()
   }
 
-  const handleBatchRefresh = async () => {
-    if (selected.size === 0) return
+  const handleBatchRefresh = async (ids = Array.from(selected)) => {
+    if (ids.length === 0) return
     setBatchLoading(true)
+    setBatchRefreshing(true)
     let success = 0
     let fail = 0
-    for (const id of selected) {
-      try {
-        await api.refreshAccount(id)
-        success++
-      } catch {
-        fail++
+    try {
+      for (const id of ids) {
+        try {
+          await api.refreshAccount(id)
+          success++
+        } catch {
+          fail++
+        }
       }
+      showToast(t('accounts.batchRefreshDone', { success, fail }))
+      void reload()
+    } finally {
+      setBatchLoading(false)
+      setBatchRefreshing(false)
     }
-    showToast(t('accounts.batchRefreshDone', { success, fail }))
-    setBatchLoading(false)
-    void reload()
   }
 
   const handleBatchLock = async (locked: boolean) => {
@@ -885,6 +928,28 @@ export default function Accounts() {
     setBatchLoading(false)
     setSelected(new Set())
     void reload()
+  }
+
+  const handleBatchEnabled = async (enabled: boolean) => {
+    if (selected.size === 0) return
+    setBatchLoading(true)
+    let success = 0
+    let fail = 0
+    try {
+      for (const id of selected) {
+        try {
+          await api.toggleAccountEnabled(id, enabled)
+          success++
+        } catch {
+          fail++
+        }
+      }
+      showToast(t(enabled ? 'accounts.batchEnableDone' : 'accounts.batchDisableDone', { success, fail }))
+      setSelected(new Set())
+      void reload()
+    } finally {
+      setBatchLoading(false)
+    }
   }
 
   const handleResetStatus = async (account: AccountRow) => {
@@ -912,10 +977,11 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchTest = async () => {
+  const handleBatchTest = async (ids?: number[]) => {
+    if (ids && ids.length === 0) return
     setBatchTesting(true)
     try {
-      const result = await api.batchTestAccounts()
+      const result = await api.batchTestAccounts(ids)
       showToast(t('accounts.batchTestDone', {
         success: result.success,
         banned: result.banned,
@@ -1093,37 +1159,91 @@ export default function Accounts() {
           onRefresh={() => void reload()}
           actions={(
             <div className="flex flex-wrap items-center justify-end gap-1.5">
-              <Button variant="outline" size="sm" disabled={batchTesting} onClick={() => void handleBatchTest()}>
-                <FlaskConical className="size-3" />
-                {batchTesting ? t('accounts.batchTesting') : t('accounts.batchTest')}
-              </Button>
-              <Button variant="outline" size="sm" disabled={cleaningBanned} onClick={() => void handleCleanBanned()}>
-                <Ban className="size-3" />
-                {cleaningBanned ? t('accounts.cleaning') : t('accounts.cleanBanned')}
-              </Button>
-              <Button variant="outline" size="sm" disabled={cleaningRateLimited} onClick={() => void handleCleanRateLimited()}>
-                <Timer className="size-3" />
-                {cleaningRateLimited ? t('accounts.cleaning') : t('accounts.cleanRateLimited')}
-              </Button>
-              <Button variant="outline" size="sm" disabled={cleaningError} onClick={() => void handleCleanError()}>
-                <AlertTriangle className="size-3" />
-                {cleaningError ? t('accounts.cleaning') : t('accounts.cleanError')}
-              </Button>
+              <HeaderActionMenu
+                label={t('accounts.maintenanceActions')}
+                icon={<Zap className="size-3.5" />}
+                items={[
+                  {
+                    key: 'refresh-tokens',
+                    label: t('accounts.refreshTokens'),
+                    icon: <RefreshCw className={`size-3.5 ${batchRefreshing ? 'animate-spin' : ''}`} />,
+                    disabled: batchLoading || batchTesting || accounts.length === 0,
+                    onSelect: () => void handleBatchRefresh(accounts.map((account) => account.id)),
+                  },
+                  {
+                    key: 'test-connection',
+                    label: batchTesting ? t('accounts.batchTesting') : t('accounts.testConnection'),
+                    icon: <FlaskConical className="size-3.5" />,
+                    disabled: batchLoading || batchTesting || accounts.length === 0,
+                    onSelect: () => void handleBatchTest(),
+                  },
+                  {
+                    key: 'lock-subscription',
+                    label: lockingSubscriptionAccounts ? t('accounts.lockingSubscriptionAccounts') : t('accounts.lockSubscriptionAccounts'),
+                    icon: <Lock className="size-3.5" />,
+                    disabled: batchLoading || batchTesting || lockingSubscriptionAccounts || accounts.length === 0,
+                    title: t('accounts.lockSubscriptionAccountsHint', { count: subscriptionAccountsToLock.length }),
+                    onSelect: () => void handleLockSubscriptionAccounts(),
+                  },
+                ]}
+              />
+              <HeaderActionMenu
+                label={t('accounts.cleanupActions')}
+                icon={<Trash2 className="size-3.5" />}
+                items={[
+                  {
+                    key: 'clean-banned',
+                    label: cleaningBanned ? t('accounts.cleaning') : t('accounts.cleanBanned'),
+                    icon: <Ban className="size-3.5" />,
+                    disabled: cleaningBanned,
+                    onSelect: () => void handleCleanBanned(),
+                  },
+                  {
+                    key: 'clean-rate-limited',
+                    label: cleaningRateLimited ? t('accounts.cleaning') : t('accounts.cleanRateLimited'),
+                    icon: <Timer className="size-3.5" />,
+                    disabled: cleaningRateLimited,
+                    onSelect: () => void handleCleanRateLimited(),
+                  },
+                  {
+                    key: 'clean-error',
+                    label: cleaningError ? t('accounts.cleaning') : t('accounts.cleanError'),
+                    icon: <AlertTriangle className="size-3.5" />,
+                    disabled: cleaningError,
+                    onSelect: () => void handleCleanError(),
+                  },
+                ]}
+              />
+              <HeaderActionMenu
+                label={t('accounts.dataActions')}
+                icon={<FolderOpen className="size-3.5" />}
+                items={[
+                  {
+                    key: 'import',
+                    label: importing ? t('accounts.importing') : t('accounts.importFile'),
+                    icon: <Upload className="size-3.5" />,
+                    disabled: importing,
+                    onSelect: () => setShowImportPicker(true),
+                  },
+                  {
+                    key: 'export',
+                    label: exporting ? t('accounts.exporting') : t('accounts.export'),
+                    icon: <Download className="size-3.5" />,
+                    disabled: exporting,
+                    onSelect: () => setShowExportPicker(true),
+                  },
+                  {
+                    key: 'migrate',
+                    label: migrating ? t('accounts.migrating') : t('accounts.migrateImport'),
+                    icon: <ArrowDownToLine className="size-3.5" />,
+                    disabled: migrating,
+                    onSelect: () => setShowMigrate(true),
+                  },
+                ]}
+              />
               <Button onClick={() => setShowAdd(true)}>
                 <Plus className="size-3.5" />
                 {t('accounts.addAccount')}
-              </Button>
-              <Button variant="outline" disabled={importing} onClick={() => setShowImportPicker(true)}>
-                <Upload className="size-3.5" />
-                {importing ? t('accounts.importing') : t('accounts.importFile')}
-              </Button>
-              <Button variant="outline" disabled={exporting} onClick={() => setShowExportPicker(true)}>
-                <Download className="size-3.5" />
-                {exporting ? t('accounts.exporting') : t('accounts.export')}
-              </Button>
-              <Button variant="outline" disabled={migrating} onClick={() => setShowMigrate(true)}>
-                <ArrowDownToLine className="size-3.5" />
-                {migrating ? t('accounts.migrating') : t('accounts.migrateImport')}
               </Button>
               <input
                 ref={fileInputRef}
@@ -1171,7 +1291,7 @@ export default function Accounts() {
 
         <div className="toolbar-surface mb-3 flex flex-wrap items-center gap-2">
           <span className="font-semibold text-foreground">{t('accounts.filter')}</span>
-          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['disabled', t('accounts.filterDisabled')], ['error', t('accounts.filterError')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
+          {([['all', t('accounts.filterAll')], ['normal', t('accounts.filterNormal')], ['rate_limited', t('accounts.filterRateLimited')], ['banned', t('accounts.filterBanned')], ['error', t('accounts.filterError')], ['disabled', t('accounts.filterDisabled')], ['locked', t('accounts.filterLocked')]] as const).map(([key, label]) => (
             <button
               key={key}
               onClick={() => { setStatusFilter(key); setPage(1) }}
@@ -1181,7 +1301,7 @@ export default function Accounts() {
                   : 'bg-muted/50 text-muted-foreground hover:bg-muted'
               }`}
             >
-              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : key === 'disabled' ? disabledAccounts : key === 'error' ? errorAccounts : lockedAccounts}
+              {label} {key === 'all' ? totalAccounts : key === 'normal' ? normalAccounts : key === 'rate_limited' ? rateLimitedAccounts : key === 'banned' ? bannedAccounts : key === 'error' ? errorAccounts : key === 'disabled' ? disabledAccounts : lockedAccounts}
             </button>
           ))}
         </div>
@@ -1205,7 +1325,7 @@ export default function Accounts() {
             />
           </div>
           <div className="flex items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5">
-            {(['all', 'pro', 'plus', 'team', 'free'] as const).map((key) => (
+            {(['all', 'pro', 'prolite', 'plus', 'team', 'free'] as const).map((key) => (
               <button
                 key={key}
                 onClick={() => { setPlanFilter(key); setPage(1) }}
@@ -1215,7 +1335,11 @@ export default function Accounts() {
                     : 'text-muted-foreground hover:text-foreground'
                 }`}
               >
-                {key === 'all' ? t('accounts.filterAll') : key.charAt(0).toUpperCase() + key.slice(1)}
+                {key === 'all'
+                  ? t('accounts.filterAll')
+                  : key === 'prolite'
+                    ? 'ProLite'
+                    : key.charAt(0).toUpperCase() + key.slice(1)}
               </button>
             ))}
           </div>
@@ -1236,19 +1360,28 @@ export default function Accounts() {
           <div className="sticky top-2 z-20 mb-4 flex items-center justify-between gap-3 rounded-lg border border-primary/20 bg-card/95 px-3 py-2.5 text-sm font-semibold text-primary shadow-lg backdrop-blur-sm max-lg:flex-col max-lg:items-stretch">
             <span>{t('common.selected', { count: selected.size })}</span>
             <div className="flex flex-wrap items-center justify-end gap-1.5 max-lg:justify-start">
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchRefresh()}>
-                {t('accounts.batchRefresh')}
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchRefresh()}>
+                <RefreshCw className={`size-3 mr-1 ${batchRefreshing ? 'animate-spin' : ''}`} />{t('accounts.batchRefresh')}
               </Button>
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(true)}>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchTest(Array.from(selected))}>
+                <FlaskConical className="size-3 mr-1" />{batchTesting ? t('accounts.batchTesting') : t('accounts.batchTest')}
+              </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchEnabled(true)}>
+                <Power className="size-3 mr-1" />{t('accounts.enable')}
+              </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchEnabled(false)}>
+                <PowerOff className="size-3 mr-1" />{t('accounts.disable')}
+              </Button>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchLock(true)}>
                 <Lock className="size-3 mr-1" />{t('accounts.lock')}
               </Button>
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchLock(false)}>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchLock(false)}>
                 <Unlock className="size-3 mr-1" />{t('accounts.unlock')}
               </Button>
-              <Button variant="outline" size="sm" disabled={batchLoading} onClick={() => void handleBatchResetStatus()}>
+              <Button variant="outline" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchResetStatus()}>
                 <RotateCcw className="size-3 mr-1" />{t('accounts.batchResetStatus')}
               </Button>
-              <Button variant="destructive" size="sm" disabled={batchLoading} onClick={() => void handleBatchDelete()}>
+              <Button variant="destructive" size="sm" disabled={batchLoading || batchTesting} onClick={() => void handleBatchDelete()}>
                 {t('accounts.batchDelete')}
               </Button>
               <Button variant="outline" size="sm" onClick={() => setSelected(new Set())}>
@@ -1331,9 +1464,9 @@ export default function Accounts() {
                               API
                             </span>
                           )}
-                          {account.disabled && (
-                            <span className="ml-1.5 inline-flex items-center rounded-md bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-700 ring-1 ring-inset ring-slate-500/20 dark:bg-slate-900 dark:text-slate-300 dark:ring-slate-400/20">
-                              <Ban className="size-2.5 mr-0.5" />{t('accounts.disable')}
+                          {(account.enabled === false || account.disabled === true) && (
+                            <span className="ml-1.5 inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
+                              <PowerOff className="size-2.5 mr-0.5" />{t('accounts.disabled')}
                             </span>
                           )}
                           {account.locked && (
@@ -1345,13 +1478,24 @@ export default function Accounts() {
                         <TableCell
                           className="text-[13px] font-medium"
                         >
-                          {account.plan_type || '-'}
+                          {formatPlanLabel(account.plan_type)}
                         </TableCell>
                         <TableCell>
-                          <div className="space-y-1">
-                            <StatusBadge status={account.status} />
-                            {account.cooldown_until && (account.status === 'rate_limited' || account.status === 'error') && (
-                              <CooldownTimer until={account.cooldown_until} />
+                          <div className="space-y-1.5">
+                            <div className="flex min-h-6 items-center gap-2 whitespace-nowrap">
+                              <StatusBadge status={account.status} />
+                              <AccountStatusCountdown account={account} />
+                            </div>
+                            {account.status === 'error' && account.error_message && (
+                              <div className="max-w-[180px] truncate text-[11px] leading-tight text-red-500" title={account.error_message}>
+                                {account.error_message}
+                              </div>
+                            )}
+                            {(account.model_cooldowns?.length ?? 0) > 0 && (
+                              <div className="text-[11px] leading-tight text-amber-600">
+                                model {account.model_cooldowns?.[0]?.model}
+                                {(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ''}
+                              </div>
                             )}
                             <div className="text-[11px] text-muted-foreground">
                               {t('accounts.healthSummary', {
@@ -1363,10 +1507,17 @@ export default function Accounts() {
                           </div>
                         </TableCell>
                         <TableCell>
-                          <div className="flex items-center gap-2 text-[13px]">
-                            <span className="text-emerald-600 font-medium">{account.success_requests ?? 0}</span>
-                            <span className="text-muted-foreground">/</span>
-                            <span className="text-red-500 font-medium">{account.error_requests ?? 0}</span>
+                          <div className="space-y-0.5 text-[13px]">
+                            <div className="flex items-center gap-2">
+                              <span className="text-emerald-600 font-medium">{account.success_requests ?? 0}</span>
+                              <span className="text-muted-foreground">/</span>
+                              <span className="text-red-500 font-medium">{account.error_requests ?? 0}</span>
+                            </div>
+                            {((account.retry_error_requests ?? 0) > 0 || (account.rate_limit_attempts ?? 0) > 0) && (
+                              <div className="text-[11px] text-muted-foreground">
+                                retry {account.retry_error_requests ?? 0} · 429 {account.rate_limit_attempts ?? 0}
+                              </div>
+                            )}
                           </div>
                         </TableCell>
                         <TableCell>
@@ -1414,15 +1565,6 @@ export default function Accounts() {
                               <RefreshCw className={`size-3.5 ${refreshingIds.has(account.id) ? 'animate-spin' : ''}`} />
                             </Button>
                             <Button
-                              variant={account.disabled ? 'default' : 'outline'}
-                              size="icon"
-                              className="h-7 w-8 px-0"
-                              onClick={() => void handleToggleDisabled(account)}
-                              title={account.disabled ? t('accounts.enableHint') : t('accounts.disableHint')}
-                            >
-                              <Ban className="size-3.5" />
-                            </Button>
-                            <Button
                               variant="outline"
                               size="icon"
                               className="h-7 w-8 px-0"
@@ -1431,6 +1573,15 @@ export default function Accounts() {
                               title={account.at_only ? t('accounts.authJsonDisabled') : t('accounts.generateAuthJson')}
                             >
                               <FileJson className="size-3.5" />
+                            </Button>
+                            <Button
+                              variant={account.enabled === false || account.disabled === true ? 'default' : 'outline'}
+                              size="icon"
+                              className="h-7 w-8 px-0"
+                              onClick={() => void handleToggleEnabled(account)}
+                              title={account.enabled === false || account.disabled === true ? t('accounts.enableHint') : t('accounts.disableHint')}
+                            >
+                              {account.enabled === false || account.disabled === true ? <Power className="size-3.5" /> : <PowerOff className="size-3.5" />}
                             </Button>
                             <Button
                               variant={account.locked ? 'default' : 'outline'}
@@ -2380,8 +2531,126 @@ function getDispatchScore(account: AccountRow): number {
   return account.dispatch_score ?? account.scheduler_score ?? 0
 }
 
+// OpenAI reports the $100 Pro tier as "prolite" — functionally a Pro plan with
+// a smaller usage cap. Keep behavioral comparisons (usage windows, plan filter,
+// scheduler bias) aligned with the Go side by folding it into "pro".
+function normalizePlanType(planType?: string): string {
+  const raw = (planType || '').toLowerCase().trim()
+  if (raw === 'prolite' || raw === 'pro_lite' || raw === 'pro-lite') return 'pro'
+  return raw
+}
+
+function isSubscriptionPlan(planType?: string): boolean {
+  const normalized = normalizePlanType(planType)
+  if (!normalized || normalized === 'free') return false
+  if (['plus', 'pro', 'team', 'teamplus', 'enterprise', 'business', 'edu', 'education'].includes(normalized)) {
+    return true
+  }
+  return normalized.includes('plus') ||
+    normalized.startsWith('pro') ||
+    normalized.startsWith('team') ||
+    normalized.includes('enterprise') ||
+    normalized.includes('business')
+}
+
+interface HeaderActionMenuItem {
+  key: string
+  label: string
+  icon: ReactNode
+  disabled?: boolean
+  title?: string
+  onSelect: () => void
+}
+
+function HeaderActionMenu({
+  label,
+  icon,
+  items,
+}: {
+  label: string
+  icon: ReactNode
+  items: HeaderActionMenuItem[]
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+
+    const handlePointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false)
+      }
+    }
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpen(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    document.addEventListener('keydown', handleEscape)
+
+    return () => {
+      document.removeEventListener('mousedown', handlePointerDown)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [open])
+
+  return (
+    <div ref={rootRef} className="relative">
+      <Button
+        type="button"
+        variant="outline"
+        size="sm"
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((current) => !current)}
+      >
+        {icon}
+        {label}
+        <ChevronDown className={`size-3.5 transition-transform ${open ? 'rotate-180' : ''}`} />
+      </Button>
+
+      {open ? (
+        <div className="absolute right-0 top-[calc(100%+0.5rem)] z-50 w-56 overflow-hidden rounded-lg border border-border bg-popover p-1.5 shadow-[0_18px_40px_hsl(222_30%_18%/0.12)] backdrop-blur-sm">
+          <div role="menu" className="space-y-0.5">
+            {items.map((item) => (
+              <button
+                key={item.key}
+                type="button"
+                role="menuitem"
+                disabled={item.disabled}
+                title={item.title}
+                className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm text-foreground transition-colors hover:bg-accent/70 disabled:cursor-not-allowed disabled:opacity-50"
+                onClick={() => {
+                  if (item.disabled) return
+                  setOpen(false)
+                  item.onSelect()
+                }}
+              >
+                <span className="flex size-5 shrink-0 items-center justify-center text-muted-foreground">{item.icon}</span>
+                <span className="min-w-0 flex-1 truncate">{item.label}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function formatPlanLabel(planType?: string): string {
+  const raw = (planType || '').trim()
+  if (!raw) return '-'
+  const lower = raw.toLowerCase()
+  if (lower === 'prolite' || lower === 'pro_lite' || lower === 'pro-lite') return 'ProLite'
+  return raw
+}
+
 function getDefaultScoreBias(planType?: string): number {
-  switch ((planType || '').toLowerCase()) {
+  switch (normalizePlanType(planType)) {
     case 'pro':
     case 'plus':
     case 'team':
@@ -2931,18 +3200,30 @@ function UsageBar({ label, pct, resetAt, detail }: { label: string; pct: number;
 }
 
 function UsageWindowStat({ label, detail }: { label: string; detail?: AccountRow['usage_5h_detail'] }) {
-  if (!hasUsageWindowDetail(detail)) return null
+  if (!detail || !hasUsageWindowDetail(detail)) return null
+
+  const accountBilledText = typeof detail.account_billed === 'number' ? detail.account_billed.toFixed(4) : ''
+  const userBilledText = typeof detail.user_billed === 'number' ? detail.user_billed.toFixed(4) : ''
+
   return (
-    <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
-      <span className="w-5 shrink-0">{label}</span>
-      <span>{formatCompactUsageNumber(detail?.requests)} req / {formatCompactUsageNumber(detail?.tokens)} tok</span>
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground">
+        <span className="w-5 shrink-0">{label}</span>
+        <span>{formatCompactUsageNumber(detail?.requests)} req / {formatCompactUsageNumber(detail?.tokens)} tok</span>
+      </div>
+      {(accountBilledText || userBilledText) && (
+        <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground/80 pl-6">
+          {accountBilledText && <span>账号: ${accountBilledText}</span>}
+          {userBilledText && <span>用户: ${userBilledText}</span>}
+        </div>
+      )}
     </div>
   )
 }
 
 // 用量列组件
 function UsageCell({ account }: { account: AccountRow }) {
-  const plan = (account.plan_type || '').toLowerCase()
+  const plan = normalizePlanType(account.plan_type)
   const has7d = account.usage_percent_7d !== null && account.usage_percent_7d !== undefined
   const has5h = account.usage_percent_5h !== null && account.usage_percent_5h !== undefined
   const has7dDetail = hasUsageWindowDetail(account.usage_7d_detail)
@@ -2993,6 +3274,23 @@ function UsageCell({ account }: { account: AccountRow }) {
   return <span className="text-[13px] text-muted-foreground">-</span>
 }
 
+function getAccountStatusCountdownUntil(account: AccountRow): string | undefined {
+  const status = account.status
+  if (account.cooldown_until && (status === 'rate_limited' || status === 'error' || status === 'cooldown')) {
+    return account.cooldown_until
+  }
+  if (status === 'usage_exhausted') {
+    return account.reset_7d_at
+  }
+  return undefined
+}
+
+function AccountStatusCountdown({ account }: { account: AccountRow }) {
+  const until = getAccountStatusCountdownUntil(account)
+  if (!until) return null
+  return <CooldownTimer until={until} />
+}
+
 // 冷却倒计时组件
 function CooldownTimer({ until }: { until: string }) {
   const [remaining, setRemaining] = useState('')
@@ -3024,5 +3322,10 @@ function CooldownTimer({ until }: { until: string }) {
   }, [until])
 
   if (!remaining) return null
-  return <span className="text-[11px] font-mono text-amber-600">⏳ {remaining}</span>
+  return (
+    <span className="inline-flex h-6 min-w-[112px] shrink-0 items-center justify-center gap-1.5 rounded-full bg-amber-50 px-2 text-[11px] font-mono leading-none tabular-nums text-amber-700 ring-1 ring-inset ring-amber-200/70 dark:bg-amber-950/40 dark:text-amber-300 dark:ring-amber-400/20">
+      <Hourglass className="size-3 shrink-0" aria-hidden="true" />
+      {remaining}
+    </span>
+  )
 }

@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -25,6 +26,25 @@ func TestNextForSessionPrefersBoundAccountAndProxy(t *testing.T) {
 	}
 	if proxyURL != "http://proxy-2" {
 		t.Fatalf("proxyURL = %q, want %q", proxyURL, "http://proxy-2")
+	}
+}
+
+func TestBindSessionAffinityUsesConfigurableTTL(t *testing.T) {
+	t.Setenv("CODEX_SESSION_AFFINITY_TTL", "2h")
+	store := &Store{}
+	account := &Account{DBID: 1, AccessToken: "tok-1"}
+
+	before := time.Now()
+	store.bindSessionAffinity("session-ttl", account, "http://proxy-1")
+
+	store.sessionMu.RLock()
+	binding, ok := store.sessionBindings["session-ttl"]
+	store.sessionMu.RUnlock()
+	if !ok {
+		t.Fatal("expected session binding")
+	}
+	if binding.expiresAt.Before(before.Add(2*time.Hour - time.Second)) {
+		t.Fatalf("expiresAt too early: got %s want about 2h from now", binding.expiresAt)
 	}
 }
 
@@ -71,6 +91,31 @@ func TestNextForSessionWithFilterFallsBackWhenBoundAccountRejected(t *testing.T)
 	}
 	if proxyURL != "" {
 		t.Fatalf("proxyURL = %q, want empty fallback proxy", proxyURL)
+	}
+}
+
+func TestNextForSessionFallsBackWhenBoundAccountIsError(t *testing.T) {
+	store := &Store{
+		accounts: []*Account{
+			{DBID: 1, AccessToken: "tok-1"},
+			{DBID: 2, AccessToken: "tok-2", Status: StatusError, ErrorMsg: "deactivated_workspace"},
+		},
+		maxConcurrency: 2,
+	}
+	store.bindSessionAffinity("session-1", store.accounts[1], "http://proxy-2")
+
+	acc, proxyURL := store.NextForSession("session-1", 0, nil)
+	if acc == nil {
+		t.Fatal("expected fallback account")
+	}
+	if acc.DBID != 1 {
+		t.Fatalf("account DBID = %d, want %d", acc.DBID, 1)
+	}
+	if proxyURL != "" {
+		t.Fatalf("proxyURL = %q, want empty fallback proxy", proxyURL)
+	}
+	if store.accounts[1].IsAvailable() {
+		t.Fatal("error account should not be available for scheduling")
 	}
 }
 
@@ -145,6 +190,52 @@ func TestWaitForSessionAvailableRespectsExcludeSet(t *testing.T) {
 	}
 	if proxyURL != "" {
 		t.Fatalf("proxyURL = %q, want empty fallback proxy", proxyURL)
+	}
+}
+
+func TestWaitForSessionAvailableReturnsImmediatelyWhenNoDispatchCandidate(t *testing.T) {
+	store := &Store{
+		accounts:       []*Account{},
+		maxConcurrency: 1,
+	}
+
+	start := time.Now()
+	acc, proxyURL := store.WaitForSessionAvailable(context.Background(), "", 2*time.Second, 0, nil)
+	elapsed := time.Since(start)
+
+	if acc != nil {
+		t.Fatalf("account = %+v, want nil", acc)
+	}
+	if proxyURL != "" {
+		t.Fatalf("proxyURL = %q, want empty", proxyURL)
+	}
+	if elapsed > 150*time.Millisecond {
+		t.Fatalf("WaitForSessionAvailable took %s with no dispatch candidates; want fast failure", elapsed)
+	}
+}
+
+func TestWaitForSessionAvailableKeepsWaitingWhenCandidateIsBusy(t *testing.T) {
+	account := &Account{DBID: 1, AccessToken: "tok-1"}
+	store := &Store{
+		accounts:       []*Account{account},
+		maxConcurrency: 1,
+	}
+	atomic.StoreInt64(&account.ActiveRequests, 1)
+
+	go func() {
+		time.Sleep(75 * time.Millisecond)
+		store.Release(account)
+	}()
+
+	acc, proxyURL := store.WaitForSessionAvailable(context.Background(), "", 500*time.Millisecond, 0, nil)
+	if acc == nil {
+		t.Fatal("expected busy candidate to become available")
+	}
+	if acc.DBID != 1 {
+		t.Fatalf("account DBID = %d, want %d", acc.DBID, 1)
+	}
+	if proxyURL != "" {
+		t.Fatalf("proxyURL = %q, want empty", proxyURL)
 	}
 }
 

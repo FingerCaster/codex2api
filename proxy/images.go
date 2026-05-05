@@ -605,6 +605,9 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/generations", imageModel) {
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"generate","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -701,6 +704,9 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 
 	style := strings.TrimSpace(c.PostForm("style"))
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+		return
+	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
 	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
@@ -788,6 +794,9 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 
 	style := strings.TrimSpace(gjson.GetBytes(rawBody, "style").String())
 	promptForRequest := AppendImageStyleToPrompt(prompt, style)
+	if h.inspectPromptFilterTextOpenAI(c, promptForRequest, "/v1/images/edits", imageModel) {
+		return
+	}
 	tool := []byte(`{"type":"image_generation","action":"edit","model":""}`)
 	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
 	tool, _ = sjson.SetBytes(tool, "model", toolModel)
@@ -858,12 +867,14 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 
 	apiKeyID := requestAPIKeyID(c)
 	maxRetries := h.getMaxRetries()
-	var lastErr error
+	maxRateLimitRetries := h.getMaxRateLimitRetries()
+	generalRetries := 0
+	rateLimitRetries := 0
 	var lastStatusCode int
 	var lastBody []byte
 	excludeAccounts := make(map[int64]bool)
 
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts)
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts)
@@ -872,23 +883,20 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
 					return
 				}
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "无可用账号，请稍后重试", "type": "server_error"}})
+				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
 				return
 			}
 		}
 
 		start := time.Now()
-		proxyURL := stickyProxyURL
-		if proxyURL == "" {
-			proxyURL = h.store.NextProxy()
-		}
+		proxyURL := h.resolveProxyForAttempt(account, stickyProxyURL)
 		apiKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
 		deviceCfg := h.deviceCfg
 		if deviceCfg == nil {
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), h.cfg != nil && h.cfg.UseWebsocket)
+		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), h.shouldUseWebsocketForHTTP())
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
@@ -900,8 +908,11 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				ErrorToGinResponse(c, reqErr)
 				return
 			}
-			lastErr = reqErr
-			continue
+			if shouldRetryRequestError(reqErr, &generalRetries, maxRetries) {
+				continue
+			}
+			ErrorToGinResponse(c, reqErr)
+			return
 		}
 
 		if resp.StatusCode != http.StatusOK {
@@ -915,8 +926,25 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
-			h.applyCooldown(account, resp.StatusCode, errBody, resp)
-			if isRetryableStatus(resp.StatusCode) && attempt < maxRetries {
+			logUpstreamError(inboundEndpoint, resp.StatusCode, requestModel, account.ID(), errBody)
+			h.logUpstreamCyberPolicy(c, inboundEndpoint, requestModel, errBody)
+			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
+			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
+			h.logUsageForRequest(c, &database.UsageLogInput{
+				AccountID:         account.ID(),
+				Endpoint:          inboundEndpoint,
+				Model:             requestModel,
+				StatusCode:        resp.StatusCode,
+				DurationMs:        durationMs,
+				InboundEndpoint:   inboundEndpoint,
+				UpstreamEndpoint:  "/v1/responses",
+				Stream:            stream,
+				IsRetryAttempt:    shouldRetry,
+				AttemptIndex:      attempt + 1,
+				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
+			})
+			if shouldRetry {
 				lastStatusCode = resp.StatusCode
 				lastBody = errBody
 				continue
@@ -963,6 +991,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			UpstreamEndpoint: "/v1/responses",
 			Stream:           stream,
 		}
+		if readErr != nil {
+			logInput.ErrorMessage = usageLogErrorMessage(statusCode, []byte(readErr.Error()))
+		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
 			logInput.CompletionTokens = usage.CompletionTokens
@@ -985,17 +1016,13 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		if readErr != nil {
 			h.store.ReportRequestFailure(account, "transport", time.Duration(logInput.DurationMs)*time.Millisecond)
 		} else {
+			h.store.ClearModelCooldown(account, requestModel)
 			h.store.ReportRequestSuccess(account, time.Duration(logInput.DurationMs)*time.Millisecond)
 		}
 		h.store.Release(account)
 		return
 	}
 
-	if lastErr != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": "上游请求失败: " + lastErr.Error(), "type": "upstream_error"}})
-	} else if lastStatusCode != 0 {
-		h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
-	}
 }
 
 func collectImagesResponse(body io.Reader, responseFormat, fallbackModel string) ([]byte, *UsageInfo, int, imageUsageLogInfo, error) {
