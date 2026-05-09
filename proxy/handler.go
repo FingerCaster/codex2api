@@ -149,9 +149,10 @@ const (
 )
 
 const (
-	contextAPIKeyID     = "apiKeyID"
-	contextAPIKeyName   = "apiKeyName"
-	contextAPIKeyMasked = "apiKeyMasked"
+	contextAPIKeyID        = "apiKeyID"
+	contextAPIKeyName      = "apiKeyName"
+	contextAPIKeyMasked    = "apiKeyMasked"
+	contextTargetAccountID = "targetAccountID"
 )
 
 func requestAPIKeyID(c *gin.Context) int64 {
@@ -159,6 +160,21 @@ func requestAPIKeyID(c *gin.Context) int64 {
 		return 0
 	}
 	if value, exists := c.Get(contextAPIKeyID); exists && value != nil {
+		switch typed := value.(type) {
+		case int64:
+			return typed
+		case int:
+			return int64(typed)
+		}
+	}
+	return 0
+}
+
+func requestTargetAccountID(c *gin.Context) int64 {
+	if c == nil {
+		return 0
+	}
+	if value, exists := c.Get(contextTargetAccountID); exists && value != nil {
 		switch typed := value.(type) {
 		case int64:
 			return typed
@@ -611,6 +627,14 @@ func (h *Handler) proxyGenericOpenAIResponse(c *gin.Context, resp *http.Response
 			input.OutputTokens = outputTokens
 			input.CompletionTokens = outputTokens
 			input.TotalTokens = input.InputTokens + input.OutputTokens
+		}
+	}
+	if imageInfo := imageUsageLogInfoFromOpenAIImagesBody(body); imageInfo.Count > 0 {
+		applyImageUsageLogInfo(input, imageInfo)
+		if input.CompletionTokens == 0 {
+			input.CompletionTokens = imageInfo.Count
+			input.OutputTokens = imageInfo.Count
+			input.TotalTokens = input.InputTokens + imageInfo.Count
 		}
 	}
 
@@ -1631,8 +1655,17 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 		downstreamHeaders := c.Request.Header.Clone()
 
-		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
-		resp, reqErr := ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
+		isGenericProvider := account.IsAPIKeyProvider()
+		upstreamEndpoint := "/v1/responses/compact"
+		var resp *http.Response
+		var reqErr error
+		if isGenericProvider {
+			upstreamEndpoint = "/v1/responses"
+			resp, reqErr = ExecuteGenericOpenAIRequest(c.Request.Context(), account, upstreamEndpoint, codexBody, proxyURL, false, downstreamHeaders)
+		} else {
+			upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+			resp, reqErr = ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
+		}
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -1660,7 +1693,9 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			SyncCodexUsageState(h.store, account, resp)
+			if !isGenericProvider {
+				SyncCodexUsageState(h.store, account, resp)
+			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
@@ -1668,8 +1703,11 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			excludeAccounts[account.ID()] = true
 
 			logUpstreamError("/v1/responses/compact", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/responses/compact", model, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			var decision codex429Decision
+			if !isGenericProvider {
+				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", model, errBody)
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			}
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
@@ -1679,7 +1717,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				DurationMs:        durationMs,
 				ReasoningEffort:   reasoningEffort,
 				InboundEndpoint:   "/v1/responses/compact",
-				UpstreamEndpoint:  "/v1/responses/compact",
+				UpstreamEndpoint:  upstreamEndpoint,
 				ServiceTier:       serviceTier,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
@@ -1694,6 +1732,31 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			}
 
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			return
+		}
+
+		if isGenericProvider {
+			account.Mu().RLock()
+			c.Set("x-account-email", account.ProviderName)
+			account.Mu().RUnlock()
+			c.Set("x-account-proxy", proxyURL)
+			c.Set("x-model", model)
+			c.Set("x-reasoning-effort", reasoningEffort)
+			c.Set("x-service-tier", serviceTier)
+			promptTokens := estimatePromptTokensFromBody(codexBody)
+			h.proxyGenericOpenAIResponse(c, resp, account, &database.UsageLogInput{
+				AccountID:        account.ID(),
+				Endpoint:         "/v1/responses/compact",
+				Model:            model,
+				DurationMs:       durationMs,
+				PromptTokens:     promptTokens,
+				InputTokens:      promptTokens,
+				ReasoningEffort:  reasoningEffort,
+				InboundEndpoint:  "/v1/responses/compact",
+				UpstreamEndpoint: upstreamEndpoint,
+				ServiceTier:      serviceTier,
+			})
+			h.store.Release(account)
 			return
 		}
 

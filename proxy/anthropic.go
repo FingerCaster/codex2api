@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 // ==================== Anthropic Messages API 类型定义 ====================
@@ -532,19 +533,19 @@ func convertAnthropicToolChoice(raw json.RawMessage) any {
 
 // anthropicStreamTranslator 有状态的流式响应翻译器（Codex → Anthropic）
 type anthropicStreamTranslator struct {
-	model                   string
-	responseID              string
-	messageStartSent        bool
-	contentBlockIndex       int
-	contentBlockOpen        bool
-	currentBlockType        string // "text" | "thinking" | "tool_use"
-	currentToolUseID        string
-	currentToolUseName      string
-	currentToolInputBuffer  strings.Builder
-	hasToolUse              bool
-	inputTokens             int
-	outputTokens            int
-	cachedTokens            int
+	model                  string
+	responseID             string
+	messageStartSent       bool
+	contentBlockIndex      int
+	contentBlockOpen       bool
+	currentBlockType       string // "text" | "thinking" | "tool_use"
+	currentToolUseID       string
+	currentToolUseName     string
+	currentToolInputBuffer strings.Builder
+	hasToolUse             bool
+	inputTokens            int
+	outputTokens           int
+	cachedTokens           int
 }
 
 // newAnthropicStreamTranslator 创建流式翻译器
@@ -1046,4 +1047,13 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 	}
 
 	return resp
+}
+
+func wrapResponsesBodyAsCompletedEvent(body []byte) []byte {
+	wrapped := []byte(`{"type":"response.completed","response":{}}`)
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return wrapped
+	}
+	wrapped, _ = sjson.SetRawBytes(wrapped, "response", body)
+	return wrapped
 }

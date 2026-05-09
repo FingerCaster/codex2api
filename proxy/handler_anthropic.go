@@ -135,12 +135,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		if account == nil {
 			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), affinityKey, 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
-			if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
-				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
+				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
+					sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", "All accounts rate limited")
+					return
+				}
+				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel))
 				return
-			}
-			sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel))
-			return
 			}
 		}
 
@@ -167,8 +167,15 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		downstreamHeaders := c.Request.Header.Clone()
-		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		isGenericProvider := account.IsAPIKeyProvider()
+		var resp *http.Response
+		var reqErr error
+		if isGenericProvider {
+			resp, reqErr = ExecuteGenericOpenAIRequest(c.Request.Context(), account, "/v1/responses", codexBody, proxyURL, isStream, downstreamHeaders)
+		} else {
+			upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+			resp, reqErr = ExecuteRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
+		}
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -196,8 +203,10 @@ func (h *Handler) Messages(c *gin.Context) {
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
+			if !isGenericProvider {
+				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
+					h.store.PersistUsageSnapshot(account, usagePct)
+				}
 			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
@@ -207,8 +216,11 @@ func (h *Handler) Messages(c *gin.Context) {
 
 			log.Printf("上游返回错误 (attempt %d, status %d, /v1/messages): %s", attempt+1, resp.StatusCode, string(errBody))
 			logUpstreamError("/v1/messages", resp.StatusCode, model, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			var decision codex429Decision
+			if !isGenericProvider {
+				h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			}
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
@@ -245,7 +257,11 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		// ========== 成功路径 ==========
 		account.Mu().RLock()
-		c.Set("x-account-email", account.Email)
+		if isGenericProvider {
+			c.Set("x-account-email", account.ProviderName)
+		} else {
+			c.Set("x-account-email", account.Email)
+		}
 		account.Mu().RUnlock()
 		c.Set("x-account-proxy", proxyURL)
 		c.Set("x-model", effectiveModel)
@@ -339,30 +355,39 @@ func (h *Handler) Messages(c *gin.Context) {
 		} else {
 			// 非流式：缓冲所有事件后构建完整 JSON 响应
 			var lastCompletedData []byte
-
-			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
-				parsed := gjson.ParseBytes(data)
-				eventType := parsed.Get("type").String()
-
-				if !ttftRecorded && isFirstTokenEvent(eventType) {
-					firstTokenMs = int(time.Since(start).Milliseconds())
-					ttftRecorded = true
-				}
-				if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
-					deltaCharCount += len(parsed.Get("delta").String())
-				}
-				if eventType == "response.completed" {
-					usage = extractUsageFromResult(parsed.Get("response.usage"))
-					lastCompletedData = data
+			if isGenericProvider {
+				var body []byte
+				body, readErr = io.ReadAll(resp.Body)
+				if readErr == nil {
+					lastCompletedData = wrapResponsesBodyAsCompletedEvent(body)
+					usage = extractUsageFromOpenAIBody(body)
 					gotTerminal = true
-					return false
 				}
-				if eventType == "response.failed" {
-					gotTerminal = true
-					return false
-				}
-				return true
-			})
+			} else {
+				readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
+					parsed := gjson.ParseBytes(data)
+					eventType := parsed.Get("type").String()
+
+					if !ttftRecorded && isFirstTokenEvent(eventType) {
+						firstTokenMs = int(time.Since(start).Milliseconds())
+						ttftRecorded = true
+					}
+					if eventType == "response.output_text.delta" || eventType == "response.function_call_arguments.delta" {
+						deltaCharCount += len(parsed.Get("delta").String())
+					}
+					if eventType == "response.completed" {
+						usage = extractUsageFromResult(parsed.Get("response.usage"))
+						lastCompletedData = data
+						gotTerminal = true
+						return false
+					}
+					if eventType == "response.failed" {
+						gotTerminal = true
+						return false
+					}
+					return true
+				})
+			}
 
 			if lastCompletedData != nil {
 				anthropicResp := buildAnthropicResponseFromCompleted(lastCompletedData, originalModel)
@@ -378,9 +403,11 @@ func (h *Handler) Messages(c *gin.Context) {
 		if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 			log.Printf("上游流在首包前断开，重试 (attempt %d/%d, account %d, /v1/messages): %s",
 				attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
-			recyclePooledClient(account, proxyURL)
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
+			if !isGenericProvider {
+				recyclePooledClient(account, proxyURL)
+				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
+					h.store.PersistUsageSnapshot(account, usagePct)
+				}
 			}
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
@@ -436,11 +463,15 @@ func (h *Handler) Messages(c *gin.Context) {
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
-		if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-			h.store.PersistUsageSnapshot(account, usagePct)
+		if !isGenericProvider {
+			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
+				h.store.PersistUsageSnapshot(account, usagePct)
+			}
 		}
 		if outcome.penalize {
-			recyclePooledClient(account, proxyURL)
+			if !isGenericProvider {
+				recyclePooledClient(account, proxyURL)
+			}
 			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {

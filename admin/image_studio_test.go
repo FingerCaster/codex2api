@@ -59,6 +59,93 @@ func TestBuildAdminImageGenerationRequestOmitsAutoSize(t *testing.T) {
 	}
 }
 
+func TestBuildAdminImageRequestUsesEditsForReferenceImages(t *testing.T) {
+	dataURL := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tinyPNG(t))
+	body, endpoint, err := (&Handler{}).buildAdminImageRequest(context.Background(), imageGenerationJobPayload{
+		Prompt:       "turn it into a poster",
+		Model:        "gpt-image-2",
+		Size:         "auto",
+		Quality:      "high",
+		OutputFormat: "png",
+		Background:   "auto",
+		Style:        "flat graphic",
+		ReferenceImages: []imageReferencePayload{
+			{ImageURL: dataURL, Name: "input.png"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("buildAdminImageRequest 返回错误: %v", err)
+	}
+	if endpoint != "/v1/images/edits" {
+		t.Fatalf("endpoint = %q, want /v1/images/edits", endpoint)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if payload["model"] != "gpt-image-2" || payload["response_format"] != "b64_json" {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if _, exists := payload["size"]; exists {
+		t.Fatalf("auto size should be omitted, payload = %#v", payload)
+	}
+	if _, exists := payload["background"]; exists {
+		t.Fatalf("auto background should be omitted, payload = %#v", payload)
+	}
+	if prompt := payload["prompt"].(string); !strings.Contains(prompt, "Style guidance: flat graphic") {
+		t.Fatalf("prompt = %q, want style guidance appended", prompt)
+	}
+	images, ok := payload["images"].([]any)
+	if !ok || len(images) != 1 {
+		t.Fatalf("images = %#v, want one image", payload["images"])
+	}
+	image, ok := images[0].(map[string]any)
+	if !ok || image["image_url"] != dataURL {
+		t.Fatalf("images[0] = %#v, want data URL", images[0])
+	}
+}
+
+func TestResolveImageReferenceDataURLNormalizesOctetStreamGalleryAsset(t *testing.T) {
+	db := newTestAdminDB(t)
+	dir := t.TempDir()
+	if err := imagestore.Configure(imagestore.Config{Backend: imagestore.BackendLocal, LocalDir: dir}); err != nil {
+		t.Fatalf("imagestore.Configure: %v", err)
+	}
+	handler := &Handler{db: db}
+
+	jobID, err := db.InsertImageGenerationJob(context.Background(), database.ImageGenerationJobInput{Prompt: "asset"})
+	if err != nil {
+		t.Fatalf("InsertImageGenerationJob 返回错误: %v", err)
+	}
+	pngBytes := tinyPNG(t)
+	path := filepath.Join(dir, "legacy-reference.png")
+	if err := os.WriteFile(path, pngBytes, 0o644); err != nil {
+		t.Fatalf("write asset file: %v", err)
+	}
+	assetID, err := db.InsertImageAsset(context.Background(), database.ImageAssetInput{
+		JobID:        jobID,
+		Filename:     "legacy-reference.png",
+		StoragePath:  path,
+		MimeType:     "application/octet-stream",
+		Bytes:        len(pngBytes),
+		Width:        1,
+		Height:       1,
+		OutputFormat: "png",
+	})
+	if err != nil {
+		t.Fatalf("InsertImageAsset 返回错误: %v", err)
+	}
+
+	dataURL, err := handler.resolveImageReferenceDataURL(context.Background(), imageReferencePayload{AssetID: assetID})
+	if err != nil {
+		t.Fatalf("resolveImageReferenceDataURL 返回错误: %v", err)
+	}
+	if !strings.HasPrefix(dataURL, "data:image/png;base64,") {
+		t.Fatalf("data URL prefix = %q, want image/png", dataURL[:min(len(dataURL), 40)])
+	}
+}
+
 func TestImageJobJPEGFallbackDecision(t *testing.T) {
 	req := imageGenerationJobPayload{OutputFormat: "png"}
 	if !shouldFallbackImageJobToJPEG(req, http.StatusBadGateway, fmt.Errorf("upstream image generation failed (server_error): An error occurred while processing your request")) {
@@ -70,6 +157,9 @@ func TestImageJobJPEGFallbackDecision(t *testing.T) {
 	}
 	if shouldFallbackImageJobToJPEG(req, http.StatusTooManyRequests, fmt.Errorf("rate limit reached")) {
 		t.Fatalf("rate limit should not fall back to JPEG")
+	}
+	if shouldFallbackImageJobToJPEG(req, http.StatusBadGateway, fmt.Errorf(`上游返回错误 (status 502): {"title":"Error 502: Bad gateway","error_name":"origin_bad_gateway","cloudflare_error":true,"retry_after":60}`)) {
+		t.Fatalf("Cloudflare origin 502 should not fall back to JPEG")
 	}
 	if shouldFallbackImageJobToJPEG(imageGenerationJobPayload{OutputFormat: "jpeg"}, http.StatusBadGateway, fmt.Errorf("server_error")) {
 		t.Fatalf("non-PNG format should not fall back to JPEG")

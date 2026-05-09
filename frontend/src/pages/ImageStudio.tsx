@@ -8,7 +8,7 @@ import ToastNotice from '../components/ToastNotice'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import { formatBeijingTime } from '../utils/time'
-import type { APIKeyRow, CreateImageJobPayload, ImageAsset, ImageGenerationJob, ImagePromptTemplate, ImagePromptTemplatePayload } from '../types'
+import type { AccountRow, APIKeyRow, CreateImageJobPayload, ImageAsset, ImageGenerationJob, ImagePromptTemplate, ImagePromptTemplatePayload } from '../types'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -23,7 +23,7 @@ import {
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip'
-import { Copy, Download, Eye, Image as ImageIcon, Loader2, Pencil, Play, Plus, RefreshCcw, Save, Search, Sparkles, Star, Trash2, X } from 'lucide-react'
+import { Copy, Download, Eye, Image as ImageIcon, Loader2, Pencil, Play, Plus, RefreshCcw, Save, Search, Sparkles, Star, Trash2, Upload, X } from 'lucide-react'
 
 const IMAGE_VIEWS = ['studio', 'prompts', 'gallery', 'history'] as const
 type ImageView = typeof IMAGE_VIEWS[number]
@@ -54,6 +54,14 @@ type TemplateEditorDraft = {
   outputFormat: string
   background: string
   style: string
+}
+
+type ReferenceImageDraft = {
+  id: string
+  asset_id?: number
+  image_url?: string
+  name: string
+  previewURL?: string
 }
 
 const IMAGE_MODELS = [
@@ -273,8 +281,39 @@ function assetPreviewURL(asset: ImageAsset, imageURLs: Record<number, string>): 
   return asset.proxy_url || imageURLs[asset.id] || asset.thumbnail_url
 }
 
+function accountOptionLabel(account: AccountRow): string {
+  const isProvider = account.type === 'api_key'
+  const name = account.name?.trim() || account.email?.trim() || `#${account.id}`
+  if (isProvider) {
+    const provider = account.provider_name?.trim() || 'BaseURL'
+    const base = account.base_url?.trim()
+    return base ? `${provider} · ${name} · ${base}` : `${provider} · ${name}`
+  }
+  const plan = account.plan_type?.trim()
+  return plan ? `${name} · ${plan}` : name
+}
+
 function hasServerImageURL(asset: ImageAsset): boolean {
   return Boolean(asset.thumbnail_url || asset.proxy_url)
+}
+
+function fileToDataURL(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result || ''))
+    reader.onerror = () => reject(reader.error || new Error('read failed'))
+    reader.readAsDataURL(file)
+  })
+}
+
+function referenceDraftsFromPayload(params: Partial<CreateImageJobPayload>): ReferenceImageDraft[] {
+  return (params.reference_images ?? []).map((ref, index) => ({
+    id: ref.asset_id ? `asset-${ref.asset_id}` : `history-${index}-${Math.random().toString(36).slice(2)}`,
+    asset_id: ref.asset_id,
+    image_url: ref.image_url,
+    name: ref.name || (ref.asset_id ? `#${ref.asset_id}` : `Reference ${index + 1}`),
+    previewURL: ref.image_url,
+  })).slice(0, 8)
 }
 
 type CachedImageAsset = {
@@ -392,6 +431,7 @@ export default function ImageStudio() {
   const { confirm, confirmDialog } = useConfirmDialog()
   const [templates, setTemplates] = useState<ImagePromptTemplate[]>([])
   const [apiKeys, setAPIKeys] = useState<APIKeyRow[]>([])
+  const [accounts, setAccounts] = useState<AccountRow[]>([])
   const [jobs, setJobs] = useState<ImageGenerationJob[]>([])
   const [historyJobs, setHistoryJobs] = useState<ImageGenerationJob[]>([])
   const [historyTotal, setHistoryTotal] = useState(0)
@@ -425,6 +465,9 @@ export default function ImageStudio() {
   const [upscale, setUpscale] = useState('')
   const [style, setStyle] = useState('')
   const [apiKeyID, setAPIKeyID] = useState('')
+  const [upstreamAccountID, setUpstreamAccountID] = useState('')
+  const [referenceImages, setReferenceImages] = useState<ReferenceImageDraft[]>([])
+  const referenceUploadRef = useRef<HTMLInputElement>(null)
   const [templateName, setTemplateName] = useState('')
   const [templateTags, setTemplateTags] = useState('')
 
@@ -482,13 +525,15 @@ export default function ImageStudio() {
   const loadInitial = useCallback(async () => {
     setLoading(true)
     try {
-      const [keysRes] = await Promise.all([
+      const [keysRes, accountsRes] = await Promise.all([
         api.getAPIKeys(),
+        api.getAccounts(),
         loadTemplates(),
         loadJobs(),
         loadAssets(),
       ])
       setAPIKeys(keysRes.keys ?? [])
+      setAccounts(accountsRes.accounts ?? [])
     } catch (err) {
       showToast(err instanceof Error ? err.message : t('images.loadFailed'), 'error')
     } finally {
@@ -761,6 +806,14 @@ export default function ImageStudio() {
     if (upscale) payload.upscale = upscale
     if (style.trim()) payload.style = style.trim()
     if (apiKeyID) payload.api_key_id = Number(apiKeyID)
+    if (upstreamAccountID) payload.upstream_account_id = Number(upstreamAccountID)
+    if (referenceImages.length > 0) {
+      payload.reference_images = referenceImages.map(ref => ({
+        ...(ref.asset_id ? { asset_id: ref.asset_id } : {}),
+        ...(ref.image_url ? { image_url: ref.image_url } : {}),
+        ...(ref.name ? { name: ref.name } : {}),
+      }))
+    }
     if (selectedTemplateId) payload.template_id = selectedTemplateId
     return payload
   }
@@ -783,6 +836,41 @@ export default function ImageStudio() {
     }
   }
 
+  const addUploadedReferenceImages = async (files: FileList | null) => {
+    if (!files || files.length === 0) return
+    const next: ReferenceImageDraft[] = []
+    for (const file of Array.from(files)) {
+      if (!file.type.startsWith('image/')) continue
+      const dataURL = await fileToDataURL(file)
+      next.push({
+        id: `upload-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        image_url: dataURL,
+        name: file.name || t('images.uploadedReference'),
+        previewURL: dataURL,
+      })
+    }
+    if (next.length === 0) {
+      showToast(t('images.referenceImageInvalid'), 'error')
+      return
+    }
+    setReferenceImages(prev => [...prev, ...next].slice(0, 8))
+    showToast(t('images.referenceImageAdded', { count: next.length }), 'success')
+  }
+
+  const addGalleryReferenceImage = (asset: ImageAsset) => {
+    if (referenceAssetIDs.has(asset.id)) return
+    setReferenceImages(prev => [...prev, {
+      id: `asset-${asset.id}`,
+      asset_id: asset.id,
+      name: asset.filename || `#${asset.id}`,
+      previewURL: assetThumbnailURL(asset, assetURLs),
+    }].slice(0, 8))
+  }
+
+  const removeReferenceImage = (id: string) => {
+    setReferenceImages(prev => prev.filter(ref => ref.id !== id))
+  }
+
   const rerunFromJob = (job: ImageGenerationJob) => {
     const params = jobParams(job)
     const nextModel = params.model || 'gpt-image-2'
@@ -795,6 +883,8 @@ export default function ImageStudio() {
     setBackground(params.background || 'auto')
     setUpscale(normalizeUpscale(params.upscale))
     setStyle(params.style || '')
+    setUpstreamAccountID(params.upstream_account_id ? String(params.upstream_account_id) : '')
+    setReferenceImages(referenceDraftsFromPayload(params))
     setSelectedTemplateId(params.template_id ? Number(params.template_id) : null)
     navigate('/images/studio')
     void submitJob({
@@ -807,6 +897,8 @@ export default function ImageStudio() {
       upscale: normalizeUpscale(params.upscale) || undefined,
       style: params.style,
       api_key_id: apiKeyID ? Number(apiKeyID) : undefined,
+      upstream_account_id: params.upstream_account_id,
+      reference_images: params.reference_images,
       template_id: params.template_id ? Number(params.template_id) : undefined,
     })
   }
@@ -935,6 +1027,11 @@ export default function ImageStudio() {
   const templateSelectOptions = templates.length > 0
     ? [{ label: t('images.noTemplateSelected'), value: '' }, ...templates.map(template => ({ label: template.name || `#${template.id}`, value: String(template.id) }))]
     : [{ label: t('images.noTemplates'), value: '' }]
+  const upstreamAccountOptions = useMemo(() => [
+    { label: t('images.autoUpstreamAccount'), value: '' },
+    ...accounts.map(account => ({ label: accountOptionLabel(account), value: String(account.id) })),
+  ], [accounts, t])
+  const referenceAssetIDs = useMemo(() => new Set(referenceImages.map(ref => ref.asset_id).filter((id): id is number => Boolean(id))), [referenceImages])
   const sizeOptions = useMemo(() => sizeOptionsForModel(model), [model])
   const backgroundOptions = useMemo(() => [
     { label: t('images.backgroundOptions.auto'), value: 'auto' },
@@ -958,7 +1055,9 @@ export default function ImageStudio() {
     outputFormat !== 'png' ||
     background !== 'auto' ||
     upscale ||
-    apiKeyID
+    apiKeyID ||
+    upstreamAccountID ||
+    referenceImages.length > 0
   )
 
   const clearGenerationForm = () => {
@@ -972,6 +1071,8 @@ export default function ImageStudio() {
     setUpscale('')
     setStyle('')
     setAPIKeyID('')
+    setUpstreamAccountID('')
+    setReferenceImages([])
     setTemplateName('')
     setTemplateTags('')
   }
@@ -1008,6 +1109,14 @@ export default function ImageStudio() {
               compact
             />
           </Field>
+          <Field label={t('images.upstreamAccount')}>
+            <Select
+              value={upstreamAccountID}
+              onValueChange={setUpstreamAccountID}
+              options={upstreamAccountOptions}
+              compact
+            />
+          </Field>
         </div>
 
         <Field label={t('images.style')}>
@@ -1015,6 +1124,90 @@ export default function ImageStudio() {
         </Field>
 
         <StylePresetPicker value={style} onChange={setStyle} onApply={() => showToast(t('images.stylePresetApplied'), 'success')} />
+
+        <div className="space-y-3 rounded-md border border-border p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div>
+              <div className="text-xs font-semibold text-muted-foreground">{t('images.referenceImages')}</div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                {referenceImages.length > 0 ? t('images.referenceImagesHintActive', { count: referenceImages.length }) : t('images.referenceImagesHint')}
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <input
+                ref={referenceUploadRef}
+                type="file"
+                accept="image/*"
+                multiple
+                className="hidden"
+                onChange={event => {
+                  void addUploadedReferenceImages(event.target.files)
+                  event.target.value = ''
+                }}
+              />
+              <Button size="xs" variant="outline" type="button" onClick={() => referenceUploadRef.current?.click()}>
+                <Upload className="size-3" />
+                {t('images.uploadReference')}
+              </Button>
+              {referenceImages.length > 0 && (
+                <Button size="xs" variant="ghost" type="button" onClick={() => setReferenceImages([])}>
+                  <X className="size-3" />
+                  {t('images.clearReferences')}
+                </Button>
+              )}
+            </div>
+          </div>
+
+          {referenceImages.length > 0 && (
+            <div className="grid grid-cols-3 gap-2 sm:grid-cols-4 lg:grid-cols-6">
+              {referenceImages.map(ref => (
+                <div key={ref.id} className="group/reference relative aspect-square overflow-hidden rounded-md border border-border bg-muted">
+                  {ref.previewURL ? (
+                    <img src={ref.previewURL} alt={ref.name} className="h-full w-full object-cover" />
+                  ) : (
+                    <div className="flex h-full w-full items-center justify-center text-muted-foreground"><ImageIcon className="size-5" /></div>
+                  )}
+                  <button
+                    type="button"
+                    className="absolute right-1 top-1 rounded-md bg-background/85 p-1 text-muted-foreground opacity-0 shadow transition hover:text-foreground group-hover/reference:opacity-100"
+                    onClick={() => removeReferenceImage(ref.id)}
+                    aria-label={t('images.removeReference')}
+                  >
+                    <X className="size-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {assets.length > 0 && (
+            <div className="space-y-2">
+              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">{t('images.addFromGallery')}</div>
+              <div className="grid grid-cols-4 gap-2 sm:grid-cols-6 lg:grid-cols-8">
+                {assets.slice(0, 8).map(asset => {
+                  const selected = referenceAssetIDs.has(asset.id)
+                  return (
+                    <button
+                      key={asset.id}
+                      type="button"
+                      className={`relative aspect-square overflow-hidden rounded-md border bg-muted transition ${
+                        selected ? 'border-primary ring-2 ring-primary/25' : 'border-border hover:border-primary/60'
+                      }`}
+                      onClick={() => addGalleryReferenceImage(asset)}
+                      title={asset.filename}
+                    >
+                      {assetThumbnailURL(asset, assetURLs) ? (
+                        <img src={assetThumbnailURL(asset, assetURLs)} alt={asset.filename} className="h-full w-full object-cover" />
+                      ) : (
+                        <span className="flex h-full w-full items-center justify-center text-muted-foreground"><ImageIcon className="size-4" /></span>
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          )}
+        </div>
 
         <label className="flex min-h-0 flex-1 flex-col space-y-1.5">
           <span className="text-xs font-semibold text-muted-foreground">{t('images.prompt')}</span>

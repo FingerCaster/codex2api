@@ -11,8 +11,15 @@ import (
 
 // ExecuteGenericOpenAIRequest 向 OpenAI 兼容上游发送请求（base_url + api_key）
 func ExecuteGenericOpenAIRequest(ctx context.Context, account *auth.Account, endpointPath string, requestBody []byte, proxyOverride string, stream bool, downstreamHeaders http.Header) (*http.Response, error) {
+	return ExecuteGenericOpenAIRequestWithContentType(ctx, account, endpointPath, requestBody, "application/json", proxyOverride, stream, downstreamHeaders)
+}
+
+func ExecuteGenericOpenAIRequestWithContentType(ctx context.Context, account *auth.Account, endpointPath string, requestBody []byte, contentType string, proxyOverride string, stream bool, downstreamHeaders http.Header) (*http.Response, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "application/json"
 	}
 
 	baseURL, apiKey, extraHeaders := account.GenericUpstream()
@@ -34,7 +41,7 @@ func ExecuteGenericOpenAIRequest(ctx context.Context, account *auth.Account, end
 	}
 
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", contentType)
 	if stream {
 		req.Header.Set("Accept", "text/event-stream")
 	} else {

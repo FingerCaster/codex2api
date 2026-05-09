@@ -95,20 +95,28 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+	isGenericProvider := account.IsAPIKeyProvider()
 	if resp.StatusCode != http.StatusOK {
-		proxy.SyncCodexUsageState(h.store, account, resp)
+		if !isGenericProvider {
+			proxy.SyncCodexUsageState(h.store, account, resp)
+		}
 		errBody, _ := io.ReadAll(resp.Body)
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
-			h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
-		case http.StatusTooManyRequests:
-			proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
+		if !isGenericProvider {
+			switch resp.StatusCode {
+			case http.StatusUnauthorized:
+				h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
+			case http.StatusTooManyRequests:
+				proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
+			}
 		}
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 500))})
 		return
 	}
 
-	usageState := proxy.SyncCodexUsageState(h.store, account, resp)
+	usageState := proxy.CodexUsageSyncResult{}
+	if !isGenericProvider {
+		usageState = proxy.SyncCodexUsageState(h.store, account, resp)
+	}
 
 	// 解析 SSE 流
 	hasContent := false
@@ -203,11 +211,11 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				return false
 			}
 			// 测试成功即重置冷却状态，用量限制由调度器自行判断
-			if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
+			if isGenericProvider || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100)) {
 				h.store.ClearCooldown(account)
 			}
 			// 如果上游未返回用量头，清除旧的用量缓存，避免显示过期数据
-			if !usageState.HasUsage7d && !usageState.HasUsage5h {
+			if !isGenericProvider && !usageState.HasUsage7d && !usageState.HasUsage5h {
 				account.ClearUsageCache()
 			}
 			duration := time.Since(start).Milliseconds()
@@ -523,12 +531,13 @@ func (h *Handler) BatchTest(c *gin.Context) {
 	)
 
 	for _, account := range accounts {
-		// 跳过没有 token 的账号
+		// 跳过没有 token 的 Codex 账号；OpenAI 兼容上游使用 base_url + api_key。
 		account.Mu().RLock()
 		hasToken := account.AccessToken != ""
 		hasRefreshToken := account.RefreshToken != ""
 		account.Mu().RUnlock()
-		if !hasToken {
+		isGenericProvider := account.IsAPIKeyProvider()
+		if !hasToken && !isGenericProvider {
 			if !hasRefreshToken {
 				h.store.MarkError(account, "批量测试失败: 账号缺少 access_token 和 refresh_token")
 			}
@@ -542,7 +551,14 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			resp, err := proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+			isGenericProvider := acc.IsAPIKeyProvider()
+			var resp *http.Response
+			var err error
+			if isGenericProvider {
+				resp, err = proxy.ExecuteGenericOpenAIRequest(context.Background(), acc, "/v1/responses", payload, h.store.ResolveProxyForAccount(acc), true, nil)
+			} else {
+				resp, err = proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+			}
 			if err != nil {
 				h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
 				atomic.AddInt64(&failedCount, 1)
@@ -553,19 +569,29 @@ func (h *Handler) BatchTest(c *gin.Context) {
 
 			switch resp.StatusCode {
 			case http.StatusOK:
-				usageState := proxy.SyncCodexUsageState(h.store, acc, resp)
+				usageState := proxy.CodexUsageSyncResult{}
+				if !isGenericProvider {
+					usageState = proxy.SyncCodexUsageState(h.store, acc, resp)
+				}
 				// 测试成功即重置冷却状态，用量限制由调度器自行判断
-				if !usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100) {
+				if isGenericProvider || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100)) {
 					h.store.ClearCooldown(acc)
 				}
 				atomic.AddInt64(&successCount, 1)
 			case http.StatusUnauthorized:
-				proxy.SyncCodexUsageState(h.store, acc, resp)
-				h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
-				atomic.AddInt64(&bannedCount, 1)
+				if isGenericProvider {
+					h.store.MarkError(acc, fmt.Sprintf("批量测试上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+					atomic.AddInt64(&failedCount, 1)
+				} else {
+					proxy.SyncCodexUsageState(h.store, acc, resp)
+					h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
+					atomic.AddInt64(&bannedCount, 1)
+				}
 			case http.StatusTooManyRequests:
-				proxy.SyncCodexUsageState(h.store, acc, resp)
-				proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
+				if !isGenericProvider {
+					proxy.SyncCodexUsageState(h.store, acc, resp)
+					proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
+				}
 				atomic.AddInt64(&rateLimitCount, 1)
 			default:
 				if shouldMarkBatchTestAccountError(resp.StatusCode, body) {

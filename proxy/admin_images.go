@@ -17,16 +17,32 @@ import (
 // GenerateImageOnceForAdmin executes the existing Images API handler in-process.
 // It keeps model aliasing, account dispatch, usage logging, and image parsing in one code path.
 func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow) ([]byte, int, error) {
+	return h.executeImageOnceForAdmin(ctx, "/v1/images/generations", rawBody, apiKey, 0)
+}
+
+func (h *Handler) GenerateImageOnceForAdminWithAccount(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow, targetAccountID int64) ([]byte, int, error) {
+	return h.executeImageOnceForAdmin(ctx, "/v1/images/generations", rawBody, apiKey, targetAccountID)
+}
+
+func (h *Handler) EditImageOnceForAdminWithAccount(ctx context.Context, rawBody []byte, apiKey *database.APIKeyRow, targetAccountID int64) ([]byte, int, error) {
+	return h.executeImageOnceForAdmin(ctx, "/v1/images/edits", rawBody, apiKey, targetAccountID)
+}
+
+func (h *Handler) executeImageOnceForAdmin(ctx context.Context, endpoint string, rawBody []byte, apiKey *database.APIKeyRow, targetAccountID int64) ([]byte, int, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if h == nil {
 		return nil, http.StatusInternalServerError, fmt.Errorf("image proxy handler is not initialized")
 	}
+	endpoint = strings.TrimSpace(endpoint)
+	if endpoint == "" {
+		endpoint = "/v1/images/generations"
+	}
 
 	recorder := httptest.NewRecorder()
 	ginCtx, _ := gin.CreateTestContext(recorder)
-	req := httptest.NewRequest(http.MethodPost, "/v1/images/generations", bytes.NewReader(rawBody)).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodPost, endpoint, bytes.NewReader(rawBody)).WithContext(ctx)
 	req.Header.Set("Content-Type", "application/json")
 	if apiKey != nil && strings.TrimSpace(apiKey.Key) != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey.Key)
@@ -34,9 +50,17 @@ func (h *Handler) GenerateImageOnceForAdmin(ctx context.Context, rawBody []byte,
 		ginCtx.Set(contextAPIKeyName, strings.TrimSpace(apiKey.Name))
 		ginCtx.Set(contextAPIKeyMasked, security.MaskAPIKey(apiKey.Key))
 	}
+	if targetAccountID > 0 {
+		ginCtx.Set(contextTargetAccountID, targetAccountID)
+	}
 	ginCtx.Request = req
 
-	h.ImagesGenerations(ginCtx)
+	switch endpoint {
+	case "/v1/images/edits":
+		h.ImagesEdits(ginCtx)
+	default:
+		h.ImagesGenerations(ginCtx)
+	}
 
 	body := recorder.Body.Bytes()
 	if recorder.Code < 200 || recorder.Code >= 300 {

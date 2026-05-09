@@ -12,6 +12,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
@@ -98,6 +99,109 @@ func decodeImageBase64(raw string) ([]byte, bool) {
 		}
 	}
 	return nil, false
+}
+
+func normalizeImageDataURL(raw string) (string, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !strings.HasPrefix(strings.ToLower(raw), "data:") {
+		return raw, false
+	}
+	comma := strings.Index(raw, ",")
+	if comma < 0 || !strings.Contains(strings.ToLower(raw[:comma]), ";base64") {
+		return raw, false
+	}
+	mediaType := strings.TrimPrefix(strings.Split(raw[:comma], ";")[0], "data:")
+	data, ok := decodeImageBase64(raw)
+	if !ok || len(data) == 0 {
+		return raw, false
+	}
+	mediaType = normalizeImageDataURLMimeType(mediaType, data)
+	if mediaType == "" {
+		return raw, false
+	}
+	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data), true
+}
+
+func normalizeImageDataURLMimeType(mediaType string, data []byte, hints ...string) string {
+	if normalized, ok := canonicalImageDataURLMimeType(mediaType); ok {
+		return normalized
+	}
+	if detected := imageDataURLMimeTypeFromBytes(data); detected != "" {
+		return detected
+	}
+	for _, hint := range hints {
+		if normalized, ok := canonicalImageDataURLMimeType(hint); ok {
+			return normalized
+		}
+		if detected := imageDataURLMimeTypeFromHint(hint); detected != "" {
+			return detected
+		}
+	}
+	return ""
+}
+
+func canonicalImageDataURLMimeType(raw string) (string, bool) {
+	raw = strings.ToLower(strings.TrimSpace(strings.Split(raw, ";")[0]))
+	switch raw {
+	case "image/png":
+		return "image/png", true
+	case "image/jpeg", "image/jpg":
+		return "image/jpeg", true
+	case "image/webp":
+		return "image/webp", true
+	case "image/gif":
+		return "image/gif", true
+	default:
+		return "", false
+	}
+}
+
+func imageDataURLMimeTypeFromBytes(data []byte) string {
+	if len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		return "image/png"
+	}
+	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
+		return "image/jpeg"
+	}
+	if len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a") {
+		return "image/gif"
+	}
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return "image/webp"
+	}
+	if detected, ok := canonicalImageDataURLMimeType(http.DetectContentType(data)); ok {
+		return detected
+	}
+	if _, format, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		return imageDataURLMimeTypeFromHint(format)
+	}
+	return ""
+}
+
+func imageDataURLMimeTypeFromHint(hint string) string {
+	hint = strings.ToLower(strings.TrimSpace(hint))
+	if hint == "" {
+		return ""
+	}
+	ext := strings.TrimPrefix(hint, ".")
+	if idx := strings.LastIndexAny(ext, `/\`); idx >= 0 {
+		ext = ext[idx+1:]
+	}
+	if dot := strings.LastIndex(ext, "."); dot >= 0 {
+		ext = ext[dot+1:]
+	}
+	switch ext {
+	case "png":
+		return "image/png"
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	case "webp":
+		return "image/webp"
+	case "gif":
+		return "image/gif"
+	default:
+		return ""
+	}
 }
 
 func imageStatsFromBase64(raw string) (imageOutputStats, bool) {
@@ -262,6 +366,50 @@ func imageUsageLogInfoFromImages(images []imageCallResult) imageUsageLogInfo {
 	for _, image := range images {
 		info = mergeImageUsageLogInfo(info, imageUsageLogInfoFromImage(image))
 	}
+	return info
+}
+
+func imageUsageLogInfoFromOpenAIImagesBody(body []byte) imageUsageLogInfo {
+	var info imageUsageLogInfo
+	if len(body) == 0 || !gjson.ValidBytes(body) {
+		return info
+	}
+	data := gjson.GetBytes(body, "data")
+	if !data.IsArray() {
+		return info
+	}
+	responseFormat := strings.TrimSpace(gjson.GetBytes(body, "output_format").String())
+	responseSize := strings.TrimSpace(gjson.GetBytes(body, "size").String())
+	responseModel := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	data.ForEach(func(_, item gjson.Result) bool {
+		result := strings.TrimSpace(item.Get("b64_json").String())
+		if result == "" {
+			result = strings.TrimSpace(item.Get("url").String())
+		}
+		if result == "" {
+			return true
+		}
+		image := imageCallResult{
+			Result:       result,
+			OutputFormat: strings.TrimSpace(item.Get("output_format").String()),
+			Size:         strings.TrimSpace(item.Get("size").String()),
+			ByteSize:     int(item.Get("bytes").Int()),
+			Width:        int(item.Get("width").Int()),
+			Height:       int(item.Get("height").Int()),
+			Model:        strings.TrimSpace(item.Get("model").String()),
+		}
+		if image.OutputFormat == "" {
+			image.OutputFormat = responseFormat
+		}
+		if image.Size == "" {
+			image.Size = responseSize
+		}
+		if image.Model == "" {
+			image.Model = responseModel
+		}
+		info = mergeImageUsageLogInfo(info, imageUsageLogInfoFromImage(image))
+		return true
+	})
 	return info
 }
 
@@ -565,8 +713,9 @@ func multipartFileToDataURL(fileHeader *multipart.FileHeader) (string, error) {
 	}
 
 	mediaType := strings.TrimSpace(fileHeader.Header.Get("Content-Type"))
+	mediaType = normalizeImageDataURLMimeType(mediaType, data, fileHeader.Filename)
 	if mediaType == "" {
-		mediaType = http.DetectContentType(data)
+		return "", fmt.Errorf("upload %q is not a supported image", strings.TrimSpace(fileHeader.Filename))
 	}
 	return "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
 }
@@ -624,7 +773,8 @@ func (h *Handler) ImagesGenerations(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, nil, tool)
-	h.forwardImagesRequest(c, "/v1/images/generations", imageModel, responsesBody, responseFormat, "image_generation", stream)
+	genericBody := buildGenericImagesRequestBody(rawBody, promptForRequest, imageModel)
+	h.forwardImagesRequest(c, "/v1/images/generations", imageModel, responsesBody, genericBody, "application/json", responseFormat, "image_generation", stream)
 }
 
 func (h *Handler) ImagesEdits(c *gin.Context) {
@@ -677,8 +827,10 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 		images = append(images, dataURL)
 	}
 
+	var maskFile *multipart.FileHeader
 	var maskDataURL string
 	if maskFiles := form.File["mask"]; len(maskFiles) > 0 && maskFiles[0] != nil {
+		maskFile = maskFiles[0]
 		dataURL, err := multipartFileToDataURL(maskFiles[0])
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
@@ -709,7 +861,112 @@ func (h *Handler) imagesEditsFromMultipart(c *gin.Context) {
 	}
 	tool := buildImagesEditToolFromForm(c, imageModel, maskDataURL)
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
+	genericBody, genericContentType, err := buildGenericImagesMultipartRequestBody(form, imageFiles, maskFile, promptForRequest, imageModel, stream)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, genericBody, genericContentType, responseFormat, "image_edit", stream)
+}
+
+func buildGenericImagesMultipartRequestBody(form *multipart.Form, imageFiles []*multipart.FileHeader, maskFile *multipart.FileHeader, promptForRequest, imageModel string, stream bool) ([]byte, string, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	if err := writer.WriteField("prompt", strings.TrimSpace(promptForRequest)); err != nil {
+		return nil, "", err
+	}
+	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
+	if strings.TrimSpace(toolModel) != "" {
+		if err := writer.WriteField("model", toolModel); err != nil {
+			return nil, "", err
+		}
+	}
+
+	wroteSize := false
+	skipFields := map[string]bool{
+		"prompt": true,
+		"model":  true,
+		"style":  true,
+	}
+	if form != nil {
+		for key, values := range form.Value {
+			if skipFields[key] {
+				continue
+			}
+			for _, value := range values {
+				value = strings.TrimSpace(value)
+				if value == "" {
+					continue
+				}
+				if key == "size" {
+					wroteSize = true
+				}
+				if err := writer.WriteField(key, value); err != nil {
+					return nil, "", err
+				}
+			}
+		}
+	}
+	if !wroteSize && defaultSize != "" {
+		if err := writer.WriteField("size", defaultSize); err != nil {
+			return nil, "", err
+		}
+	}
+	if stream && !formHasNonEmptyValue(form, "stream") {
+		if err := writer.WriteField("stream", "true"); err != nil {
+			return nil, "", err
+		}
+	}
+
+	for _, fileHeader := range imageFiles {
+		if err := writeGenericMultipartFile(writer, "image", fileHeader); err != nil {
+			return nil, "", err
+		}
+	}
+	if maskFile != nil {
+		if err := writeGenericMultipartFile(writer, "mask", maskFile); err != nil {
+			return nil, "", err
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), writer.FormDataContentType(), nil
+}
+
+func formHasNonEmptyValue(form *multipart.Form, key string) bool {
+	if form == nil {
+		return false
+	}
+	for _, value := range form.Value[key] {
+		if strings.TrimSpace(value) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func writeGenericMultipartFile(writer *multipart.Writer, field string, fileHeader *multipart.FileHeader) error {
+	if writer == nil || fileHeader == nil {
+		return nil
+	}
+	src, err := fileHeader.Open()
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+
+	data, err := io.ReadAll(src)
+	if err != nil {
+		return err
+	}
+	mediaType := normalizeImageDataURLMimeType(fileHeader.Header.Get("Content-Type"), data, fileHeader.Filename)
+	if mediaType == "" {
+		return fmt.Errorf("upload %q is not a supported image", strings.TrimSpace(fileHeader.Filename))
+	}
+	return writeGenericMultipartImageBytes(writer, field, fileHeader.Filename, data, mediaType)
 }
 
 func buildImagesEditToolFromForm(c *gin.Context, imageModel, maskDataURL string) []byte {
@@ -758,6 +1015,9 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	}
 	for _, image := range imagesResult.Array() {
 		if imageURL := strings.TrimSpace(image.Get("image_url").String()); imageURL != "" {
+			if normalized, ok := normalizeImageDataURL(imageURL); ok {
+				imageURL = normalized
+			}
 			images = append(images, imageURL)
 			continue
 		}
@@ -772,6 +1032,9 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	}
 
 	maskDataURL := strings.TrimSpace(gjson.GetBytes(rawBody, "mask.image_url").String())
+	if normalized, ok := normalizeImageDataURL(maskDataURL); ok {
+		maskDataURL = normalized
+	}
 	if maskDataURL == "" && gjson.GetBytes(rawBody, "mask.file_id").Exists() {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: mask.file_id is not supported (use mask.image_url instead)", "type": "invalid_request_error"}})
 		return
@@ -816,7 +1079,148 @@ func (h *Handler) imagesEditsFromJSON(c *gin.Context) {
 	tool = setDefaultImageToolSize(tool, defaultSize)
 
 	responsesBody := buildImagesResponsesRequest(promptForRequest, images, tool)
-	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, responseFormat, "image_edit", stream)
+	genericBody, genericContentType, err := buildGenericImagesJSONEditMultipartRequestBody(rawBody, images, maskDataURL, promptForRequest, imageModel, stream)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
+		return
+	}
+	h.forwardImagesRequest(c, "/v1/images/edits", imageModel, responsesBody, genericBody, genericContentType, responseFormat, "image_edit", stream)
+}
+
+func buildGenericImagesRequestBody(rawBody []byte, promptForRequest, imageModel string) []byte {
+	if len(rawBody) == 0 || !json.Valid(rawBody) {
+		return nil
+	}
+	body := append([]byte(nil), rawBody...)
+	if strings.TrimSpace(promptForRequest) != "" {
+		body, _ = sjson.SetBytes(body, "prompt", strings.TrimSpace(promptForRequest))
+	}
+	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
+	if strings.TrimSpace(toolModel) != "" {
+		body, _ = sjson.SetBytes(body, "model", toolModel)
+	}
+	if defaultSize != "" && strings.TrimSpace(gjson.GetBytes(body, "size").String()) == "" {
+		body, _ = sjson.SetBytes(body, "size", defaultSize)
+	}
+	body, _ = sjson.DeleteBytes(body, "style")
+	return body
+}
+
+func buildGenericImagesJSONEditMultipartRequestBody(rawBody []byte, images []string, maskDataURL, promptForRequest, imageModel string, stream bool) ([]byte, string, error) {
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+
+	if err := writer.WriteField("prompt", strings.TrimSpace(promptForRequest)); err != nil {
+		return nil, "", err
+	}
+	toolModel, defaultSize := normalizeImageToolModelForPrompt(imageModel, promptForRequest)
+	if strings.TrimSpace(toolModel) != "" {
+		if err := writer.WriteField("model", toolModel); err != nil {
+			return nil, "", err
+		}
+	}
+
+	wroteSize := false
+	for _, field := range genericImageOptionFields() {
+		value := strings.TrimSpace(genericImageJSONFieldString(gjson.GetBytes(rawBody, field)))
+		if value == "" {
+			continue
+		}
+		if field == "size" {
+			wroteSize = true
+		}
+		if err := writer.WriteField(field, value); err != nil {
+			return nil, "", err
+		}
+	}
+	if !wroteSize && defaultSize != "" {
+		if err := writer.WriteField("size", defaultSize); err != nil {
+			return nil, "", err
+		}
+	}
+	if stream && !gjson.GetBytes(rawBody, "stream").Exists() {
+		if err := writer.WriteField("stream", "true"); err != nil {
+			return nil, "", err
+		}
+	}
+
+	for i, imageURL := range images {
+		data, ok := decodeImageBase64(imageURL)
+		if !ok || len(data) == 0 {
+			return nil, "", fmt.Errorf("images[%d].image_url is not valid base64 image data", i)
+		}
+		if err := writeGenericMultipartBytes(writer, "image", fmt.Sprintf("image-%d.png", i+1), data); err != nil {
+			return nil, "", err
+		}
+	}
+	if strings.TrimSpace(maskDataURL) != "" {
+		data, ok := decodeImageBase64(maskDataURL)
+		if !ok || len(data) == 0 {
+			return nil, "", fmt.Errorf("mask.image_url is not valid base64 image data")
+		}
+		if err := writeGenericMultipartBytes(writer, "mask", "mask.png", data); err != nil {
+			return nil, "", err
+		}
+	}
+
+	if err := writer.Close(); err != nil {
+		return nil, "", err
+	}
+	return buf.Bytes(), writer.FormDataContentType(), nil
+}
+
+func genericImageOptionFields() []string {
+	return []string{
+		"size",
+		"quality",
+		"background",
+		"output_format",
+		"output_compression",
+		"input_fidelity",
+		"moderation",
+		"partial_images",
+		"response_format",
+		"n",
+		"user",
+		"stream",
+	}
+}
+
+func genericImageJSONFieldString(result gjson.Result) string {
+	if !result.Exists() {
+		return ""
+	}
+	if result.Type == gjson.String {
+		return result.String()
+	}
+	return result.Raw
+}
+
+func writeGenericMultipartBytes(writer *multipart.Writer, field, filename string, data []byte) error {
+	if writer == nil {
+		return nil
+	}
+	mediaType := normalizeImageDataURLMimeType("", data, filename)
+	if mediaType == "" {
+		return fmt.Errorf("%s is not a supported image", strings.TrimSpace(filename))
+	}
+	return writeGenericMultipartImageBytes(writer, field, filename, data, mediaType)
+}
+
+func writeGenericMultipartImageBytes(writer *multipart.Writer, field, filename string, data []byte, mediaType string) error {
+	header := make(textproto.MIMEHeader)
+	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, multipartQuote(field), multipartQuote(filename)))
+	header.Set("Content-Type", mediaType)
+	dst, err := writer.CreatePart(header)
+	if err != nil {
+		return err
+	}
+	_, err = dst.Write(data)
+	return err
+}
+
+func multipartQuote(value string) string {
+	return strings.NewReplacer("\\", "\\\\", `"`, `\"`, "\r", "", "\n", "").Replace(value)
 }
 
 func buildImagesResponsesRequest(prompt string, images []string, toolJSON []byte) []byte {
@@ -848,24 +1252,42 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 	if account == nil {
 		return false
 	}
+	if account.IsAPIKeyProvider() {
+		return true
+	}
 	return auth.IsPlusOrHigherPlan(account.GetPlanType())
 }
 
-func (h *Handler) nextImageAccount(apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
-	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, imagePreferredAccountFilter)
+func imageAccountFilter(targetAccountID int64) auth.AccountFilter {
+	if targetAccountID > 0 {
+		return func(account *auth.Account) bool {
+			return account != nil && account.ID() == targetAccountID
+		}
+	}
+	return imagePreferredAccountFilter
+}
+
+func (h *Handler) nextImageAccount(apiKeyID int64, targetAccountID int64, exclude map[int64]bool) (*auth.Account, string) {
+	filter := imageAccountFilter(targetAccountID)
+	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, filter)
 	if account != nil {
 		return account, stickyProxyURL
+	}
+	if targetAccountID > 0 {
+		return nil, ""
 	}
 	return h.nextAccountForSession("", apiKeyID, exclude)
 }
 
-func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, responseFormat, streamPrefix string, stream bool) {
+func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, genericBody []byte, genericContentType, responseFormat, streamPrefix string, stream bool) {
 	if err := validateResponsesImageGenerationSizes(responsesBody); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "Invalid request: " + err.Error(), "type": "invalid_request_error"}})
 		return
 	}
 
 	apiKeyID := requestAPIKeyID(c)
+	targetAccountID := requestTargetAccountID(c)
+	accountFilter := imageAccountFilter(targetAccountID)
 	maxRetries := h.getMaxRetries()
 	maxRateLimitRetries := h.getMaxRateLimitRetries()
 	generalRetries := 0
@@ -875,12 +1297,16 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	excludeAccounts := make(map[int64]bool)
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextImageAccount(apiKeyID, excludeAccounts)
+		account, stickyProxyURL := h.nextImageAccount(apiKeyID, targetAccountID, excludeAccounts)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailable(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
+					return
+				}
+				if targetAccountID > 0 {
+					c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": fmt.Sprintf("指定账号 %d 不可用或不允许当前 API Key 使用", targetAccountID), "type": "server_error"}})
 					return
 				}
 				c.JSON(http.StatusServiceUnavailable, noAvailableAccountError(""))
@@ -896,7 +1322,20 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			deviceCfg = &DeviceProfileConfig{StabilizeDeviceProfile: false}
 		}
 
-		resp, reqErr := ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, c.Request.Header.Clone(), h.shouldUseWebsocketForHTTP())
+		downstreamHeaders := c.Request.Header.Clone()
+		isGenericProvider := account.IsAPIKeyProvider()
+		var resp *http.Response
+		var reqErr error
+		if isGenericProvider {
+			if len(genericBody) == 0 {
+				h.store.Release(account)
+				excludeAccounts[account.ID()] = true
+				continue
+			}
+			resp, reqErr = ExecuteGenericOpenAIRequestWithContentType(c.Request.Context(), account, inboundEndpoint, genericBody, genericContentType, proxyURL, stream, downstreamHeaders)
+		} else {
+			resp, reqErr = ExecuteRequest(c.Request.Context(), account, responsesBody, "", proxyURL, apiKey, deviceCfg, downstreamHeaders, h.shouldUseWebsocketForHTTP())
+		}
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
@@ -919,16 +1358,24 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
-			if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
-				h.store.PersistUsageSnapshot(account, usagePct)
+			if !isGenericProvider {
+				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
+					h.store.PersistUsageSnapshot(account, usagePct)
+				}
 			}
 			errBody, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
 			logUpstreamError(inboundEndpoint, resp.StatusCode, requestModel, account.ID(), errBody)
-			h.logUpstreamCyberPolicy(c, inboundEndpoint, requestModel, errBody)
-			decision := h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
+			var decision codex429Decision
+			upstreamEndpoint := "/v1/responses"
+			if isGenericProvider {
+				upstreamEndpoint = inboundEndpoint
+			} else {
+				h.logUpstreamCyberPolicy(c, inboundEndpoint, requestModel, errBody)
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
+			}
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
@@ -937,7 +1384,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				StatusCode:        resp.StatusCode,
 				DurationMs:        durationMs,
 				InboundEndpoint:   inboundEndpoint,
-				UpstreamEndpoint:  "/v1/responses",
+				UpstreamEndpoint:  upstreamEndpoint,
 				Stream:            stream,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
@@ -950,6 +1397,29 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				continue
 			}
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
+			return
+		}
+
+		if isGenericProvider {
+			account.Mu().RLock()
+			c.Set("x-account-email", account.ProviderName)
+			account.Mu().RUnlock()
+			c.Set("x-account-proxy", proxyURL)
+			c.Set("x-model", requestModel)
+			promptTokens := estimatePromptTokensFromBody(genericBody)
+			h.proxyGenericOpenAIResponse(c, resp, account, &database.UsageLogInput{
+				AccountID:        account.ID(),
+				Endpoint:         inboundEndpoint,
+				Model:            requestModel,
+				StatusCode:       resp.StatusCode,
+				DurationMs:       durationMs,
+				PromptTokens:     promptTokens,
+				InputTokens:      promptTokens,
+				InboundEndpoint:  inboundEndpoint,
+				UpstreamEndpoint: inboundEndpoint,
+				Stream:           stream,
+			})
+			h.store.Release(account)
 			return
 		}
 

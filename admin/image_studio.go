@@ -53,16 +53,24 @@ type imagePromptTemplatePayload struct {
 }
 
 type imageGenerationJobPayload struct {
-	Prompt       string `json:"prompt"`
-	Model        string `json:"model"`
-	Size         string `json:"size"`
-	Quality      string `json:"quality"`
-	OutputFormat string `json:"output_format"`
-	Background   string `json:"background"`
-	Style        string `json:"style"`
-	Upscale      string `json:"upscale"`
-	APIKeyID     int64  `json:"api_key_id"`
-	TemplateID   int64  `json:"template_id"`
+	Prompt            string                  `json:"prompt"`
+	Model             string                  `json:"model"`
+	Size              string                  `json:"size"`
+	Quality           string                  `json:"quality"`
+	OutputFormat      string                  `json:"output_format"`
+	Background        string                  `json:"background"`
+	Style             string                  `json:"style"`
+	Upscale           string                  `json:"upscale"`
+	APIKeyID          int64                   `json:"api_key_id"`
+	TemplateID        int64                   `json:"template_id"`
+	UpstreamAccountID int64                   `json:"upstream_account_id"`
+	ReferenceImages   []imageReferencePayload `json:"reference_images"`
+}
+
+type imageReferencePayload struct {
+	AssetID  int64  `json:"asset_id"`
+	ImageURL string `json:"image_url"`
+	Name     string `json:"name"`
 }
 
 type imageJobResponse struct {
@@ -272,6 +280,15 @@ func (h *Handler) CreateImageGenerationJob(c *gin.Context) {
 	req.Background = normalizeOptionalImageParam(req.Background)
 	req.Style = normalizeOptionalImageParam(req.Style)
 	req.Upscale = imageproc.NormalizeUpscale(req.Upscale)
+	req.ReferenceImages = normalizeImageReferencePayloads(req.ReferenceImages)
+	if len(req.ReferenceImages) > 8 {
+		writeError(c, http.StatusBadRequest, "参考图最多支持 8 张")
+		return
+	}
+	if req.UpstreamAccountID < 0 {
+		writeError(c, http.StatusBadRequest, "上游账号无效")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
 	defer cancel()
@@ -282,6 +299,21 @@ func (h *Handler) CreateImageGenerationJob(c *gin.Context) {
 	}
 	paramsJSON, _ := json.Marshal(req)
 	keyID, keyName, keyMasked := imageJobAPIKeyMeta(apiKey)
+	if req.UpstreamAccountID > 0 {
+		if h.store == nil {
+			writeError(c, http.StatusBadRequest, "账号池不可用")
+			return
+		}
+		account := h.store.FindByID(req.UpstreamAccountID)
+		if account == nil {
+			writeError(c, http.StatusBadRequest, "上游账号不存在或未加载")
+			return
+		}
+		if !account.AllowsAPIKey(keyID) {
+			writeError(c, http.StatusBadRequest, "所选上游账号不允许当前 API Key 使用")
+			return
+		}
+	}
 	if h.inspectImageStudioPromptFilter(c, proxy.AppendImageStyleToPrompt(req.Prompt, req.Style), req.Model, keyID, keyName, keyMasked) {
 		return
 	}
@@ -304,7 +336,7 @@ func (h *Handler) CreateImageGenerationJob(c *gin.Context) {
 		writeInternalError(c, err)
 		return
 	}
-	log.Printf("[image-studio] job=%d queued model=%s size=%s quality=%s format=%s background=%s upscale=%s style=%t api_key=%s template=%d prompt=%q",
+	log.Printf("[image-studio] job=%d queued model=%s size=%s quality=%s format=%s background=%s upscale=%s style=%t api_key=%s upstream_account=%d references=%d template=%d prompt=%q",
 		jobID,
 		imageLogValue(req.Model),
 		imageLogValue(req.Size),
@@ -314,6 +346,8 @@ func (h *Handler) CreateImageGenerationJob(c *gin.Context) {
 		imageLogValue(req.Upscale),
 		strings.TrimSpace(req.Style) != "",
 		imageLogAPIKeyLabel(keyID, keyName, keyMasked),
+		req.UpstreamAccountID,
+		len(req.ReferenceImages),
 		req.TemplateID,
 		imageLogPromptPreview(req.Prompt),
 	)
@@ -632,7 +666,7 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 		logImageJobError(jobID, err)
 		return
 	}
-	log.Printf("[image-studio] job=%d started model=%s size=%s quality=%s format=%s background=%s api_key=%s prompt_chars=%d",
+	log.Printf("[image-studio] job=%d started model=%s size=%s quality=%s format=%s background=%s api_key=%s upstream_account=%d references=%d prompt_chars=%d",
 		jobID,
 		imageLogValue(req.Model),
 		imageLogValue(req.Size),
@@ -640,19 +674,22 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 		imageLogValue(req.OutputFormat),
 		imageLogValue(req.Background),
 		imageLogAPIKeyFromRow(apiKey),
+		req.UpstreamAccountID,
+		len(req.ReferenceImages),
 		len([]rune(req.Prompt)),
 	)
 
 	styledPrompt := proxy.AppendImageStyleToPrompt(req.Prompt, req.Style)
-	rawBody, err := buildAdminImageGenerationRequest(req)
+	rawBody, imageEndpoint, err := h.buildAdminImageRequest(ctx, req)
 	if err != nil {
 		durationMs := int(time.Since(start).Milliseconds())
 		log.Printf("[image-studio] job=%d failed duration=%s stage=build_request error=%s", jobID, imageLogDuration(durationMs), security.SanitizeLog(err.Error()))
 		_ = h.db.MarkImageJobFailed(context.Background(), jobID, err.Error(), durationMs)
 		return
 	}
-	log.Printf("[image-studio] job=%d upstream request model=%s size=%s quality=%s format=%s body_bytes=%d prompt_chars=%d prompt=%q",
+	log.Printf("[image-studio] job=%d upstream request endpoint=%s model=%s size=%s quality=%s format=%s body_bytes=%d prompt_chars=%d prompt=%q",
 		jobID,
+		imageEndpoint,
 		imageLogValue(gjson.GetBytes(rawBody, "model").String()),
 		imageLogValue(gjson.GetBytes(rawBody, "size").String()),
 		imageLogValue(gjson.GetBytes(rawBody, "quality").String()),
@@ -665,12 +702,12 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 	if imageProxy == nil {
 		imageProxy = proxy.NewHandler(h.store, h.db, nil, nil)
 	}
-	responseJSON, upstreamStatus, err := imageProxy.GenerateImageOnceForAdmin(ctx, rawBody, apiKey)
+	responseJSON, upstreamStatus, err := executeAdminImageProxyRequest(ctx, imageProxy, imageEndpoint, rawBody, apiKey, req.UpstreamAccountID)
 	if shouldFallbackImageJobToJPEG(req, upstreamStatus, err) {
 		pngErr := err
 		pngStatus := upstreamStatus
 		fallbackReq := jpegFallbackImageJobRequest(req)
-		fallbackBody, buildErr := buildAdminImageGenerationRequest(fallbackReq)
+		fallbackBody, fallbackEndpoint, buildErr := h.buildAdminImageRequest(ctx, fallbackReq)
 		if buildErr != nil {
 			durationMs := int(time.Since(start).Milliseconds())
 			log.Printf("[image-studio] job=%d failed duration=%s stage=build_jpeg_fallback error=%s", jobID, imageLogDuration(durationMs), security.SanitizeLog(buildErr.Error()))
@@ -688,10 +725,11 @@ func (h *Handler) runImageGenerationJob(jobID int64, req imageGenerationJobPaylo
 			len([]rune(fallbackStyledPrompt)),
 			imageLogPromptPreview(fallbackStyledPrompt),
 		)
-		responseJSON, upstreamStatus, err = imageProxy.GenerateImageOnceForAdmin(ctx, fallbackBody, apiKey)
+		responseJSON, upstreamStatus, err = executeAdminImageProxyRequest(ctx, imageProxy, fallbackEndpoint, fallbackBody, apiKey, fallbackReq.UpstreamAccountID)
 		if err == nil {
 			req = fallbackReq
 			rawBody = fallbackBody
+			imageEndpoint = fallbackEndpoint
 			if paramsJSON, marshalErr := json.Marshal(fallbackReq); marshalErr == nil {
 				if updateErr := h.db.UpdateImageGenerationJobParamsJSON(context.Background(), jobID, string(paramsJSON)); updateErr != nil {
 					logImageJobError(jobID, updateErr)
@@ -770,6 +808,117 @@ func buildAdminImageGenerationRequest(req imageGenerationJobPayload) ([]byte, er
 	return json.Marshal(body)
 }
 
+func (h *Handler) buildAdminImageRequest(ctx context.Context, req imageGenerationJobPayload) ([]byte, string, error) {
+	if len(req.ReferenceImages) == 0 {
+		body, err := buildAdminImageGenerationRequest(req)
+		return body, "/v1/images/generations", err
+	}
+	body, err := h.buildAdminImageEditRequest(ctx, req)
+	return body, "/v1/images/edits", err
+}
+
+func (h *Handler) buildAdminImageEditRequest(ctx context.Context, req imageGenerationJobPayload) ([]byte, error) {
+	images := make([]map[string]string, 0, len(req.ReferenceImages))
+	for idx, ref := range req.ReferenceImages {
+		imageURL, err := h.resolveImageReferenceDataURL(ctx, ref)
+		if err != nil {
+			return nil, fmt.Errorf("参考图 %d 无效: %w", idx+1, err)
+		}
+		images = append(images, map[string]string{"image_url": imageURL})
+	}
+	if len(images) == 0 {
+		return nil, fmt.Errorf("至少需要一张参考图")
+	}
+	body := map[string]any{
+		"model":           req.Model,
+		"prompt":          proxy.AppendImageStyleToPrompt(req.Prompt, req.Style),
+		"response_format": "b64_json",
+		"images":          images,
+	}
+	if req.Size != "" && req.Size != "auto" {
+		body["size"] = req.Size
+	}
+	if req.Quality != "" && req.Quality != "auto" {
+		body["quality"] = req.Quality
+	}
+	if req.OutputFormat != "" {
+		body["output_format"] = req.OutputFormat
+	}
+	if req.Background != "" && req.Background != "auto" {
+		body["background"] = req.Background
+	}
+	return json.Marshal(body)
+}
+
+func (h *Handler) resolveImageReferenceDataURL(ctx context.Context, ref imageReferencePayload) (string, error) {
+	if strings.TrimSpace(ref.ImageURL) != "" {
+		mimeType, data, ok := parseInlineImageDataURL(ref.ImageURL)
+		if !ok {
+			return "", fmt.Errorf("上传图片必须是 data:image/*;base64 格式")
+		}
+		return imageDataURL(mimeType, data), nil
+	}
+	if ref.AssetID <= 0 {
+		return "", fmt.Errorf("缺少图片")
+	}
+	if h == nil || h.db == nil {
+		return "", fmt.Errorf("图库不可用")
+	}
+	asset, err := h.db.GetImageAsset(ctx, ref.AssetID)
+	if err != nil {
+		return "", err
+	}
+	backend, err := imagestore.Resolve(asset.StoragePath)
+	if err != nil {
+		return "", err
+	}
+	data, err := backend.Read(ctx, asset.StoragePath)
+	if err != nil {
+		return "", err
+	}
+	mimeType := normalizeImageMimeType(asset.MimeType, data, asset.Filename, asset.OutputFormat, asset.StoragePath)
+	if mimeType == "" {
+		return "", fmt.Errorf("图库图片 MIME 类型无法识别为图片")
+	}
+	return imageDataURL(mimeType, data), nil
+}
+
+func parseInlineImageDataURL(raw string) (string, []byte, bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(strings.ToLower(raw), "data:") {
+		return "", nil, false
+	}
+	comma := strings.Index(raw, ",")
+	if comma < 0 || !strings.Contains(strings.ToLower(raw[:comma]), ";base64") {
+		return "", nil, false
+	}
+	mimeType := strings.TrimPrefix(strings.Split(raw[:comma], ";")[0], "data:")
+	encoded := raw[comma+1:]
+	if strings.ContainsAny(encoded, " \t\r\n") {
+		encoded = strings.NewReplacer(" ", "", "\t", "", "\r", "", "\n", "").Replace(encoded)
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil || len(data) == 0 {
+		return "", nil, false
+	}
+	mimeType = normalizeImageMimeType(mimeType, data)
+	if mimeType == "" {
+		return "", nil, false
+	}
+	return mimeType, data, true
+}
+
+func imageDataURL(mimeType string, data []byte) string {
+	return "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(data)
+}
+
+func executeAdminImageProxyRequest(ctx context.Context, imageProxy *proxy.Handler, endpoint string, rawBody []byte, apiKey *database.APIKeyRow, upstreamAccountID int64) ([]byte, int, error) {
+	if strings.TrimSpace(endpoint) == "/v1/images/edits" {
+		return imageProxy.EditImageOnceForAdminWithAccount(ctx, rawBody, apiKey, upstreamAccountID)
+	}
+	return imageProxy.GenerateImageOnceForAdminWithAccount(ctx, rawBody, apiKey, upstreamAccountID)
+}
+
 func shouldFallbackImageJobToJPEG(req imageGenerationJobPayload, upstreamStatus int, err error) bool {
 	if err == nil || !isPNGOutputFormat(req.OutputFormat) {
 		return false
@@ -791,6 +940,12 @@ func shouldFallbackImageJobToJPEG(req imageGenerationJobPayload, upstreamStatus 
 		"content_policy",
 		"safety",
 		"unsupported_country_region_territory",
+		"bad gateway",
+		"bad_gateway",
+		"cloudflare_error",
+		"origin_bad_gateway",
+		"owner_action_required",
+		"retry_after",
 	} {
 		if strings.Contains(message, blocked) {
 			return false
@@ -799,15 +954,13 @@ func shouldFallbackImageJobToJPEG(req imageGenerationJobPayload, upstreamStatus 
 	for _, marker := range []string{
 		"server_error",
 		"processing your request",
-		"image generation failed with http 5",
+		"image generation failed with http 500",
 	} {
 		if strings.Contains(message, marker) {
 			return true
 		}
 	}
-	return upstreamStatus == http.StatusBadGateway ||
-		upstreamStatus == http.StatusInternalServerError ||
-		upstreamStatus == http.StatusGatewayTimeout
+	return upstreamStatus == http.StatusInternalServerError
 }
 
 func isPNGOutputFormat(outputFormat string) bool {
@@ -868,8 +1021,9 @@ func (h *Handler) saveImageJobAssets(ctx context.Context, jobID int64, req image
 		if format == "" {
 			format = responseFormat
 		}
+		mimeType = normalizeImageMimeType(mimeType, imageBytes, format, responseFormat)
 		if mimeType == "" {
-			mimeType = mime.TypeByExtension("." + format)
+			mimeType = imageMimeTypeFromHint(format)
 		}
 		if mimeType == "" {
 			mimeType = "application/octet-stream"
@@ -1033,6 +1187,7 @@ func decodeImageDataItem(item gjson.Result) ([]byte, string, string, error) {
 	if mimeType == "" {
 		mimeType = http.DetectContentType(data)
 	}
+	mimeType = normalizeImageMimeType(mimeType, data, item.Get("output_format").String())
 	format := strings.ToLower(strings.TrimSpace(item.Get("output_format").String()))
 	if format == "" {
 		format = extensionFromMimeType(mimeType)
@@ -1066,6 +1221,19 @@ func normalizeImageStudioModel(model string) string {
 
 func normalizeOptionalImageParam(value string) string {
 	return strings.TrimSpace(value)
+}
+
+func normalizeImageReferencePayloads(refs []imageReferencePayload) []imageReferencePayload {
+	result := make([]imageReferencePayload, 0, len(refs))
+	for _, ref := range refs {
+		ref.ImageURL = strings.TrimSpace(ref.ImageURL)
+		ref.Name = strings.TrimSpace(ref.Name)
+		if ref.AssetID <= 0 && ref.ImageURL == "" {
+			continue
+		}
+		result = append(result, ref)
+	}
+	return result
 }
 
 func parsePositiveIDParam(c *gin.Context, name string) (int64, error) {
@@ -1131,6 +1299,90 @@ func extensionFromMimeType(mimeType string) string {
 	case "image/gif":
 		return "gif"
 	default:
+		return ""
+	}
+}
+
+func normalizeImageMimeType(mimeType string, data []byte, hints ...string) string {
+	if normalized, ok := canonicalImageMimeType(mimeType); ok {
+		return normalized
+	}
+	if detected := imageMimeTypeFromBytes(data); detected != "" {
+		return detected
+	}
+	for _, hint := range hints {
+		if normalized, ok := canonicalImageMimeType(hint); ok {
+			return normalized
+		}
+		if detected := imageMimeTypeFromHint(hint); detected != "" {
+			return detected
+		}
+	}
+	return ""
+}
+
+func canonicalImageMimeType(raw string) (string, bool) {
+	raw = strings.ToLower(strings.TrimSpace(strings.Split(raw, ";")[0]))
+	switch raw {
+	case "image/png":
+		return "image/png", true
+	case "image/jpeg", "image/jpg":
+		return "image/jpeg", true
+	case "image/webp":
+		return "image/webp", true
+	case "image/gif":
+		return "image/gif", true
+	default:
+		return "", false
+	}
+}
+
+func imageMimeTypeFromBytes(data []byte) string {
+	if len(data) >= 8 && bytes.Equal(data[:8], []byte{0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'}) {
+		return "image/png"
+	}
+	if len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff {
+		return "image/jpeg"
+	}
+	if len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a") {
+		return "image/gif"
+	}
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return "image/webp"
+	}
+	if detected, ok := canonicalImageMimeType(http.DetectContentType(data)); ok {
+		return detected
+	}
+	if _, format, err := image.DecodeConfig(bytes.NewReader(data)); err == nil {
+		return imageMimeTypeFromHint(format)
+	}
+	return ""
+}
+
+func imageMimeTypeFromHint(hint string) string {
+	hint = strings.ToLower(strings.TrimSpace(hint))
+	if hint == "" {
+		return ""
+	}
+	ext := strings.TrimPrefix(filepath.Ext(hint), ".")
+	if ext == "" {
+		ext = strings.TrimPrefix(hint, ".")
+	}
+	switch ext {
+	case "png":
+		return "image/png"
+	case "jpg", "jpeg":
+		return "image/jpeg"
+	case "webp":
+		return "image/webp"
+	case "gif":
+		return "image/gif"
+	default:
+		if mimeType := mime.TypeByExtension("." + ext); mimeType != "" {
+			if normalized, ok := canonicalImageMimeType(mimeType); ok {
+				return normalized
+			}
+		}
 		return ""
 	}
 }

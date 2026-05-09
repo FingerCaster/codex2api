@@ -603,6 +603,12 @@ export interface CreateImageJobPayload {
   style?: string
   upscale?: string
   api_key_id?: number
+  upstream_account_id?: number
+  reference_images?: Array<{
+    asset_id?: number
+    image_url?: string
+    name?: string
+  }>
   template_id?: number
 }
 
