@@ -276,15 +276,14 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 
 			translator := newAnthropicStreamTranslator(originalModel)
+			streamWriter := newStreamFlushWriter(c.Writer, flusher)
 
 			readErr = ReadSSEStream(resp.Body, func(data []byte) bool {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
 				// TTFT 跟踪
-				if !ttftRecorded && (eventType == "response.output_text.delta" ||
-					eventType == "response.reasoning_summary_text.delta" ||
-					eventType == "response.reasoning_text.delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
@@ -307,18 +306,18 @@ func (h *Handler) Messages(c *gin.Context) {
 				events := translator.translateEvent(data)
 				for _, evt := range events {
 					sse := anthropicEventToSSE(evt)
-					if _, err := fmt.Fprint(c.Writer, sse); err != nil {
+					if err := streamWriter.WriteString(sse); err != nil {
 						writeErr = err
 						return false
 					}
 					wroteAnyBody = true
 				}
-				if len(events) > 0 {
-					flusher.Flush()
-				}
 
 				return eventType != "response.completed" && eventType != "response.failed"
 			})
+			if writeErr == nil {
+				writeErr = streamWriter.Flush()
+			}
 
 			// 流结束后补齐事件
 			if writeErr == nil {
@@ -327,9 +326,14 @@ func (h *Handler) Messages(c *gin.Context) {
 				if !gotTerminal {
 					for _, evt := range finalEvents {
 						sse := anthropicEventToSSE(evt)
-						fmt.Fprint(c.Writer, sse)
+						if err := streamWriter.WriteString(sse); err != nil {
+							writeErr = err
+							break
+						}
 					}
-					flusher.Flush()
+					if writeErr == nil {
+						writeErr = streamWriter.Flush()
+					}
 				}
 			}
 		} else {
@@ -340,7 +344,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				parsed := gjson.ParseBytes(data)
 				eventType := parsed.Get("type").String()
 
-				if !ttftRecorded && strings.Contains(eventType, ".delta") {
+				if !ttftRecorded && isFirstTokenEvent(eventType) {
 					firstTokenMs = int(time.Since(start).Milliseconds())
 					ttftRecorded = true
 				}
