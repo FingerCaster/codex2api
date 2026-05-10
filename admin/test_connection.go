@@ -116,6 +116,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	usageState := proxy.CodexUsageSyncResult{}
 	if !isGenericProvider {
 		usageState = proxy.SyncCodexUsageState(h.store, account, resp)
+		if msg, limited := formatUsageLimitedTestError(usageState); limited {
+			sendTestEvent(c, testEvent{Type: "error", Error: msg})
+			return
+		}
 	}
 
 	// 解析 SSE 流
@@ -294,6 +298,20 @@ func buildTestPayload(model string) []byte {
 	payload, _ = sjson.SetBytes(payload, "store", false)
 	payload, _ = sjson.SetBytes(payload, "instructions", "You are a helpful assistant. Reply briefly.")
 	return payload
+}
+
+func formatUsageLimitedTestError(state proxy.CodexUsageSyncResult) (string, bool) {
+	if state.Premium5hRateLimited {
+		remaining := time.Until(state.Reset5hAt).Round(time.Second)
+		if remaining < 0 {
+			remaining = 0
+		}
+		return fmt.Sprintf("上游探针返回 200，但 Codex 5h 用量头已达 %.0f%%，账号已保持限流状态，预计 %s 后恢复。", state.UsagePct5h, remaining), true
+	}
+	if state.HasUsage7d && state.UsagePct7d >= 100 {
+		return fmt.Sprintf("上游探针返回 200，但 Codex 7d 用量头已达 %.0f%%，账号已保持用量耗尽状态。", state.UsagePct7d), true
+	}
+	return "", false
 }
 
 // sendTestEvent 发送 SSE 事件
@@ -572,11 +590,13 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				usageState := proxy.CodexUsageSyncResult{}
 				if !isGenericProvider {
 					usageState = proxy.SyncCodexUsageState(h.store, acc, resp)
+					if _, limited := formatUsageLimitedTestError(usageState); limited {
+						atomic.AddInt64(&rateLimitCount, 1)
+						return
+					}
 				}
 				// 测试成功即重置冷却状态，用量限制由调度器自行判断
-				if isGenericProvider || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100)) {
-					h.store.ClearCooldown(acc)
-				}
+				h.store.ClearCooldown(acc)
 				atomic.AddInt64(&successCount, 1)
 			case http.StatusUnauthorized:
 				if isGenericProvider {

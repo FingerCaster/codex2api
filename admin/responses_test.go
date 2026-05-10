@@ -435,6 +435,7 @@ func TestSchedulerBreakdownResponse(t *testing.T) {
 		FailurePenalty:      1.0,
 		SuccessBonus:        4.0,
 		UsagePenalty7d:      8.0,
+		UsageUrgencyBonus5h: 6.0,
 		LatencyPenalty:      2.5,
 		SuccessRatePenalty:  1.5,
 	}
@@ -444,6 +445,9 @@ func TestSchedulerBreakdownResponse(t *testing.T) {
 	}
 	if resp.SuccessBonus != 4.0 {
 		t.Errorf("SuccessBonus = %v, want 4.0", resp.SuccessBonus)
+	}
+	if resp.UsageUrgencyBonus5h != 6.0 {
+		t.Errorf("UsageUrgencyBonus5h = %v, want 6.0", resp.UsageUrgencyBonus5h)
 	}
 }
 

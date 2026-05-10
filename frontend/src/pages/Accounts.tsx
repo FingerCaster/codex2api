@@ -11,6 +11,7 @@ import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
 import type { AccountRow, AddAccountRequest, AddATAccountRequest, AddProviderKeyRequest, APIKeyRow } from '../types'
+import { formatCompactEmail } from '../lib/utils'
 import { getErrorMessage } from '../utils/error'
 import { formatRelativeTime, formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
@@ -54,6 +55,31 @@ function matchesPlanFilter(planType: string | undefined, filter: AccountPlanFilt
   }
 
   return normalized === filter
+}
+
+const ACCOUNT_BATCH_CONCURRENCY = 6
+const ACCOUNT_REFRESH_BATCH_CONCURRENCY = 4
+
+async function runAccountBatch(ids: number[], action: (id: number) => Promise<unknown>, concurrency = ACCOUNT_BATCH_CONCURRENCY) {
+  let success = 0
+  let fail = 0
+  let cursor = 0
+  const workerCount = Math.min(concurrency, ids.length)
+
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (cursor < ids.length) {
+      const id = ids[cursor]
+      cursor += 1
+      try {
+        await action(id)
+        success += 1
+      } catch {
+        fail += 1
+      }
+    }
+  }))
+
+  return { success, fail }
 }
 
 export default function Accounts() {
@@ -126,6 +152,7 @@ export default function Accounts() {
   const jsonInputRef = useRef<HTMLInputElement>(null)
   const atFileInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
+  const selectAllRef = useRef<HTMLInputElement>(null)
   const { toast, showToast } = useToast()
   const { confirm, confirmDialog } = useConfirmDialog()
 
@@ -191,77 +218,94 @@ export default function Accounts() {
     return () => window.clearTimeout(timer)
   }, [accounts, reloadSilently])
 
-  const totalAccounts = accounts.length
-  const normalAccounts = accounts.filter((account) => account.status === 'active' || account.status === 'ready').length
-  const rateLimitedAccountRows = accounts.filter(isRateLimitedAccount)
-  const rateLimitedWindowStats = getRateLimitedWindowStats(rateLimitedAccountRows)
-  const rateLimitedAccounts = rateLimitedAccountRows.length
-  const rateLimited5hAccounts = rateLimitedWindowStats.fiveHour
-  const rateLimited7dAccounts = rateLimitedWindowStats.sevenDay
-  const bannedAccounts = accounts.filter((account) => account.status === 'unauthorized').length
-  const errorAccounts = accounts.filter((account) => account.status === 'error').length
-  const disabledAccounts = accounts.filter((account) => account.enabled === false).length
-  const lockedAccounts = accounts.filter((account) => account.locked).length
-  const subscriptionAccountsToLock = accounts.filter((account) => isSubscriptionPlan(account.plan_type) && !account.locked)
-  const healthyAccounts = accounts.filter((account) => account.health_tier === 'healthy').length
-  const warmAccounts = accounts.filter((account) => account.health_tier === 'warm').length
-  const riskyAccounts = accounts.filter((account) => account.health_tier === 'risky').length
+  const accountSummary = useMemo(() => {
+    const rateLimitedWindowStats = getRateLimitedWindowStats(accounts)
+    return {
+      totalAccounts: accounts.length,
+      normalAccounts: accounts.filter((account) => account.status === 'active' || account.status === 'ready').length,
+      rateLimitedAccounts: rateLimitedWindowStats.total,
+      rateLimited5hAccounts: rateLimitedWindowStats.fiveHour,
+      rateLimited7dAccounts: rateLimitedWindowStats.sevenDay,
+      bannedAccounts: accounts.filter((account) => account.status === 'unauthorized').length,
+      errorAccounts: accounts.filter((account) => account.status === 'error').length,
+      disabledAccounts: accounts.filter((account) => account.enabled === false).length,
+      lockedAccounts: accounts.filter((account) => account.locked).length,
+      subscriptionAccountsToLock: accounts.filter((account) => isSubscriptionPlan(account.plan_type) && !account.locked),
+      healthyAccounts: accounts.filter((account) => account.health_tier === 'healthy').length,
+      warmAccounts: accounts.filter((account) => account.health_tier === 'warm').length,
+      riskyAccounts: accounts.filter((account) => account.health_tier === 'risky').length,
+    }
+  }, [accounts])
+  const {
+    totalAccounts,
+    normalAccounts,
+    rateLimitedAccounts,
+    rateLimited5hAccounts,
+    rateLimited7dAccounts,
+    bannedAccounts,
+    errorAccounts,
+    disabledAccounts,
+    lockedAccounts,
+    subscriptionAccountsToLock,
+    healthyAccounts,
+    warmAccounts,
+    riskyAccounts,
+  } = accountSummary
 
-  const filteredAccounts = accounts.filter((account) => {
-    // 状态过滤
-    switch (statusFilter) {
-      case 'normal':
-        if (account.status !== 'active' && account.status !== 'ready') return false
-        break
-      case 'rate_limited':
-        if (!isRateLimitedAccount(account)) return false
-        break
-      case 'banned':
-        if (account.status !== 'unauthorized') return false
-        break
-      case 'disabled':
-        if (!account.disabled) return false
-      case 'error':
-        if (account.status !== 'error') return false
-        break
-      case 'disabled':
-        if (account.enabled !== false) return false
-        break
-      case 'locked':
-        if (!account.locked) return false
-        break
-    }
-    // 套餐过滤：保留 plus 模糊匹配，同时支持 prolite 独立过滤
-    if (planFilter === 'prolite') {
-      const plan = (account.plan_type || '').toLowerCase().trim()
-      if (plan !== 'prolite') return false
-    } else if (!matchesPlanFilter(account.plan_type, planFilter)) {
-      return false
-    }
-    // 搜索过滤
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase()
-      const email = (account.email || '').toLowerCase()
-      const name = (account.name || '').toLowerCase()
-      const providerName = (account.provider_name || '').toLowerCase()
-      const baseURL = (account.base_url || '').toLowerCase()
-      if (!email.includes(q) && !name.includes(q) && !providerName.includes(q) && !baseURL.includes(q)) return false
-    }
-    return true
-  })
+  const filteredAccounts = useMemo(() => {
+    const query = searchQuery.toLowerCase()
+    return accounts.filter((account) => {
+      switch (statusFilter) {
+        case 'normal':
+          if (account.status !== 'active' && account.status !== 'ready') return false
+          break
+        case 'rate_limited':
+          if (!isRateLimitedAccount(account)) return false
+          break
+        case 'banned':
+          if (account.status !== 'unauthorized') return false
+          break
+        case 'error':
+          if (account.status !== 'error') return false
+          break
+        case 'disabled':
+          if (account.enabled !== false) return false
+          break
+        case 'locked':
+          if (!account.locked) return false
+          break
+      }
+      if (planFilter === 'prolite') {
+        const plan = (account.plan_type || '').toLowerCase().trim()
+        if (plan !== planFilter) return false
+      } else if (!matchesPlanFilter(account.plan_type, planFilter)) {
+        return false
+      }
+      if (query) {
+        const email = (account.email || '').toLowerCase()
+        const name = (account.name || '').toLowerCase()
+        const providerName = (account.provider_name || '').toLowerCase()
+        const baseURL = (account.base_url || '').toLowerCase()
+        if (!email.includes(query) && !name.includes(query) && !providerName.includes(query) && !baseURL.includes(query)) return false
+      }
+      return true
+    })
+  }, [accounts, planFilter, searchQuery, statusFilter])
 
-  const sortedAccounts = [...filteredAccounts].sort((a, b) => {
-    if (!sortKey) return 0
-    let diff = 0
-    if (sortKey === 'requests') {
-      diff = ((a.success_requests ?? 0) + (a.error_requests ?? 0)) - ((b.success_requests ?? 0) + (b.error_requests ?? 0))
-    } else if (sortKey === 'usage') {
-      diff = (a.usage_percent_7d ?? -1) - (b.usage_percent_7d ?? -1)
-    } else if (sortKey === 'importTime') {
-      diff = new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
-    }
-    return sortDir === 'asc' ? diff : -diff
-  })
+  const sortedAccounts = useMemo(() => {
+    if (!sortKey) return filteredAccounts
+    return [...filteredAccounts].sort((a, b) => {
+      let diff = 0
+      if (sortKey === 'requests') {
+        diff = ((a.success_requests ?? 0) + (a.error_requests ?? 0)) - ((b.success_requests ?? 0) + (b.error_requests ?? 0))
+      } else if (sortKey === 'usage') {
+        diff = (a.usage_percent_7d ?? -1) - (b.usage_percent_7d ?? -1)
+      } else if (sortKey === 'importTime') {
+        diff = new Date(a.created_at || 0).getTime() - new Date(b.created_at || 0).getTime()
+      }
+      return sortDir === 'asc' ? diff : -diff
+    })
+  }, [filteredAccounts, sortDir, sortKey])
 
   const sortValue = sortKey ? `${sortKey}_${sortDir}` as AccountSortValue : 'default'
 
@@ -277,8 +321,17 @@ export default function Accounts() {
 
   const totalPages = Math.max(1, Math.ceil(sortedAccounts.length / pageSize))
   const currentPage = Math.min(page, totalPages)
-  const pagedAccounts = sortedAccounts.slice((currentPage - 1) * pageSize, currentPage * pageSize)
-  const allPageSelected = pagedAccounts.length > 0 && pagedAccounts.every((a) => selected.has(a.id))
+  const pagedAccounts = useMemo(
+    () => sortedAccounts.slice((currentPage - 1) * pageSize, currentPage * pageSize),
+    [currentPage, pageSize, sortedAccounts],
+  )
+  const pagedAccountIds = useMemo(() => pagedAccounts.map((account) => account.id), [pagedAccounts])
+  const pageSelectedCount = useMemo(
+    () => pagedAccountIds.reduce((count, id) => count + (selected.has(id) ? 1 : 0), 0),
+    [pagedAccountIds, selected],
+  )
+  const allPageSelected = pagedAccountIds.length > 0 && pageSelectedCount === pagedAccountIds.length
+  const somePageSelected = pageSelectedCount > 0 && !allPageSelected
 
   const handleSortChange = (value: string) => {
     if (value === 'default') {
@@ -322,30 +375,36 @@ export default function Accounts() {
     return () => window.clearTimeout(timer)
   }, [accounts, reloadSilently])
 
-  const toggleSelect = (id: number) => {
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate = somePageSelected
+    }
+  }, [somePageSelected])
+
+  const toggleSelect = useCallback((id: number) => {
     setSelected((prev) => {
       const next = new Set(prev)
       if (next.has(id)) next.delete(id)
       else next.add(id)
       return next
     })
-  }
+  }, [])
 
-  const toggleSelectAll = () => {
+  const toggleSelectAll = useCallback(() => {
     if (allPageSelected) {
       setSelected((prev) => {
         const next = new Set(prev)
-        for (const a of pagedAccounts) next.delete(a.id)
+        for (const id of pagedAccountIds) next.delete(id)
         return next
       })
     } else {
       setSelected((prev) => {
         const next = new Set(prev)
-        for (const a of pagedAccounts) next.add(a.id)
+        for (const id of pagedAccountIds) next.add(id)
         return next
       })
     }
-  }
+  }, [allPageSelected, pagedAccountIds])
 
   const handleAdd = async () => {
     if (!addForm.refresh_token.trim()) return
@@ -822,7 +881,7 @@ export default function Accounts() {
   }
 
   const handleLockSubscriptionAccounts = async () => {
-    const candidates = accounts.filter((account) => isSubscriptionPlan(account.plan_type) && !account.locked)
+    const candidates = subscriptionAccountsToLock
     if (candidates.length === 0) {
       showToast(t('accounts.noSubscriptionAccountsToLock'))
       return
@@ -830,17 +889,11 @@ export default function Accounts() {
 
     setBatchLoading(true)
     setLockingSubscriptionAccounts(true)
-    let success = 0
-    let fail = 0
     try {
-      for (const account of candidates) {
-        try {
-          await api.toggleAccountLock(account.id, true)
-          success++
-        } catch {
-          fail++
-        }
-      }
+      const { success, fail } = await runAccountBatch(
+        candidates.map((account) => account.id),
+        (id) => api.toggleAccountLock(id, true),
+      )
       showToast(t('accounts.lockSubscriptionAccountsDone', { success, fail }))
       void reload()
     } finally {
@@ -861,47 +914,34 @@ export default function Accounts() {
   }
 
   const handleBatchDelete = async () => {
-    if (selected.size === 0) return
+    const ids = Array.from(selected)
+    if (ids.length === 0) return
     const confirmed = await confirm({
       title: t('accounts.batchDeleteTitle'),
-      description: t('accounts.batchDeleteDesc', { count: selected.size }),
+      description: t('accounts.batchDeleteDesc', { count: ids.length }),
       confirmText: t('accounts.deleteConfirm'),
       tone: 'destructive',
       confirmVariant: 'destructive',
     })
     if (!confirmed) return
     setBatchLoading(true)
-    let success = 0
-    let fail = 0
-    for (const id of selected) {
-      try {
-        await api.deleteAccount(id)
-        success++
-      } catch {
-        fail++
-      }
+    try {
+      const { success, fail } = await runAccountBatch(ids, api.deleteAccount)
+      showToast(t('accounts.batchDeleteDone', { success, fail }))
+      setSelected(new Set())
+      void reload()
+    } finally {
+      setBatchLoading(false)
     }
-    showToast(t('accounts.batchDeleteDone', { success, fail }))
-    setSelected(new Set())
-    setBatchLoading(false)
-    void reload()
   }
 
-  const handleBatchRefresh = async (ids = Array.from(selected)) => {
-    if (ids.length === 0) return
+  const handleBatchRefresh = async (ids?: number[]) => {
+    const targetIds = ids ?? Array.from(selected)
+    if (targetIds.length === 0) return
     setBatchLoading(true)
     setBatchRefreshing(true)
-    let success = 0
-    let fail = 0
     try {
-      for (const id of ids) {
-        try {
-          await api.refreshAccount(id)
-          success++
-        } catch {
-          fail++
-        }
-      }
+      const { success, fail } = await runAccountBatch(targetIds, api.refreshAccount, ACCOUNT_REFRESH_BATCH_CONCURRENCY)
       showToast(t('accounts.batchRefreshDone', { success, fail }))
       void reload()
     } finally {
@@ -911,38 +951,25 @@ export default function Accounts() {
   }
 
   const handleBatchLock = async (locked: boolean) => {
-    if (selected.size === 0) return
+    const ids = Array.from(selected)
+    if (ids.length === 0) return
     setBatchLoading(true)
-    let success = 0
-    let fail = 0
-    for (const id of selected) {
-      try {
-        await api.toggleAccountLock(id, locked)
-        success++
-      } catch {
-        fail++
-      }
+    try {
+      const { success, fail } = await runAccountBatch(ids, (id) => api.toggleAccountLock(id, locked))
+      showToast(t(locked ? 'accounts.batchLockDone' : 'accounts.batchUnlockDone', { success, fail }))
+      setSelected(new Set())
+      void reload()
+    } finally {
+      setBatchLoading(false)
     }
-    showToast(t(locked ? 'accounts.batchLockDone' : 'accounts.batchUnlockDone', { success, fail }))
-    setBatchLoading(false)
-    setSelected(new Set())
-    void reload()
   }
 
   const handleBatchEnabled = async (enabled: boolean) => {
-    if (selected.size === 0) return
+    const ids = Array.from(selected)
+    if (ids.length === 0) return
     setBatchLoading(true)
-    let success = 0
-    let fail = 0
     try {
-      for (const id of selected) {
-        try {
-          await api.toggleAccountEnabled(id, enabled)
-          success++
-        } catch {
-          fail++
-        }
-      }
+      const { success, fail } = await runAccountBatch(ids, (id) => api.toggleAccountEnabled(id, enabled))
       showToast(t(enabled ? 'accounts.batchEnableDone' : 'accounts.batchDisableDone', { success, fail }))
       setSelected(new Set())
       void reload()
@@ -962,10 +989,11 @@ export default function Accounts() {
   }
 
   const handleBatchResetStatus = async () => {
-    if (selected.size === 0) return
+    const ids = Array.from(selected)
+    if (ids.length === 0) return
     setBatchLoading(true)
     try {
-      const result = await api.batchResetStatus(Array.from(selected))
+      const result = await api.batchResetStatus(ids)
       showToast(t('accounts.batchResetStatusDone', { success: result.success, fail: result.failed }))
       setSelected(new Set())
       void reload()
@@ -1414,6 +1442,7 @@ export default function Accounts() {
                     <TableRow>
                       <TableHead className="w-10">
                         <input
+                          ref={selectAllRef}
                           type="checkbox"
                           className="size-4 cursor-pointer accent-primary"
                           checked={allPageSelected}
@@ -1447,73 +1476,73 @@ export default function Accounts() {
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                    {pagedAccounts.map((account, index) => (
-                      <TableRow key={account.id} className={selected.has(account.id) ? 'bg-primary/5' : ''}>
-                        <TableCell>
-                          <input
-                            type="checkbox"
-                            className="size-4 cursor-pointer accent-primary"
-                            checked={selected.has(account.id)}
-                            onChange={() => toggleSelect(account.id)}
-                          />
-                        </TableCell>
-                        <TableCell className="text-[14px] font-mono text-muted-foreground" title={`ID ${account.id}`}>
-                          {(currentPage - 1) * pageSize + index + 1}
-                        </TableCell>
-                        <TableCell className="text-[14px] text-muted-foreground">
-                          {getAccountDisplayName(account)}
-                          {account.at_only && (
-                            <span className="ml-1.5 inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
-                              AT
-                            </span>
-                          )}
-                          {account.type === 'api_key' && (
-                            <span className="ml-1.5 inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
-                              API
-                            </span>
-                          )}
-                          {(account.enabled === false || account.disabled === true) && (
-                            <span className="ml-1.5 inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
-                              <PowerOff className="size-2.5 mr-0.5" />{t('accounts.disabled')}
-                            </span>
-                          )}
-                          {account.locked && (
-                            <span className="ml-1.5 inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
-                              <Lock className="size-2.5 mr-0.5" />{t('accounts.lock')}
-                            </span>
-                          )}
-                        </TableCell>
-                        <TableCell
-                          className="text-[13px] font-medium"
-                        >
-                          {formatPlanLabel(account.plan_type)}
-                        </TableCell>
-                        <TableCell>
-                          <div className="space-y-1.5">
-                            <div className="flex min-h-6 items-center gap-2 whitespace-nowrap">
-                              <StatusBadge status={account.status} />
-                              <AccountStatusCountdown account={account} />
-                            </div>
-                            {account.status === 'error' && account.error_message && (
-                              <div className="max-w-[180px] truncate text-[11px] leading-tight text-red-500" title={account.error_message}>
-                                {account.error_message}
-                              </div>
+                    {pagedAccounts.map((account, index) => {
+                      const isSelected = selected.has(account.id)
+                      return (
+                        <TableRow key={account.id} className={isSelected ? 'bg-primary/5' : ''}>
+                          <TableCell>
+                            <input
+                              type="checkbox"
+                              className="size-4 cursor-pointer accent-primary"
+                              checked={isSelected}
+                              onChange={() => toggleSelect(account.id)}
+                            />
+                          </TableCell>
+                          <TableCell className="text-[14px] font-mono text-muted-foreground" title={`ID ${account.id}`}>
+                            {(currentPage - 1) * pageSize + index + 1}
+                          </TableCell>
+                          <TableCell className="text-[14px] text-muted-foreground">
+                            {account.type === 'api_key' ? getAccountDisplayName(account) : formatCompactEmail(account.email, getAccountDisplayName(account))}
+                            {account.at_only && (
+                              <span className="ml-1.5 inline-flex items-center rounded-md bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-600/20 dark:bg-amber-950 dark:text-amber-400 dark:ring-amber-400/20">
+                                AT
+                              </span>
                             )}
-                            {(account.model_cooldowns?.length ?? 0) > 0 && (
-                              <div className="text-[11px] leading-tight text-amber-600">
-                                model {account.model_cooldowns?.[0]?.model}
-                                {(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ''}
-                              </div>
+                            {account.type === 'api_key' && (
+                              <span className="ml-1.5 inline-flex items-center rounded-md bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20 dark:bg-emerald-950 dark:text-emerald-400 dark:ring-emerald-400/20">
+                                API
+                              </span>
                             )}
-                            <div className="text-[11px] text-muted-foreground">
-                              {t('accounts.healthSummary', {
-                                health: formatHealthTier(account.health_tier, t),
-                                score: Math.round(getDispatchScore(account)),
-                                concurrency: account.dynamic_concurrency_limit ?? '-',
-                              })}
+                            {(account.enabled === false || account.disabled === true) && (
+                              <span className="ml-1.5 inline-flex items-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium text-zinc-700 ring-1 ring-inset ring-zinc-500/20 dark:bg-zinc-900 dark:text-zinc-300 dark:ring-zinc-400/20">
+                                <PowerOff className="size-2.5 mr-0.5" />{t('accounts.disabled')}
+                              </span>
+                            )}
+                            {account.locked && (
+                              <span className="ml-1.5 inline-flex items-center rounded-md bg-blue-50 px-1.5 py-0.5 text-[10px] font-medium text-blue-700 ring-1 ring-inset ring-blue-600/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20">
+                                <Lock className="size-2.5 mr-0.5" />{t('accounts.lock')}
+                              </span>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            <PlanBadge planType={account.plan_type} />
+                          </TableCell>
+                          <TableCell>
+                            <div className="space-y-1.5">
+                              <div className="flex min-h-6 items-center gap-2 whitespace-nowrap">
+                                <StatusBadge status={account.status} detail={getAccountRateLimitWindow(account) ?? undefined} />
+                                <AccountStatusCountdown account={account} />
+                              </div>
+                              {account.status === 'error' && account.error_message && (
+                                <div className="max-w-[180px] truncate text-[11px] leading-tight text-red-500" title={account.error_message}>
+                                  {account.error_message}
+                                </div>
+                              )}
+                              {(account.model_cooldowns?.length ?? 0) > 0 && (
+                                <div className="text-[11px] leading-tight text-amber-600">
+                                  model {account.model_cooldowns?.[0]?.model}
+                                  {(account.model_cooldowns?.length ?? 0) > 1 ? ` +${(account.model_cooldowns?.length ?? 1) - 1}` : ''}
+                                </div>
+                              )}
+                              <div className="text-[11px] text-muted-foreground">
+                                {t('accounts.healthSummary', {
+                                  health: formatHealthTier(account.health_tier, t),
+                                  score: Math.round(getDispatchScore(account)),
+                                  concurrency: account.dynamic_concurrency_limit ?? '-',
+                                })}
+                              </div>
                             </div>
-                          </div>
-                        </TableCell>
+                          </TableCell>
                         <TableCell>
                           <div className="space-y-0.5 text-[13px]">
                             <div className="flex items-center gap-2">
@@ -1621,7 +1650,8 @@ export default function Accounts() {
                           </div>
                         </TableCell>
                       </TableRow>
-                    ))}
+                      )
+                    })}
                   </TableBody>
                 </Table>
               </div>
@@ -2558,31 +2588,41 @@ function isUsageWindowExhausted(value?: number | null): boolean {
   return typeof value === 'number' && Number.isFinite(value) && value >= 100
 }
 
+function isActiveUsageWindowExhausted(value?: number | null, resetAt?: string): boolean {
+  return isUsageWindowExhausted(value) && (!resetAt || isFutureTime(resetAt))
+}
+
 function isPremiumUsagePlan(planType?: string): boolean {
   return ['plus', 'pro', 'team', 'teamplus'].includes(normalizePlanType(planType))
 }
 
+type RateLimitWindow = '5h' | '7d'
+
 function isRateLimitedAccount(account: AccountRow): boolean {
+  return getAccountRateLimitWindow(account) !== null
+}
+
+function getAccountRateLimitWindow(account: AccountRow): RateLimitWindow | null {
   const status = (account.status || '').toLowerCase()
   const reason = (account.cooldown_reason || '').toLowerCase()
-
-  return status === 'rate_limited' ||
+  const explicitlyRateLimited = status === 'rate_limited' ||
     status === 'usage_exhausted' ||
     status === 'rate_limited_5h' ||
     status === 'rate_limited_7d' ||
+    reason === 'rate_limited' ||
     reason === 'rate_limited_5h' ||
     reason === 'rate_limited_7d'
-}
+  const has7dLimit = isActiveUsageWindowExhausted(account.usage_percent_7d, account.reset_7d_at)
+  const has5hLimit = isPremiumUsagePlan(account.plan_type) &&
+    isActiveUsageWindowExhausted(account.usage_percent_5h, account.reset_5h_at)
 
-function getAccountRateLimitWindow(account: AccountRow): '5h' | '7d' {
-  const status = (account.status || '').toLowerCase()
-  const reason = (account.cooldown_reason || '').toLowerCase()
-
+  // Prefer the longer 7d window when both windows are exhausted so each account
+  // belongs to exactly one bucket and 5h + 7d stays equal to total limited.
   if (
     status === 'usage_exhausted' ||
     status === 'rate_limited_7d' ||
     reason === 'rate_limited_7d' ||
-    (isUsageWindowExhausted(account.usage_percent_7d) && (!account.reset_7d_at || isFutureTime(account.reset_7d_at)))
+    has7dLimit
   ) {
     return '7d'
   }
@@ -2590,27 +2630,32 @@ function getAccountRateLimitWindow(account: AccountRow): '5h' | '7d' {
   if (
     status === 'rate_limited_5h' ||
     reason === 'rate_limited_5h' ||
-    (
-      isPremiumUsagePlan(account.plan_type) &&
-      isUsageWindowExhausted(account.usage_percent_5h) &&
-      (!account.reset_5h_at || isFutureTime(account.reset_5h_at))
-    )
+    has5hLimit
   ) {
     return '5h'
   }
 
-  return '5h'
+  return explicitlyRateLimited ? '5h' : null
 }
 
-function getRateLimitedWindowStats(accounts: AccountRow[]): { fiveHour: number; sevenDay: number } {
-  return accounts.reduce((stats, account) => {
-    if (getAccountRateLimitWindow(account) === '7d') {
+function getRateLimitedWindowStats(accounts: AccountRow[]): { total: number; fiveHour: number; sevenDay: number } {
+  const stats = accounts.reduce((stats, account) => {
+    const window = getAccountRateLimitWindow(account)
+    if (!window) {
+      return stats
+    }
+    if (window === '7d') {
       stats.sevenDay += 1
     } else {
       stats.fiveHour += 1
     }
     return stats
   }, { fiveHour: 0, sevenDay: 0 })
+
+  return {
+    ...stats,
+    total: stats.fiveHour + stats.sevenDay,
+  }
 }
 
 function isSubscriptionPlan(planType?: string): boolean {
@@ -2720,6 +2765,29 @@ function formatPlanLabel(planType?: string): string {
   const lower = raw.toLowerCase()
   if (lower === 'prolite' || lower === 'pro_lite' || lower === 'pro-lite') return 'ProLite'
   return raw
+}
+
+function PlanBadge({ planType }: { planType?: string }) {
+  const label = formatPlanLabel(planType)
+  if (label === '-') return <span className="text-[12px] text-muted-foreground">-</span>
+
+  const style: Record<string, string> = {
+    pro: 'bg-violet-100 text-violet-700 ring-violet-500/30 dark:bg-violet-500/20 dark:text-violet-300 dark:ring-violet-400/30',
+    prolite: 'bg-purple-50 text-purple-600 ring-purple-400/25 dark:bg-purple-500/15 dark:text-purple-300 dark:ring-purple-400/25',
+    plus: 'bg-blue-100 text-blue-700 ring-blue-500/30 dark:bg-blue-500/20 dark:text-blue-300 dark:ring-blue-400/30',
+    team: 'bg-amber-100 text-amber-700 ring-amber-500/30 dark:bg-amber-500/20 dark:text-amber-300 dark:ring-amber-400/30',
+    free: 'bg-zinc-100 text-zinc-500 ring-zinc-400/20 dark:bg-zinc-500/10 dark:text-zinc-400 dark:ring-zinc-400/15',
+  }
+
+  const normalized = normalizePlanType(planType)
+  const key = normalized === 'pro' && label === 'ProLite' ? 'prolite' : normalized
+  const cls = style[key] || 'bg-slate-100 text-slate-600 ring-slate-400/20 dark:bg-slate-500/15 dark:text-slate-300 dark:ring-slate-400/20'
+
+  return (
+    <span className={`inline-flex items-center rounded-md px-2.5 py-1 text-[13px] font-semibold ring-1 ring-inset ${cls}`}>
+      {label}
+    </span>
+  )
 }
 
 function getDefaultScoreBias(planType?: string): number {
@@ -2832,10 +2900,10 @@ function CompactStat({
         {details && details.length > 0 && (
           <div className="flex flex-col items-end gap-0.5 text-[11px] font-semibold leading-4 text-muted-foreground">
             {details.map((item) => (
-              <div key={item.label} className="tabular-nums">
-                <span>{item.label}</span>
-                <span className="mx-0.5">：</span>
-                <span className="text-foreground">{item.value}</span>
+              <div key={item.label} className="grid grid-cols-[2ch_auto_max-content] items-center gap-x-0.5 tabular-nums">
+                <span className="justify-self-start">{item.label}</span>
+                <span className="justify-self-center">：</span>
+                <span className="justify-self-end text-foreground">{item.value}</span>
               </div>
             ))}
           </div>
