@@ -42,14 +42,17 @@ function getAccountDisplayName(account: Pick<AccountRow, 'id' | 'email' | 'provi
   return `ID ${account.id}`
 }
 
-type AccountPlanFilter = 'all' | 'pro' | 'plus' | 'team' | 'free'
+type AccountPlanFilter = 'all' | 'pro' | 'prolite' | 'plus' | 'team' | 'free' | 'provider'
 type AccountSortKey = 'requests' | 'usage' | 'importTime'
 type AccountSortValue = 'default' | 'requests_desc' | 'requests_asc' | 'usage_desc' | 'usage_asc' | 'importTime_desc' | 'importTime_asc'
 
-function matchesPlanFilter(planType: string | undefined, filter: AccountPlanFilter): boolean {
+function matchesPlanFilter(planType: string | undefined, filter: Exclude<AccountPlanFilter, 'provider'>): boolean {
   if (filter === 'all') return true
 
   const normalized = normalizePlanType(planType)
+  if (filter === 'prolite') {
+    return normalized === 'prolite'
+  }
   if (filter === 'plus') {
     return normalized.includes('plus')
   }
@@ -82,6 +85,10 @@ async function runAccountBatch(ids: number[], action: (id: number) => Promise<un
   return { success, fail }
 }
 
+function isProviderAccount(account: Pick<AccountRow, 'type' | 'base_url'>): boolean {
+  return account.type === 'api_key' || Boolean((account.base_url || '').trim())
+}
+
 export default function Accounts() {
   const { t } = useTranslation()
   const pageSizeOptions = [10, 20, 50, 100]
@@ -90,7 +97,7 @@ export default function Accounts() {
   const [pageSize, setPageSize] = useState(20)
   const [statusFilter, setStatusFilter] = useState<'all' | 'normal' | 'rate_limited' | 'banned' | 'error' | 'disabled' | 'locked'>('all')
   const [searchQuery, setSearchQuery] = useState('')
-  const [planFilter, setPlanFilter] = useState<AccountPlanFilter | 'prolite'>('all')
+  const [planFilter, setPlanFilter] = useState<AccountPlanFilter>('all')
   const [sortKey, setSortKey] = useState<AccountSortKey | null>(null)
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc')
   const [addForm, setAddForm] = useState<AddAccountRequest>({
@@ -228,8 +235,9 @@ export default function Accounts() {
       rateLimited7dAccounts: rateLimitedWindowStats.sevenDay,
       bannedAccounts: accounts.filter((account) => account.status === 'unauthorized').length,
       errorAccounts: accounts.filter((account) => account.status === 'error').length,
-      disabledAccounts: accounts.filter((account) => account.enabled === false).length,
+      disabledAccounts: accounts.filter((account) => account.enabled === false || account.disabled === true).length,
       lockedAccounts: accounts.filter((account) => account.locked).length,
+      providerAccounts: accounts.filter(isProviderAccount).length,
       subscriptionAccountsToLock: accounts.filter((account) => isSubscriptionPlan(account.plan_type) && !account.locked),
       healthyAccounts: accounts.filter((account) => account.health_tier === 'healthy').length,
       warmAccounts: accounts.filter((account) => account.health_tier === 'warm').length,
@@ -246,6 +254,7 @@ export default function Accounts() {
     errorAccounts,
     disabledAccounts,
     lockedAccounts,
+    providerAccounts,
     subscriptionAccountsToLock,
     healthyAccounts,
     warmAccounts,
@@ -269,15 +278,14 @@ export default function Accounts() {
           if (account.status !== 'error') return false
           break
         case 'disabled':
-          if (account.enabled !== false) return false
+          if (account.enabled !== false && account.disabled !== true) return false
           break
         case 'locked':
           if (!account.locked) return false
           break
       }
-      if (planFilter === 'prolite') {
-        const plan = (account.plan_type || '').toLowerCase().trim()
-        if (plan !== planFilter) return false
+      if (planFilter === 'provider') {
+        if (!isProviderAccount(account)) return false
       } else if (!matchesPlanFilter(account.plan_type, planFilter)) {
         return false
       }
@@ -1361,7 +1369,7 @@ export default function Accounts() {
             />
           </div>
           <div className="flex items-center gap-1 rounded-lg border border-border bg-muted/30 p-0.5">
-            {(['all', 'pro', 'prolite', 'plus', 'team', 'free'] as const).map((key) => (
+            {(['all', 'provider', 'pro', 'prolite', 'plus', 'team', 'free'] as const).map((key) => (
               <button
                 key={key}
                 onClick={() => { setPlanFilter(key); setPage(1) }}
@@ -1373,9 +1381,11 @@ export default function Accounts() {
               >
                 {key === 'all'
                   ? t('accounts.filterAll')
-                  : key === 'prolite'
-                    ? 'ProLite'
-                    : key.charAt(0).toUpperCase() + key.slice(1)}
+                  : key === 'provider'
+                    ? `${t('accounts.filterProvider')} ${providerAccounts}`
+                    : key === 'prolite'
+                      ? 'ProLite'
+                      : key.charAt(0).toUpperCase() + key.slice(1)}
               </button>
             ))}
           </div>

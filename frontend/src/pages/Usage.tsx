@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { api } from '../api'
-import { getTimeRangeISO, type TimeRangeKey } from '../lib/timeRange'
 import PageHeader from '../components/PageHeader'
 import Pagination from '../components/Pagination'
 import StateShell from '../components/StateShell'
 import ToastNotice from '../components/ToastNotice'
+import UsageRangePicker, { createUsageRangeValue, getUsageRangeLabel, getUsageRangeRequestRange, type UsageRangePreset, type UsageRangeValue } from '../components/UsageRangePicker'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useConfirmDialog } from '../hooks/useConfirmDialog'
 import { useToast } from '../hooks/useToast'
@@ -52,7 +52,7 @@ function getStatusBadgeClassName(statusCode: number): string {
   return 'border-transparent bg-slate-500/14 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300'
 }
 
-const TIME_RANGE_OPTIONS: TimeRangeKey[] = ['1h', '6h', '24h', '7d', '30d']
+const TIME_RANGE_OPTIONS: Extract<UsageRangePreset, '1h' | '6h' | '24h' | '7d' | '30d'>[] = ['1h', '6h', '24h', '7d', '30d']
 
 function formatAPIKeyOptionLabel(apiKey: APIKeyRow): string {
   return apiKey.name ? `${apiKey.name} · ${apiKey.key}` : apiKey.key
@@ -279,7 +279,7 @@ export default function Usage() {
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [clearing, setClearing] = useState(false)
-  const [timeRange, setTimeRange] = useState<TimeRangeKey>('1h')
+  const [usageRange, setUsageRange] = useState<UsageRangeValue>(() => createUsageRangeValue('1h'))
   const [logs, setLogs] = useState<UsageLog[]>([])
   const [logsTotal, setLogsTotal] = useState(0)
   const [logsLoading, setLogsLoading] = useState(false)
@@ -309,9 +309,19 @@ export default function Usage() {
 
   // 仅加载轻量统计（秒级）
   const loadStats = useCallback(async () => {
-    const stats = await api.getUsageStats()
+    const { start, end } = getUsageRangeRequestRange(usageRange)
+    const stats = await api.getUsageStats({
+      start,
+      end,
+      email: searchEmail || undefined,
+      model: filterModel || undefined,
+      endpoint: filterEndpoint || undefined,
+      apiKeyId: filterApiKeyId || undefined,
+      fast: filterFast || undefined,
+      stream: filterStream || undefined,
+    })
     return { stats }
-  }, [])
+  }, [usageRange, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
   const { data, loading, error, reload, reloadSilently } = useDataLoader<{
     stats: UsageStats | null
@@ -335,7 +345,7 @@ export default function Usage() {
   const loadLogs = useCallback(async () => {
     setLogsLoading(true)
     try {
-      const { start, end } = getTimeRangeISO(timeRange)
+      const { start, end } = getUsageRangeRequestRange(usageRange)
       const res = await api.getUsageLogsPaged({
         start, end, page, pageSize,
         email: searchEmail || undefined,
@@ -352,9 +362,9 @@ export default function Usage() {
     } finally {
       setLogsLoading(false)
     }
-  }, [timeRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
+  }, [usageRange, page, pageSize, searchEmail, filterModel, filterEndpoint, filterApiKeyId, filterFast, filterStream])
 
-  // 首次加载 + timeRange/page 变更时重新拉取日志
+  // 首次加载 + 日期范围/page/筛选变更时重新拉取日志
   useEffect(() => {
     void loadLogs()
   }, [loadLogs])
@@ -419,6 +429,11 @@ export default function Usage() {
     { label: t('usage.allApiKeys'), value: '' },
     ...apiKeys.map((apiKey) => ({ label: formatAPIKeyOptionLabel(apiKey), value: String(apiKey.id) })),
   ]
+  const selectedAPIKey = apiKeys.find((apiKey) => String(apiKey.id) === filterApiKeyId)
+  const usageRangeLabel = getUsageRangeLabel(usageRange, (key) => t(key))
+  const usageRangeSummary = filterApiKeyId && selectedAPIKey
+    ? t('usage.rangeSummaryWithKey', { range: usageRangeLabel, name: formatAPIKeyOptionLabel(selectedAPIKey) })
+    : t('usage.rangeSummary', { range: usageRangeLabel })
 
   return (
     <StateShell
@@ -436,6 +451,20 @@ export default function Usage() {
           description={t('usage.description')}
           onRefresh={() => { void reload(); void loadLogs(); void loadAPIKeys() }}
         />
+
+        <div className="toolbar-surface mb-4 flex flex-wrap items-end gap-3">
+          <div className="flex min-w-0 flex-col gap-1">
+            <div className="text-sm font-semibold text-foreground">{t('usage.rangeTitle')}</div>
+            <UsageRangePicker
+              value={usageRange}
+              onApply={(nextRange) => {
+                setUsageRange(nextRange)
+                setPage(1)
+              }}
+            />
+          </div>
+          <div className="pb-1 text-xs text-muted-foreground">{usageRangeSummary}</div>
+        </div>
 
         {/* Top stats: 3 columns */}
         <div className="grid grid-cols-3 gap-3 mb-3 max-lg:grid-cols-2 max-sm:grid-cols-1">
@@ -553,9 +582,9 @@ export default function Usage() {
                     <button
                       key={key}
                       type="button"
-                      onClick={() => { setTimeRange(key); setPage(1) }}
+                      onClick={() => { setUsageRange(createUsageRangeValue(key)); setPage(1) }}
                       className={`px-2.5 py-1 text-xs font-medium rounded-md transition-all duration-200 ${
-                        timeRange === key
+                        usageRange.preset === key
                           ? 'bg-background text-foreground shadow-sm border border-border'
                           : 'text-muted-foreground hover:text-foreground'
                       }`}

@@ -9,6 +9,8 @@ export type UsageRangePreset =
   | 'all'
   | 'today'
   | 'yesterday'
+  | '1h'
+  | '6h'
   | '24h'
   | '7d'
   | '14d'
@@ -23,7 +25,7 @@ export interface UsageRangeValue {
   endDate: string
 }
 
-const PRESET_BUTTONS: Exclude<UsageRangePreset, 'custom'>[] = ['all', 'today', 'yesterday', '24h', '7d', '14d', '30d', 'thisMonth', 'lastMonth']
+const PRESET_BUTTONS: Exclude<UsageRangePreset, 'custom' | 'all' | '1h' | '6h'>[] = ['today', 'yesterday', '24h', '7d', '14d', '30d', 'thisMonth', 'lastMonth']
 
 export function createUsageRangeValue(preset: Exclude<UsageRangePreset, 'custom'>): UsageRangeValue {
   const now = new Date()
@@ -49,6 +51,13 @@ export function createUsageRangeValue(preset: Exclude<UsageRangePreset, 'custom'
         endDate: formatDateInput(yesterday),
       }
     }
+    case '1h':
+    case '6h':
+      return {
+        preset,
+        startDate: formatDateInput(now),
+        endDate: formatDateInput(now),
+      }
     case '24h':
       return {
         preset,
@@ -114,6 +123,16 @@ export function getUsageRangeRequestRange(value: UsageRangeValue): { start: stri
         end: toLocalRFC3339(endOfDay(yesterday)),
       }
     }
+    case '1h':
+      return {
+        start: toLocalRFC3339(new Date(now.getTime() - 60 * 60 * 1000)),
+        end: toLocalRFC3339(now),
+      }
+    case '6h':
+      return {
+        start: toLocalRFC3339(new Date(now.getTime() - 6 * 60 * 60 * 1000)),
+        end: toLocalRFC3339(now),
+      }
     case '24h':
       return {
         start: toLocalRFC3339(new Date(now.getTime() - 24 * 60 * 60 * 1000)),
@@ -173,6 +192,14 @@ export default function UsageRangePicker({ value, onApply }: UsageRangePickerPro
   const [draft, setDraft] = useState<UsageRangeValue>(value)
   const rootRef = useRef<HTMLDivElement>(null)
 
+  const updateDraftDate = (key: 'startDate' | 'endDate', nextDate: string) => {
+    setDraft((current) => ({
+      ...current,
+      preset: 'custom',
+      [key]: nextDate,
+    }))
+  }
+
   useEffect(() => {
     if (!open) {
       setDraft(value)
@@ -215,23 +242,22 @@ export default function UsageRangePicker({ value, onApply }: UsageRangePickerPro
         aria-haspopup="dialog"
         aria-expanded={open}
         className={cn(
-          'flex h-11 min-w-[154px] items-center justify-between gap-3 rounded-xl border border-input bg-background px-3.5 text-left shadow-xs transition-[border-color,box-shadow]',
-          'hover:border-primary/30 hover:bg-accent/40',
-          'focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/20',
-          open && 'border-primary/40 ring-[3px] ring-primary/10',
+          'flex h-9 min-w-[104px] items-center justify-between gap-2 rounded-lg border border-primary/45 bg-background px-3 text-left text-sm shadow-sm transition-[border-color,box-shadow,background-color]',
+          'hover:bg-primary/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/25',
+          open && 'bg-primary/5 ring-2 ring-ring/20',
         )}
         onClick={() => setOpen((current) => !current)}
       >
-          <span className="inline-flex items-center gap-2">
-            <CalendarDays className="size-4 text-muted-foreground" />
-            <span className="text-[15px] font-medium text-foreground">{getUsageRangeLabel(value, (key) => t(key))}</span>
-          </span>
-        {open ? <ChevronUp className="size-4 text-muted-foreground" /> : <ChevronDown className="size-4 text-muted-foreground" />}
+        <span className="inline-flex min-w-0 items-center gap-2">
+          <CalendarDays className="size-3.5 shrink-0 text-muted-foreground" />
+          <span className="truncate text-[14px] font-medium leading-none text-foreground">{getUsageRangeLabel(value, (key) => t(key))}</span>
+        </span>
+        {open ? <ChevronUp className="size-3.5 shrink-0 text-muted-foreground" /> : <ChevronDown className="size-3.5 shrink-0 text-muted-foreground" />}
       </button>
 
       {open ? (
-        <div className="absolute right-0 top-[calc(100%+0.75rem)] z-50 w-[352px] max-w-[calc(100vw-1rem)] rounded-2xl border border-border bg-popover p-3 shadow-[0_20px_50px_hsl(220_35%_12%/0.18)]">
-          <div className="grid grid-cols-2 gap-2">
+        <div className="absolute left-0 top-[calc(100%+0.5rem)] z-50 w-[320px] max-w-[calc(100vw-1rem)] overflow-hidden rounded-lg border border-border bg-popover shadow-[0_14px_36px_hsl(220_35%_12%/0.16)]">
+          <div className="grid grid-cols-2 gap-x-4 gap-y-1 p-2">
             {PRESET_BUTTONS.map((preset) => {
               const active = draft.preset === preset
               return (
@@ -239,10 +265,10 @@ export default function UsageRangePicker({ value, onApply }: UsageRangePickerPro
                   key={preset}
                   type="button"
                   className={cn(
-                    'rounded-xl px-3 py-2 text-sm transition-colors',
+                    'h-7 rounded-md px-3 text-center text-sm font-medium transition-colors',
                     active
-                      ? 'bg-emerald-200/70 text-emerald-900'
-                      : 'bg-muted/60 text-foreground hover:bg-accent',
+                      ? 'bg-primary/12 text-primary'
+                      : 'text-muted-foreground hover:bg-muted/70 hover:text-foreground',
                   )}
                   onClick={() => setDraft(createUsageRangeValue(preset))}
                 >
@@ -252,41 +278,36 @@ export default function UsageRangePicker({ value, onApply }: UsageRangePickerPro
             })}
           </div>
 
-          <div className="mt-4 border-t border-border pt-4">
+          <div className="border-t border-border bg-background/70 p-3">
             <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-end gap-2">
               <div className="min-w-0">
-                <div className="mb-1.5 text-xs text-muted-foreground">{t('usage.rangeStartDate')}</div>
+                <div className="mb-1.5 text-xs font-medium text-muted-foreground">{t('usage.rangeStartDate')}</div>
                 <Input
                   type="date"
                   value={draft.startDate}
-                  className="h-10 min-w-0 text-sm"
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    preset: 'custom',
-                    startDate: event.target.value,
-                  }))}
+                  className="h-9 min-w-0 rounded-md bg-background px-2.5 text-sm"
+                  onInput={(event) => updateDraftDate('startDate', event.currentTarget.value)}
+                  onChange={(event) => updateDraftDate('startDate', event.target.value)}
                 />
               </div>
-              <div className="pb-2 text-muted-foreground">→</div>
+              <div className="pb-2 text-lg leading-none text-muted-foreground">→</div>
               <div className="min-w-0">
-                <div className="mb-1.5 text-xs text-muted-foreground">{t('usage.rangeEndDate')}</div>
+                <div className="mb-1.5 text-xs font-medium text-muted-foreground">{t('usage.rangeEndDate')}</div>
                 <Input
                   type="date"
                   value={draft.endDate}
-                  className="h-10 min-w-0 text-sm"
-                  onChange={(event) => setDraft((current) => ({
-                    ...current,
-                    preset: 'custom',
-                    endDate: event.target.value,
-                  }))}
+                  className="h-9 min-w-0 rounded-md bg-background px-2.5 text-sm"
+                  onInput={(event) => updateDraftDate('endDate', event.currentTarget.value)}
+                  onChange={(event) => updateDraftDate('endDate', event.target.value)}
                 />
               </div>
             </div>
 
-            <div className="mt-4 flex justify-end">
+            <div className="mt-3 flex justify-end">
               <Button
                 size="sm"
                 disabled={!canApply}
+                className="h-8 rounded-lg px-4 text-sm font-semibold shadow-none"
                 onClick={() => {
                   if (!canApply) return
                   onApply(draft)
