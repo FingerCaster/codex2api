@@ -19,6 +19,18 @@
 - 升级指南
 - 备份与恢复
 
+### 2.1 DaybreakX Docker 镜像部署 ([DOCKER_IMAGE_DAYBREAKX.md](DOCKER_IMAGE_DAYBREAKX.md))
+- `daybreakx/codex2api:latest` 多架构镜像说明
+- 小 VPS SQLite 单容器部署
+- Docker Compose SQLite / 标准版部署示例
+- 多架构镜像发布命令
+
+### 2.2 Docker 构建与发布流程 ([DOCKER_BUILD_AND_RELEASE.md](DOCKER_BUILD_AND_RELEASE.md))
+- 修改代码后的本地检查流程
+- 单架构本地构建和 SQLite 冒烟测试
+- `daybreakx/codex2api` 多架构发布命令
+- VPS 更新与版本回滚方式
+
 ### 3. 配置文档 ([CONFIGURATION.md](CONFIGURATION.md))
 - 环境变量说明
 - 系统设置参数
