@@ -66,6 +66,15 @@ func loadLegacyConfigKeys() map[string]bool {
 	return keys
 }
 
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
 func (h *Handler) nextAccountForSession(sessionID string, apiKeyID int64, exclude map[int64]bool) (*auth.Account, string) {
 	return h.nextAccountForSessionWithFilter(sessionID, apiKeyID, exclude, nil)
 }
@@ -228,7 +237,7 @@ func accountFilterForModel(model string) auth.AccountFilter {
 			return false
 		}
 		if account.IsOpenAIResponsesAPI() {
-			return false
+			return account.SupportsOpenAIResponsesModel(model) && (model == "" || !account.IsModelRateLimited(model))
 		}
 		if model != "" && account.IsModelRateLimited(model) {
 			return false
@@ -1786,12 +1795,8 @@ func (h *Handler) Responses(c *gin.Context) {
 		lastUpstreamCancel = upstreamCancel
 		var resp *http.Response
 		var reqErr error
-		if account.IsAPIKeyProvider() {
-			resp, reqErr = ExecuteGenericOpenAIRequest(upstreamCtx, account, "/v1/responses", rawBody, proxyURL, isStream, downstreamHeaders)
-		} else {
-			upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
-			resp, reqErr = ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
-		}
+		upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+		resp, reqErr = ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
@@ -1853,12 +1858,8 @@ func (h *Handler) Responses(c *gin.Context) {
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			var decision codex429Decision
 			upstreamEndpoint := "/v1/responses"
-			if account.IsAPIKeyProvider() {
-				upstreamEndpoint = "/v1/responses"
-			} else {
-				h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
-				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
-			}
+			h.logUpstreamCyberPolicy(c, "/v1/responses", model, errBody)
+			decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			h.logUsageForRequest(c, &database.UsageLogInput{
 				AccountID:         account.ID(),
 				Endpoint:          "/v1/responses",
@@ -1883,32 +1884,6 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
-			return
-		}
-
-		if account.IsAPIKeyProvider() {
-			h.store.BindSessionAffinity(sessionID, account, proxyURL)
-			account.Mu().RLock()
-			c.Set("x-account-email", account.ProviderName)
-			account.Mu().RUnlock()
-			c.Set("x-account-proxy", proxyURL)
-			c.Set("x-model", model)
-			c.Set("x-reasoning-effort", reasoningEffort)
-			c.Set("x-service-tier", serviceTier)
-			h.proxyGenericOpenAIResponse(c, resp, account, &database.UsageLogInput{
-				AccountID:        account.ID(),
-				Endpoint:         "/v1/responses",
-				Model:            model,
-				DurationMs:       durationMs,
-				PromptTokens:     estimatePromptTokensFromBody(rawBody),
-				InputTokens:      estimatePromptTokensFromBody(rawBody),
-				ReasoningEffort:  reasoningEffort,
-				InboundEndpoint:  "/v1/responses",
-				UpstreamEndpoint: "/v1/responses",
-				Stream:           isStream,
-				ServiceTier:      serviceTier,
-			})
-			h.store.Release(account)
 			return
 		}
 
@@ -2256,15 +2231,16 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 		}
 		downstreamHeaders := c.Request.Header.Clone()
 
-		isGenericProvider := account.IsAPIKeyProvider()
+		isGenericProvider := account.IsOpenAIResponsesAPI()
 		upstreamEndpoint := "/v1/responses/compact"
+		upstreamSessionID := ""
 		var resp *http.Response
 		var reqErr error
 		if isGenericProvider {
 			upstreamEndpoint = "/v1/responses"
 			resp, reqErr = ExecuteGenericOpenAIRequest(c.Request.Context(), account, upstreamEndpoint, codexBody, proxyURL, false, downstreamHeaders)
 		} else {
-			upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
+			upstreamSessionID = IsolateCodexSessionID(apiKeyID, sessionID)
 			resp, reqErr = ExecuteCompactRequest(c.Request.Context(), account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders)
 		}
 		durationMs := int(time.Since(start).Milliseconds())
@@ -2318,8 +2294,6 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if !isGenericProvider {
 				SyncCodexUsageState(h.store, account, resp)
 			}
-			errBody, _ := io.ReadAll(resp.Body)
-			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			excludeAccounts[account.ID()] = true
@@ -2556,7 +2530,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		lastUpstreamCancel = upstreamCancel
 		var resp *http.Response
 		var reqErr error
-		if account.IsAPIKeyProvider() {
+		if account.IsOpenAIResponsesAPI() {
 			resp, reqErr = ExecuteGenericOpenAIRequest(upstreamCtx, account, "/v1/chat/completions", rawBody, proxyURL, isStream, downstreamHeaders)
 		} else {
 			upstreamSessionID := IsolateCodexSessionID(apiKeyID, sessionID)
@@ -2602,7 +2576,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			var decision codex429Decision
 			upstreamEndpoint := "/v1/responses"
-			if account.IsAPIKeyProvider() {
+			if account.IsOpenAIResponsesAPI() {
 				upstreamEndpoint = "/v1/chat/completions"
 			} else {
 				h.logUpstreamCyberPolicy(c, "/v1/chat/completions", model, errBody)
@@ -2635,10 +2609,10 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			return
 		}
 
-		if account.IsAPIKeyProvider() {
+		if account.IsOpenAIResponsesAPI() {
 			h.store.BindSessionAffinity(sessionID, account, proxyURL)
 			account.Mu().RLock()
-			c.Set("x-account-email", account.ProviderName)
+			c.Set("x-account-email", firstNonEmpty(strings.TrimSpace(account.ProviderName), strings.TrimSpace(account.Email), strings.TrimSpace(account.BaseURL)))
 			account.Mu().RUnlock()
 			c.Set("x-account-proxy", proxyURL)
 			c.Set("x-model", model)

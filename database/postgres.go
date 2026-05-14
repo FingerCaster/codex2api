@@ -3601,6 +3601,56 @@ func (db *DB) UpdateOpenAIResponsesAccount(ctx context.Context, id int64, name s
 	return tx.Commit()
 }
 
+func (db *DB) MigrateLegacyProviderAccounts(ctx context.Context) error {
+	rows, err := db.ListActive(ctx)
+	if err != nil {
+		return err
+	}
+
+	defaultModels := []string{"gpt-5.4"}
+	for _, row := range rows {
+		if row == nil {
+			continue
+		}
+		if !strings.EqualFold(strings.TrimSpace(row.Type), "api_key") {
+			continue
+		}
+		baseURL := strings.TrimSpace(row.GetCredential("base_url"))
+		apiKey := strings.TrimSpace(row.GetCredential("api_key"))
+		if baseURL == "" || apiKey == "" {
+			continue
+		}
+
+		models := row.GetCredentialStringSlice("models")
+		if len(models) == 0 {
+			models = defaultModels
+		}
+		providerName := strings.TrimSpace(row.GetCredential("provider_name"))
+		if providerName == "" {
+			providerName = strings.TrimSpace(row.Name)
+		}
+		extraHeaders := decodeCredentials(row.Credentials)["extra_headers"]
+		credentials := map[string]interface{}{
+			"upstream_type":          "openai_responses",
+			"base_url":               baseURL,
+			"api_key":                apiKey,
+			"models":                 models,
+			"plan_type":              "api",
+			"email":                  baseURL,
+			"provider_name":          providerName,
+			"supports_chat_completions": true,
+		}
+		if extraHeaders != nil {
+			credentials["extra_headers"] = extraHeaders
+		}
+
+		if err := db.UpdateOpenAIResponsesAccount(ctx, row.ID, row.Name, credentials, row.ProxyURL); err != nil {
+			return fmt.Errorf("迁移旧 provider 账号 %d 失败: %w", row.ID, err)
+		}
+	}
+	return nil
+}
+
 // UpdateUsageSnapshot 持久化账号用量快照（7d + 5h）
 func (db *DB) UpdateUsageSnapshot(ctx context.Context, id int64, pct7d float64, updatedAt time.Time) error {
 	return db.UpdateCredentials(ctx, id, map[string]interface{}{
@@ -3844,23 +3894,6 @@ func (db *DB) InsertATAccount(ctx context.Context, name string, accessToken stri
 		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3) RETURNING id`,
 		`INSERT INTO accounts (name, credentials, proxy_url) VALUES ($1, $2, $3)`,
 		name, credJSON, proxyURL,
-	)
-}
-
-// InsertProviderAccount 插入通用上游账号节点（例如 base_url + api_key）
-func (db *DB) InsertProviderAccount(ctx context.Context, name string, platform string, accountType string, credentials map[string]interface{}, proxyURL string) (int64, error) {
-	if credentials == nil {
-		credentials = map[string]interface{}{}
-	}
-	credJSON, err := json.Marshal(credentials)
-	if err != nil {
-		return 0, err
-	}
-
-	return db.insertRowID(ctx,
-		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-		`INSERT INTO accounts (name, platform, type, credentials, proxy_url) VALUES ($1, $2, $3, $4, $5)`,
-		name, platform, accountType, credJSON, proxyURL,
 	)
 }
 

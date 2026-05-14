@@ -168,7 +168,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		downstreamHeaders := c.Request.Header.Clone()
-		isGenericProvider := account.IsAPIKeyProvider()
+		isGenericProvider := account.IsOpenAIResponsesAPI()
 		var resp *http.Response
 		var reqErr error
 		if isGenericProvider {

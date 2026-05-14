@@ -114,15 +114,6 @@ export interface AddATAccountRequest {
   proxy_url: string
 }
 
-export interface AddProviderKeyRequest {
-  name?: string
-  base_url: string
-  api_key: string
-  provider_name?: string
-  proxy_url: string
-  extra_headers?: Record<string, string>
-}
-
 export interface AddOpenAIResponsesAccountRequest {
   name?: string
   base_url: string

@@ -1252,7 +1252,7 @@ func imagePreferredAccountFilter(account *auth.Account) bool {
 	if account == nil {
 		return false
 	}
-	if account.IsAPIKeyProvider() {
+	if account.IsOpenAIResponsesAPI() {
 		return true
 	}
 	return auth.IsPlusOrHigherPlan(account.GetPlanType())
@@ -1323,7 +1323,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		downstreamHeaders := c.Request.Header.Clone()
-		isGenericProvider := account.IsAPIKeyProvider()
+		isGenericProvider := account.IsOpenAIResponsesAPI()
 		var resp *http.Response
 		var reqErr error
 		if isGenericProvider {
@@ -1402,7 +1402,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 
 		if isGenericProvider {
 			account.Mu().RLock()
-			c.Set("x-account-email", account.ProviderName)
+			c.Set("x-account-email", firstNonEmpty(account.ProviderName, account.Email, account.BaseURL))
 			account.Mu().RUnlock()
 			c.Set("x-account-proxy", proxyURL)
 			c.Set("x-model", requestModel)

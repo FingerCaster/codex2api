@@ -9,7 +9,7 @@ import (
 	"github.com/codex2api/auth"
 )
 
-// ExecuteGenericOpenAIRequest 向 OpenAI 兼容上游发送请求（base_url + api_key）
+// ExecuteGenericOpenAIRequest 向 Base URL + API Key 上游发送请求。
 func ExecuteGenericOpenAIRequest(ctx context.Context, account *auth.Account, endpointPath string, requestBody []byte, proxyOverride string, stream bool, downstreamHeaders http.Header) (*http.Response, error) {
 	return ExecuteGenericOpenAIRequestWithContentType(ctx, account, endpointPath, requestBody, "application/json", proxyOverride, stream, downstreamHeaders)
 }
@@ -22,14 +22,22 @@ func ExecuteGenericOpenAIRequestWithContentType(ctx context.Context, account *au
 		contentType = "application/json"
 	}
 
-	baseURL, apiKey, extraHeaders := account.GenericUpstream()
+	baseURL, apiKey := account.OpenAIResponsesCredentials()
 	if baseURL == "" || apiKey == "" {
 		return nil, ErrNoAvailableAccount()
 	}
 
 	account.Mu().RLock()
+	extraHeaders := map[string]string(nil)
+	if len(account.ExtraHeaders) > 0 {
+		extraHeaders = make(map[string]string, len(account.ExtraHeaders))
+		for key, value := range account.ExtraHeaders {
+			extraHeaders[key] = value
+		}
+	}
 	proxyURL := account.ProxyURL
 	account.Mu().RUnlock()
+
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
 	}

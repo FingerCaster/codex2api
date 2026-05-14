@@ -308,6 +308,28 @@ func credentialInt64Slice(raw interface{}, key string) []int64 {
 	return int64SliceFromValue(value)
 }
 
+func credentialBool(raw interface{}, key string) bool {
+	credentials := decodeCredentials(raw)
+	if credentials == nil {
+		return false
+	}
+	value, ok := credentials[key]
+	if !ok || value == nil {
+		return false
+	}
+	switch typed := value.(type) {
+	case bool:
+		return typed
+	case string:
+		typed = strings.TrimSpace(strings.ToLower(typed))
+		return typed == "1" || typed == "true" || typed == "yes" || typed == "on"
+	case float64:
+		return typed != 0
+	default:
+		return false
+	}
+}
+
 func accountEmailFromRawCredentials(raw interface{}) string {
 	if email := strings.TrimSpace(credentialString(raw, "email")); email != "" {
 		return email

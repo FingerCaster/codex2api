@@ -198,7 +198,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts", h.ListAccounts)
 	api.POST("/accounts", h.AddAccount)
 	api.POST("/accounts/at", h.AddATAccount)
-	api.POST("/accounts/provider-key", h.AddProviderKey)
 	api.POST("/accounts/openai-responses", h.AddOpenAIResponsesAccount)
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
@@ -1172,15 +1171,6 @@ type addATAccountReq struct {
 	ProxyURL    string `json:"proxy_url"`
 }
 
-type addProviderKeyReq struct {
-	Name         string            `json:"name"`
-	BaseURL      string            `json:"base_url"`
-	APIKey       string            `json:"api_key"`
-	ProviderName string            `json:"provider_name"`
-	ProxyURL     string            `json:"proxy_url"`
-	ExtraHeaders map[string]string `json:"extra_headers"`
-}
-
 func validateBaseURL(raw string) error {
 	parsed, err := url.ParseRequestURI(raw)
 	if err != nil {
@@ -1193,89 +1183,6 @@ func validateBaseURL(raw string) error {
 		return fmt.Errorf("base_url 缺少主机名")
 	}
 	return nil
-}
-
-// AddProviderKey 添加 OpenAI 兼容上游节点（base_url + api_key）
-func (h *Handler) AddProviderKey(c *gin.Context) {
-	var req addProviderKeyReq
-	if err := c.ShouldBindJSON(&req); err != nil {
-		writeError(c, http.StatusBadRequest, "请求格式错误")
-		return
-	}
-
-	req.Name = security.SanitizeInput(req.Name)
-	req.BaseURL = strings.TrimRight(strings.TrimSpace(security.SanitizeInput(req.BaseURL)), "/")
-	req.APIKey = strings.TrimSpace(security.SanitizeInput(req.APIKey))
-	req.ProviderName = security.SanitizeInput(req.ProviderName)
-	req.ProxyURL = security.SanitizeInput(req.ProxyURL)
-
-	if req.BaseURL == "" || req.APIKey == "" {
-		writeError(c, http.StatusBadRequest, "base_url 和 api_key 是必填字段")
-		return
-	}
-	if security.ContainsXSS(req.Name) || security.ContainsSQLInjection(req.Name) {
-		writeError(c, http.StatusBadRequest, "名称包含非法字符")
-		return
-	}
-	if utf8.RuneCountInString(req.Name) > 100 || utf8.RuneCountInString(req.ProviderName) > 100 {
-		writeError(c, http.StatusBadRequest, "名称长度不能超过100字符")
-		return
-	}
-	if err := validateBaseURL(req.BaseURL); err != nil {
-		writeError(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	if err := security.ValidateProxyURL(req.ProxyURL); err != nil {
-		writeError(c, http.StatusBadRequest, "代理URL无效")
-		return
-	}
-
-	credentials := map[string]interface{}{
-		"base_url":      req.BaseURL,
-		"api_key":       req.APIKey,
-		"provider_name": req.ProviderName,
-	}
-	if len(req.ExtraHeaders) > 0 {
-		headers := make(map[string]string)
-		for key, value := range req.ExtraHeaders {
-			k := strings.TrimSpace(security.SanitizeInput(key))
-			v := strings.TrimSpace(security.SanitizeInput(value))
-			if k != "" && v != "" {
-				headers[k] = v
-			}
-		}
-		if len(headers) > 0 {
-			credentials["extra_headers"] = headers
-		}
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
-	defer cancel()
-
-	id, err := h.db.InsertProviderAccount(ctx, req.Name, "generic", "api_key", credentials, req.ProxyURL)
-	if err != nil {
-		writeInternalError(c, err)
-		return
-	}
-
-	h.db.InsertAccountEventAsync(id, "added", "manual_provider_key")
-	newAcc := &auth.Account{
-		DBID:         id,
-		Platform:     "generic",
-		Type:         "api_key",
-		BaseURL:      req.BaseURL,
-		APIKey:       req.APIKey,
-		ProviderName: req.ProviderName,
-		ProxyURL:     req.ProxyURL,
-		HealthTier:   auth.HealthTierHealthy,
-		ExtraHeaders: req.ExtraHeaders,
-	}
-	h.store.AddAccount(newAcc)
-
-	c.JSON(http.StatusOK, createAccountResponse{
-		ID:      id,
-		Message: "API Key 上游节点已添加",
-	})
 }
 
 // AddATAccount 添加 AT-only 账号（支持批量：access_token 按行分割）
@@ -2463,8 +2370,8 @@ func (h *Handler) RefreshAccount(c *gin.Context) {
 	defer cancel()
 
 	if h.store != nil {
-		if account := h.store.FindByID(id); account != nil && account.IsAPIKeyProvider() {
-			writeError(c, http.StatusBadRequest, "Base URL Key 节点不需要刷新")
+		if account := h.store.FindByID(id); account != nil && account.IsOpenAIResponsesAPI() {
+			writeError(c, http.StatusBadRequest, "OpenAI Responses API 账号不需要刷新")
 			return
 		}
 	}

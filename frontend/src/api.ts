@@ -3,7 +3,6 @@ import type {
   AccountUsageDetail,
   AddAccountRequest,
   AddATAccountRequest,
-  AddProviderKeyRequest,
   AddOpenAIResponsesAccountRequest,
   AdminErrorResponse,
   APIKeysResponse,
@@ -197,8 +196,6 @@ export const api = {
     request<CreateAccountResponse>('/accounts', { method: 'POST', body: JSON.stringify(data) }),
   addATAccount: (data: AddATAccountRequest) =>
     request<CreateAccountResponse>('/accounts/at', { method: 'POST', body: JSON.stringify(data) }),
-  addProviderKey: (data: AddProviderKeyRequest) =>
-    request<CreateAccountResponse>('/accounts/provider-key', { method: 'POST', body: JSON.stringify(data) }),
   addOpenAIResponsesAccount: (data: AddOpenAIResponsesAccountRequest) =>
     request<CreateAccountResponse>('/accounts/openai-responses', { method: 'POST', body: JSON.stringify(data) }),
   fetchOpenAIResponsesModels: (data: FetchOpenAIResponsesModelsRequest) =>

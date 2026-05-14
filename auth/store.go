@@ -62,8 +62,6 @@ type Account struct {
 	PlanType       string
 	ProxyURL       string
 	UpstreamType   string
-	BaseURL        string
-	APIKey         string
 	Models         []string
 	Status         AccountStatus
 	CooldownUtil   time.Time
@@ -205,11 +203,6 @@ func (a *Account) hasDispatchCredentialLocked() bool {
 	if a == nil {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(a.Type), "api_key") &&
-		strings.TrimSpace(a.BaseURL) != "" &&
-		strings.TrimSpace(a.APIKey) != "" {
-		return true
-	}
 	if a.isOpenAIResponsesAPILocked() {
 		return true
 	}
@@ -235,8 +228,11 @@ func (a *Account) SupportsOpenAIResponsesModel(model string) bool {
 	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	if !a.isOpenAIResponsesAPILocked() || len(a.Models) == 0 {
+	if !a.isOpenAIResponsesAPILocked() {
 		return false
+	}
+	if len(a.Models) == 0 {
+		return true
 	}
 	for _, candidate := range a.Models {
 		if strings.EqualFold(strings.TrimSpace(candidate), model) {
@@ -891,27 +887,6 @@ func (a *Account) IsAvailable() bool {
 		return a.hasDispatchCredentialLocked()
 	}
 	return a.hasDispatchCredentialLocked()
-}
-
-func (a *Account) IsAPIKeyProvider() bool {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-	return a.Type == "api_key" && a.BaseURL != "" && a.APIKey != ""
-}
-
-func (a *Account) GenericUpstream() (baseURL string, apiKey string, extraHeaders map[string]string) {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
-
-	baseURL = a.BaseURL
-	apiKey = a.APIKey
-	if len(a.ExtraHeaders) > 0 {
-		extraHeaders = make(map[string]string, len(a.ExtraHeaders))
-		for key, value := range a.ExtraHeaders {
-			extraHeaders[key] = value
-		}
-	}
-	return baseURL, apiKey, extraHeaders
 }
 
 // usageExhaustedLocked 判断 Free 账号 7d 用量是否已耗尽（需持有 mu 读锁）
@@ -2237,6 +2212,9 @@ func (s *Store) CleanExpiredNow() int {
 
 // Init 初始化：从数据库加载账号
 func (s *Store) Init(ctx context.Context) error {
+	if err := s.db.MigrateLegacyProviderAccounts(ctx); err != nil {
+		return fmt.Errorf("迁移旧 provider-key 账号失败: %w", err)
+	}
 	// 1. 从数据库加载账号到内存
 	if err := s.loadFromDB(ctx); err != nil {
 		return err
@@ -2287,9 +2265,8 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		apiKey := row.GetCredential("api_key")
 		models := normalizeModelList(row.GetCredentialStringSlice("models"))
 		isOpenAIResponsesAccount := strings.EqualFold(strings.TrimSpace(upstreamType), UpstreamOpenAIResponses) && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
-		isGenericProvider := strings.EqualFold(strings.TrimSpace(row.Type), "api_key") && strings.TrimSpace(baseURL) != "" && strings.TrimSpace(apiKey) != ""
-		if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount && !isGenericProvider {
-			log.Printf("[账号 %d] 缺少 refresh_token、session_token、access_token 或 api_key 上游凭据，跳过", row.ID)
+		if rt == "" && st == "" && at == "" && !isOpenAIResponsesAccount {
+			log.Printf("[账号 %d] 缺少 refresh_token、session_token、access_token 或 OpenAI Responses API 上游凭据，跳过", row.ID)
 			continue
 		}
 
@@ -2310,9 +2287,12 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 		if account.ProxyURL == "" {
 			account.ProxyURL = s.globalProxy
 		}
-		if isGenericProvider {
+		if isOpenAIResponsesAccount {
 			account.ProviderName = row.GetCredential("provider_name")
 			account.HealthTier = HealthTierHealthy
+			if account.PlanType == "" {
+				account.PlanType = "api"
+			}
 			if headers, ok := row.Credentials["extra_headers"].(map[string]interface{}); ok {
 				account.ExtraHeaders = make(map[string]string, len(headers))
 				for key, value := range headers {
@@ -2320,12 +2300,6 @@ func (s *Store) loadFromDB(ctx context.Context) error {
 						account.ExtraHeaders[key] = str
 					}
 				}
-			}
-		}
-		if isOpenAIResponsesAccount {
-			account.HealthTier = HealthTierHealthy
-			if account.PlanType == "" {
-				account.PlanType = "api"
 			}
 		}
 		account.ScoreBiasOverride = reflectOptionalInt64Field(row, "ScoreBiasOverride")
