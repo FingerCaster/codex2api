@@ -85,6 +85,7 @@ export default function APIKeys() {
   const [visibleKeys, setVisibleKeys] = useState<Set<number>>(new Set());
   const [creating, setCreating] = useState(false);
   const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set());
+  const [togglingIds, setTogglingIds] = useState<Set<number>>(new Set());
   const [editingKey, setEditingKey] = useState<APIKeyRow | null>(null);
   const [editForm, setEditForm] = useState<EditKeyFormState>(initialEditForm);
   const [saving, setSaving] = useState(false);
@@ -215,6 +216,27 @@ export default function APIKeys() {
       setDeletingIds((prev) => {
         const next = new Set(prev);
         next.delete(id);
+        return next;
+      });
+    }
+  };
+
+  const handleToggleKeyDisabled = async (keyRow: APIKeyRow) => {
+    const disabled = keyRow.enabled !== false;
+    setTogglingIds((prev) => new Set(prev).add(keyRow.id));
+    try {
+      await api.toggleAPIKeyDisabled(keyRow.id, disabled);
+      showToast(t(disabled ? "apiKeys.keyDisabled" : "apiKeys.keyEnabled"));
+      void reload();
+    } catch (error) {
+      showToast(
+        `${t(disabled ? "apiKeys.disableKey" : "apiKeys.enableKey")}: ${getErrorMessage(error)}`,
+        "error",
+      );
+    } finally {
+      setTogglingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(keyRow.id);
         return next;
       });
     }
@@ -441,6 +463,11 @@ export default function APIKeys() {
                                     {t("apiKeys.newBadge")}
                                   </Badge>
                                 ) : null}
+                                {keyRow.enabled === false ? (
+                                  <Badge variant="secondary">
+                                    {t("accounts.disabled")}
+                                  </Badge>
+                                ) : null}
                                 {status !== "active" ? (
                                   <Badge
                                     variant={
@@ -526,6 +553,26 @@ export default function APIKeys() {
                                 <Button
                                   variant="outline"
                                   size="sm"
+                                  disabled={togglingIds.has(keyRow.id)}
+                                  onClick={() =>
+                                    void handleToggleKeyDisabled(keyRow)
+                                  }
+                                >
+                                  {keyRow.enabled === false ? (
+                                    <ShieldCheck className="size-3.5" />
+                                  ) : (
+                                    <LockKeyhole className="size-3.5" />
+                                  )}
+                                  {t(
+                                    keyRow.enabled === false
+                                      ? "apiKeys.enableKey"
+                                      : "apiKeys.disableKey",
+                                  )}
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={togglingIds.has(keyRow.id)}
                                   onClick={() => startEditing(keyRow)}
                                 >
                                   <Pencil className="size-3.5" />
@@ -534,7 +581,10 @@ export default function APIKeys() {
                                 <Button
                                   variant="destructive"
                                   size="sm"
-                                  disabled={deletingIds.has(keyRow.id)}
+                                  disabled={
+                                    deletingIds.has(keyRow.id) ||
+                                    togglingIds.has(keyRow.id)
+                                  }
                                   onClick={() =>
                                     void handleDeleteKey(keyRow.id)
                                   }

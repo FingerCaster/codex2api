@@ -416,6 +416,7 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	applyOpenAICompatibleUserAgent(req, headers)
 	if headers != nil {
 		for _, key := range []string{"OpenAI-Organization", "OpenAI-Project", "Idempotency-Key"} {
 			if value := strings.TrimSpace(headers.Get(key)); value != "" {

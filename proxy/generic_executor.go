@@ -9,6 +9,17 @@ import (
 	"github.com/codex2api/auth"
 )
 
+func applyOpenAICompatibleUserAgent(req *http.Request, downstreamHeaders http.Header) {
+	if req == nil {
+		return
+	}
+	if userAgent := strings.TrimSpace(downstreamHeaders.Get("User-Agent")); userAgent != "" {
+		req.Header.Set("User-Agent", userAgent)
+		return
+	}
+	req.Header.Set("User-Agent", MinimalCodexCLIUserAgentForHeaders())
+}
+
 // ExecuteGenericOpenAIRequest 向 Base URL + API Key 上游发送请求。
 func ExecuteGenericOpenAIRequest(ctx context.Context, account *auth.Account, endpointPath string, requestBody []byte, proxyOverride string, stream bool, downstreamHeaders http.Header) (*http.Response, error) {
 	return ExecuteGenericOpenAIRequestWithContentType(ctx, account, endpointPath, requestBody, "application/json", proxyOverride, stream, downstreamHeaders)
@@ -55,6 +66,7 @@ func ExecuteGenericOpenAIRequestWithContentType(ctx context.Context, account *au
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
+	applyOpenAICompatibleUserAgent(req, downstreamHeaders)
 
 	// 透传兼容头，避免丢失客户端期望的 OpenAI 兼容能力开关。
 	for _, header := range []string{"OpenAI-Beta", "OpenAI-Organization"} {
