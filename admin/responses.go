@@ -49,30 +49,55 @@ type apiKeysResponse struct {
 
 // MaskedAPIKeyRow API Key 响应（含脱敏和完整 key）
 type MaskedAPIKeyRow struct {
-	ID        int64  `json:"id"`
-	Name      string `json:"name"`
-	Key       string `json:"key"`
-	RawKey    string `json:"raw_key"`
-	Enabled   bool   `json:"enabled"`
-	CreatedAt string `json:"created_at"`
+	ID              int64   `json:"id"`
+	Name            string  `json:"name"`
+	Key             string  `json:"key"`
+	RawKey          string  `json:"raw_key"`
+	Enabled         bool    `json:"enabled"`
+	QuotaLimit      float64 `json:"quota_limit"`
+	QuotaUsed       float64 `json:"quota_used"`
+	ExpiresAt       *string `json:"expires_at"`
+	AllowedGroupIDs []int64 `json:"allowed_group_ids"`
+	Status          string  `json:"status"`
+	CreatedAt       string  `json:"created_at"`
 }
 
 // NewMaskedAPIKeyRow 创建 API Key 响应
 func NewMaskedAPIKeyRow(row *database.APIKeyRow) *MaskedAPIKeyRow {
+	var expiresAt *string
+	if row.ExpiresAt.Valid {
+		formatted := row.ExpiresAt.Time.Format(time.RFC3339)
+		expiresAt = &formatted
+	}
+	status := "active"
+	if row.IsExpired(time.Now()) {
+		status = "expired"
+	} else if row.IsQuotaExhausted() {
+		status = "quota_exhausted"
+	}
 	return &MaskedAPIKeyRow{
-		ID:        row.ID,
-		Name:      row.Name,
-		Key:       security.MaskAPIKey(row.Key),
-		RawKey:    row.Key,
-		Enabled:   row.Enabled,
-		CreatedAt: row.CreatedAt.Format(time.RFC3339),
+		ID:              row.ID,
+		Name:            row.Name,
+		Key:             security.MaskAPIKey(row.Key),
+		RawKey:          row.Key,
+		Enabled:         row.Enabled,
+		QuotaLimit:      row.QuotaLimit,
+		QuotaUsed:       row.QuotaUsed,
+		ExpiresAt:       expiresAt,
+		AllowedGroupIDs: append([]int64(nil), row.AllowedGroupIDs...),
+		Status:          status,
+		CreatedAt:       row.CreatedAt.Format(time.RFC3339),
 	}
 }
 
 type createAPIKeyResponse struct {
-	ID   int64  `json:"id"`
-	Key  string `json:"key"`
-	Name string `json:"name"`
+	ID              int64   `json:"id"`
+	Key             string  `json:"key"`
+	Name            string  `json:"name"`
+	QuotaLimit      float64 `json:"quota_limit"`
+	QuotaUsed       float64 `json:"quota_used"`
+	ExpiresAt       *string `json:"expires_at"`
+	AllowedGroupIDs []int64 `json:"allowed_group_ids"`
 }
 
 type opsOverviewResponse struct {
@@ -144,6 +169,7 @@ type opsTrafficResponse struct {
 	TodayRequests int64   `json:"today_requests"`
 	TodayTokens   int64   `json:"today_tokens"`
 	RPMLimit      int     `json:"rpm_limit"`
+	AvgDurationMs float64 `json:"avg_duration_ms"`
 }
 
 func writeError(c *gin.Context, statusCode int, message string) {

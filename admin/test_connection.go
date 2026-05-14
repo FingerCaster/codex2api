@@ -48,21 +48,16 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		return
 	}
 
-	// 检查 access_token 是否可用
-	account.Mu().RLock()
-	hasToken := account.AccessToken != ""
-	account.Mu().RUnlock()
-
-	if !hasToken && !account.IsAPIKeyProvider() {
+	isOpenAIResponsesAccount := account.IsOpenAIResponsesAPI()
+	isGenericProvider := account.IsAPIKeyProvider()
+	if !isOpenAIResponsesAccount && !isGenericProvider && account.GetAccessToken() == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "账号没有可用的 Access Token，请先刷新"})
 		return
 	}
 
-	testModel := strings.TrimSpace(c.Query("model"))
-	if testModel == "" {
-		testModel = h.connectionTestModel(c.Request.Context())
-	} else if !proxy.IsTextTestModelID(c.Request.Context(), h.db, testModel) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "不支持的测试模型: " + testModel})
+	testModel, err := h.connectionTestModelForAccount(c.Request.Context(), account, strings.TrimSpace(c.Query("model")))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -84,8 +79,10 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	start := time.Now()
 	var resp *http.Response
 	var reqErr error
-	if account.IsAPIKeyProvider() {
+	if isGenericProvider {
 		resp, reqErr = proxy.ExecuteGenericOpenAIRequest(c.Request.Context(), account, "/v1/responses", payload, h.store.ResolveProxyForAccount(account), true, nil)
+	} else if isOpenAIResponsesAccount {
+		resp, reqErr = proxy.ExecuteOpenAIResponsesRequest(c.Request.Context(), account, payload, h.store.ResolveProxyForAccount(account), nil)
 	} else {
 		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	}
@@ -95,17 +92,22 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
-	isGenericProvider := account.IsAPIKeyProvider()
 	if resp.StatusCode != http.StatusOK {
-		if !isGenericProvider {
+		if !isGenericProvider && !isOpenAIResponsesAccount {
 			proxy.SyncCodexUsageState(h.store, account, resp)
 		}
 		errBody, _ := io.ReadAll(resp.Body)
-		if !isGenericProvider {
-			switch resp.StatusCode {
-			case http.StatusUnauthorized:
+		switch resp.StatusCode {
+		case http.StatusUnauthorized:
+			if isGenericProvider {
+				h.store.MarkError(account, fmt.Sprintf("连接测试上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 300)))
+			} else {
 				h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
-			case http.StatusTooManyRequests:
+			}
+		case http.StatusTooManyRequests:
+			if isOpenAIResponsesAccount {
+				h.store.MarkCooldown(account, time.Minute, "rate_limited")
+			} else if !isGenericProvider {
 				proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
 			}
 		}
@@ -114,7 +116,7 @@ func (h *Handler) TestConnection(c *gin.Context) {
 	}
 
 	usageState := proxy.CodexUsageSyncResult{}
-	if !isGenericProvider {
+	if !isGenericProvider && !isOpenAIResponsesAccount {
 		usageState = proxy.SyncCodexUsageState(h.store, account, resp)
 		if msg, limited := formatUsageLimitedTestError(usageState); limited {
 			sendTestEvent(c, testEvent{Type: "error", Error: msg})
@@ -215,11 +217,11 @@ func (h *Handler) TestConnection(c *gin.Context) {
 				return false
 			}
 			// 测试成功即重置冷却状态，用量限制由调度器自行判断
-			if isGenericProvider || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100)) {
+			if isGenericProvider || isOpenAIResponsesAccount || (!usageState.Premium5hRateLimited && (!usageState.HasUsage7d || usageState.UsagePct7d < 100)) {
 				h.store.ClearCooldown(account)
 			}
 			// 如果上游未返回用量头，清除旧的用量缓存，避免显示过期数据
-			if !isGenericProvider && !usageState.HasUsage7d && !usageState.HasUsage5h {
+			if !isGenericProvider && !isOpenAIResponsesAccount && !usageState.HasUsage7d && !usageState.HasUsage5h {
 				account.ClearUsageCache()
 			}
 			duration := time.Since(start).Milliseconds()
@@ -484,6 +486,51 @@ func (h *Handler) connectionTestModel(ctx context.Context) string {
 	return "gpt-5.4"
 }
 
+func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *auth.Account, requested string) (string, error) {
+	requested = strings.TrimSpace(requested)
+	if account == nil || !account.IsOpenAIResponsesAPI() {
+		if requested == "" {
+			return h.connectionTestModel(ctx), nil
+		}
+		if !proxy.IsTextTestModelID(ctx, h.db, requested) {
+			return "", fmt.Errorf("不支持的测试模型: %s", requested)
+		}
+		return requested, nil
+	}
+
+	models := account.OpenAIResponsesModels()
+	textModels := make([]string, 0, len(models))
+	for _, model := range models {
+		if isTextConnectionModel(model) {
+			textModels = append(textModels, strings.TrimSpace(model))
+		}
+	}
+	if len(textModels) == 0 {
+		return "", fmt.Errorf("该 Responses API 账号没有可用于测试的文本模型")
+	}
+	if requested != "" {
+		for _, model := range textModels {
+			if strings.EqualFold(model, requested) {
+				return model, nil
+			}
+		}
+		return "", fmt.Errorf("该账号不支持测试模型: %s", requested)
+	}
+
+	defaultModel := strings.TrimSpace(h.store.GetTestModel())
+	for _, model := range textModels {
+		if strings.EqualFold(model, defaultModel) {
+			return model, nil
+		}
+	}
+	return textModels[0], nil
+}
+
+func isTextConnectionModel(model string) bool {
+	model = strings.TrimSpace(strings.ToLower(model))
+	return model != "" && !strings.Contains(model, "image")
+}
+
 type batchTestRequest struct {
 	IDs *[]int64 `json:"ids"`
 }
@@ -535,8 +582,6 @@ func (h *Handler) BatchTest(c *gin.Context) {
 		return
 	}
 
-	testModel := h.connectionTestModel(c.Request.Context())
-	payload := buildTestPayload(testModel)
 	concurrency := h.store.GetTestConcurrency()
 
 	var (
@@ -549,13 +594,12 @@ func (h *Handler) BatchTest(c *gin.Context) {
 	)
 
 	for _, account := range accounts {
-		// 跳过没有 token 的 Codex 账号；OpenAI 兼容上游使用 base_url + api_key。
-		account.Mu().RLock()
-		hasToken := account.AccessToken != ""
-		hasRefreshToken := account.RefreshToken != ""
-		account.Mu().RUnlock()
 		isGenericProvider := account.IsAPIKeyProvider()
-		if !hasToken && !isGenericProvider {
+		isOpenAIResponsesAccount := account.IsOpenAIResponsesAPI()
+		if !isGenericProvider && !isOpenAIResponsesAccount && account.GetAccessToken() == "" {
+			account.Mu().RLock()
+			hasRefreshToken := account.RefreshToken != ""
+			account.Mu().RUnlock()
 			if !hasRefreshToken {
 				h.store.MarkError(account, "批量测试失败: 账号缺少 access_token 和 refresh_token")
 			}
@@ -570,10 +614,21 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			defer func() { <-sem }()
 
 			isGenericProvider := acc.IsAPIKeyProvider()
+			isOpenAIResponsesAccount := acc.IsOpenAIResponsesAPI()
+			testModel, modelErr := h.connectionTestModelForAccount(context.Background(), acc, "")
+			if modelErr != nil {
+				h.store.MarkError(acc, "批量测试失败: "+modelErr.Error())
+				atomic.AddInt64(&failedCount, 1)
+				return
+			}
+			payload := buildTestPayload(testModel)
+
 			var resp *http.Response
 			var err error
 			if isGenericProvider {
 				resp, err = proxy.ExecuteGenericOpenAIRequest(context.Background(), acc, "/v1/responses", payload, h.store.ResolveProxyForAccount(acc), true, nil)
+			} else if isOpenAIResponsesAccount {
+				resp, err = proxy.ExecuteOpenAIResponsesRequest(context.Background(), acc, payload, h.store.ResolveProxyForAccount(acc), nil)
 			} else {
 				resp, err = proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 			}
@@ -588,7 +643,7 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			switch resp.StatusCode {
 			case http.StatusOK:
 				usageState := proxy.CodexUsageSyncResult{}
-				if !isGenericProvider {
+				if !isGenericProvider && !isOpenAIResponsesAccount {
 					usageState = proxy.SyncCodexUsageState(h.store, acc, resp)
 					if _, limited := formatUsageLimitedTestError(usageState); limited {
 						atomic.AddInt64(&rateLimitCount, 1)
@@ -603,12 +658,16 @@ func (h *Handler) BatchTest(c *gin.Context) {
 					h.store.MarkError(acc, fmt.Sprintf("批量测试上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
 					atomic.AddInt64(&failedCount, 1)
 				} else {
-					proxy.SyncCodexUsageState(h.store, acc, resp)
+					if !isOpenAIResponsesAccount {
+						proxy.SyncCodexUsageState(h.store, acc, resp)
+					}
 					h.store.MarkCooldown(acc, 24*time.Hour, "unauthorized")
 					atomic.AddInt64(&bannedCount, 1)
 				}
 			case http.StatusTooManyRequests:
-				if !isGenericProvider {
+				if isOpenAIResponsesAccount {
+					h.store.MarkCooldown(acc, time.Minute, "rate_limited")
+				} else if !isGenericProvider {
 					proxy.SyncCodexUsageState(h.store, acc, resp)
 					proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
 				}

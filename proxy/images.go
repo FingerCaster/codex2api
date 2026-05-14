@@ -1267,8 +1267,8 @@ func imageAccountFilter(targetAccountID int64) auth.AccountFilter {
 	return imagePreferredAccountFilter
 }
 
-func (h *Handler) nextImageAccount(apiKeyID int64, targetAccountID int64, exclude map[int64]bool) (*auth.Account, string) {
-	filter := imageAccountFilter(targetAccountID)
+func (h *Handler) nextImageAccount(apiKeyID int64, targetAccountID int64, exclude map[int64]bool, model string) (*auth.Account, string) {
+	filter := h.withModelCooldownFilter(model, imageAccountFilter(targetAccountID))
 	account, stickyProxyURL := h.nextAccountForSessionWithFilter("", apiKeyID, exclude, filter)
 	if account != nil {
 		return account, stickyProxyURL
@@ -1276,7 +1276,7 @@ func (h *Handler) nextImageAccount(apiKeyID int64, targetAccountID int64, exclud
 	if targetAccountID > 0 {
 		return nil, ""
 	}
-	return h.nextAccountForSession("", apiKeyID, exclude)
+	return h.nextAccountForSessionWithFilter("", apiKeyID, exclude, h.withModelCooldownFilter(model, nil))
 }
 
 func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestModel string, responsesBody []byte, genericBody []byte, genericContentType, responseFormat, streamPrefix string, stream bool) {
@@ -1297,9 +1297,9 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 	excludeAccounts := make(map[int64]bool)
 
 	for attempt := 0; ; attempt++ {
-		account, stickyProxyURL := h.nextImageAccount(apiKeyID, targetAccountID, excludeAccounts)
+		account, stickyProxyURL := h.nextImageAccount(apiKeyID, targetAccountID, excludeAccounts, requestModel)
 		if account == nil {
-			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, accountFilter)
+			account, stickyProxyURL = h.store.WaitForSessionAvailableWithFilter(c.Request.Context(), "", 30*time.Second, apiKeyID, excludeAccounts, h.withModelCooldownFilter(requestModel, accountFilter))
 			if account == nil {
 				if lastStatusCode == http.StatusTooManyRequests && len(lastBody) > 0 {
 					h.sendFinalUpstreamError(c, lastStatusCode, lastBody)
