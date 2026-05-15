@@ -96,6 +96,8 @@ type Account struct {
 	LastTimeoutAt            time.Time
 	LastServerErrorAt        time.Time
 	LastRecoveryProbeAt      time.Time
+	RecoveryProbeSuccesses   int
+	RecoveryGuardUntil       time.Time
 
 	// 滑动窗口成功率（最近 N 次请求）
 	RecentResults    [20]uint8 // 1=成功, 0=失败
@@ -137,6 +139,12 @@ const (
 	defaultBackgroundRefreshInterval = 2 * time.Minute
 	defaultUsageProbeMaxAge          = 10 * time.Minute
 	defaultRecoveryProbeInterval     = 30 * time.Minute
+	defaultAPIAccountFailureRate     = 80
+	defaultAPIAccountFailureSamples  = 20
+	defaultAPIAccountCooldown        = 2 * time.Minute
+	defaultAPIAccountProbeInterval   = time.Minute
+	defaultAPIAccountProbeSuccesses  = 1
+	defaultAPIAccountRecoveryGuard   = time.Minute
 	premium5hUrgencyWindow           = 4 * time.Hour
 	premium5hUrgencyMaxBonus         = 25.0
 	premium5hUrgencyMinRemainingPct  = 5.0
@@ -194,9 +202,11 @@ func (a *Account) isOpenAIResponsesAPILocked() bool {
 	if a == nil {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(a.UpstreamType), UpstreamOpenAIResponses) &&
-		strings.TrimSpace(a.BaseURL) != "" &&
-		strings.TrimSpace(a.APIKey) != ""
+	if strings.TrimSpace(a.BaseURL) == "" || strings.TrimSpace(a.APIKey) == "" {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(a.UpstreamType), UpstreamOpenAIResponses) ||
+		strings.EqualFold(strings.TrimSpace(a.Type), "api_key")
 }
 
 func (a *Account) hasDispatchCredentialLocked() bool {
@@ -499,6 +509,16 @@ func concurrencyLimitForTier(baseLimit int64, tier AccountHealthTier) int64 {
 		}
 		return 1
 	}
+}
+
+func recoveryGuardedConcurrencyLimit(limit int64, guardUntil time.Time, now time.Time) int64 {
+	if limit <= 0 {
+		return limit
+	}
+	if !guardUntil.IsZero() && now.Before(guardUntil) {
+		return 1
+	}
+	return limit
 }
 
 func defaultScoreBiasForPlan(planType string) int64 {
@@ -837,7 +857,7 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	a.DispatchScore = dispatchScore
 	a.ScoreBiasEffective = scoreBiasEffective
 	a.BaseConcurrencyEffective = baseConcurrencyEffective
-	a.DynamicConcurrencyLimit = concurrencyLimitForTier(baseConcurrencyEffective, tier)
+	a.DynamicConcurrencyLimit = recoveryGuardedConcurrencyLimit(concurrencyLimitForTier(baseConcurrencyEffective, tier), a.RecoveryGuardUntil, now)
 	if a.premium5hRateLimitedLocked(now) && a.DynamicConcurrencyLimit > 1 {
 		a.DynamicConcurrencyLimit = 1
 	}
@@ -920,7 +940,11 @@ func (a *Account) SetCooldownUntil(until time.Time, reason string) {
 	a.CooldownReason = reason
 	switch reason {
 	case "unauthorized":
-		a.HealthTier = HealthTierBanned
+		if a.isOpenAIResponsesAPILocked() {
+			a.HealthTier = HealthTierRisky
+		} else {
+			a.HealthTier = HealthTierBanned
+		}
 	case "rate_limited":
 		if a.healthTierLocked() == HealthTierHealthy {
 			a.HealthTier = HealthTierWarm
@@ -1405,13 +1429,18 @@ func (a *Account) NeedsRecoveryProbe(minInterval time.Duration) bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	if a.recoveryProbeInFlight || a.healthTierLocked() != HealthTierBanned {
+	if a.recoveryProbeInFlight {
 		return false
 	}
-	if a.RefreshToken == "" {
+	if a.isOpenAIResponsesAPILocked() {
+		if a.Status != StatusCooldown {
+			return false
+		}
+	} else if a.healthTierLocked() != HealthTierBanned {
 		return false
-	}
-	if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
+	} else if a.RefreshToken == "" {
+		return false
+	} else if a.Status == StatusCooldown && time.Now().Before(a.CooldownUtil) {
 		return false
 	}
 	if !a.LastRecoveryProbeAt.IsZero() && time.Since(a.LastRecoveryProbeAt) < minInterval {
@@ -1437,6 +1466,22 @@ func (a *Account) FinishRecoveryProbe() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.recoveryProbeInFlight = false
+}
+
+func (a *Account) recentFailureRateLocked(minSamples int) (float64, int, bool) {
+	if minSamples <= 0 {
+		minSamples = 1
+	}
+	if a.RecentResultsCnt < minSamples {
+		return 0, a.RecentResultsCnt, false
+	}
+	failures := 0
+	for i := 0; i < a.RecentResultsCnt; i++ {
+		if a.RecentResults[i] == 0 {
+			failures++
+		}
+	}
+	return float64(failures) * 100 / float64(a.RecentResultsCnt), a.RecentResultsCnt, true
 }
 
 // GetActiveRequests 获取当前并发数
@@ -1486,6 +1531,14 @@ type Store struct {
 	backgroundRefreshInterval int64 // 后台刷新/探针巡检间隔（ns）
 	usageProbeMaxAge          int64 // 用量探针快照最大缓存时长（ns）
 	recoveryProbeInterval     int64 // 恢复探测最小间隔（ns）
+	apiAccountBreakerEnabled  atomic.Bool
+	apiAccountFailureRate     int64 // 触发 API 账号短冷却的失败率阈值（百分比）
+	apiAccountFailureSamples  int64 // 触发 API 账号短冷却的最小滑动窗口样本数
+	apiAccountCooldown        int64 // API 账号短冷却时长（ns）
+	apiAccountProbeInterval   int64 // API 账号恢复探测最小间隔（ns）
+	apiAccountProbeSuccesses  int64 // API 账号恢复需要的连续成功次数
+	apiAccountDirectHealthy   atomic.Bool
+	apiAccountRecoveryGuard   int64 // API 账号恢复后低并发保护窗口（ns）
 	backgroundRefreshWakeCh   chan struct{}
 	stopCh                    chan struct{}
 	stopOnce                  sync.Once
@@ -1572,6 +1625,15 @@ func normalizeCooldownReason(reason string) string {
 		return "rate_limited"
 	}
 	return reason
+}
+
+func apiAccountFailureCooldownEligible(kind string) bool {
+	switch strings.TrimSpace(kind) {
+	case "server", "timeout", "transport":
+		return true
+	default:
+		return false
+	}
 }
 
 func cooldownTTL(resetAt time.Time) (time.Duration, bool) {
@@ -1855,14 +1917,22 @@ func truthyEnv(v string) bool {
 func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSettings) *Store {
 	if settings == nil {
 		settings = &database.SystemSettings{
-			MaxConcurrency:                   2,
-			TestConcurrency:                  50,
-			TestModel:                        "gpt-5.4",
-			BackgroundRefreshIntervalMinutes: 2,
-			UsageProbeMaxAgeMinutes:          10,
-			RecoveryProbeIntervalMinutes:     30,
-			ProxyURL:                         "",
-			MaxRateLimitRetries:              1,
+			MaxConcurrency:                         2,
+			TestConcurrency:                        50,
+			TestModel:                              "gpt-5.4",
+			BackgroundRefreshIntervalMinutes:       2,
+			UsageProbeMaxAgeMinutes:                10,
+			RecoveryProbeIntervalMinutes:           30,
+			APIAccountCircuitBreakerEnabled:        true,
+			APIAccountFailureRateThreshold:         defaultAPIAccountFailureRate,
+			APIAccountFailureMinSamples:            defaultAPIAccountFailureSamples,
+			APIAccountCooldownMinutes:              int(defaultAPIAccountCooldown / time.Minute),
+			APIAccountRecoveryProbeIntervalMinutes: int(defaultAPIAccountProbeInterval / time.Minute),
+			APIAccountRecoveryProbeSuccesses:       defaultAPIAccountProbeSuccesses,
+			APIAccountRecoveryDirectHealthy:        true,
+			APIAccountRecoveryGuardMinutes:         int(defaultAPIAccountRecoveryGuard / time.Minute),
+			ProxyURL:                               "",
+			MaxRateLimitRetries:                    1,
 		}
 	}
 	s := &Store{
@@ -1880,6 +1950,14 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
 	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
 	s.SetRecoveryProbeInterval(time.Duration(settings.RecoveryProbeIntervalMinutes) * time.Minute)
+	s.SetAPIAccountCircuitBreakerEnabled(settings.APIAccountCircuitBreakerEnabled)
+	s.SetAPIAccountFailureRateThreshold(settings.APIAccountFailureRateThreshold)
+	s.SetAPIAccountFailureMinSamples(settings.APIAccountFailureMinSamples)
+	s.SetAPIAccountCooldown(time.Duration(settings.APIAccountCooldownMinutes) * time.Minute)
+	s.SetAPIAccountRecoveryProbeInterval(time.Duration(settings.APIAccountRecoveryProbeIntervalMinutes) * time.Minute)
+	s.SetAPIAccountRecoveryProbeSuccesses(settings.APIAccountRecoveryProbeSuccesses)
+	s.SetAPIAccountRecoveryDirectHealthy(settings.APIAccountRecoveryDirectHealthy)
+	s.SetAPIAccountRecoveryGuard(time.Duration(settings.APIAccountRecoveryGuardMinutes) * time.Minute)
 	s.SetSessionAffinityTTL(time.Duration(settings.SessionAffinityTTLMinutes) * time.Minute)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
@@ -2212,6 +2290,148 @@ func (s *Store) GetRecoveryProbeInterval() time.Duration {
 		return defaultRecoveryProbeInterval
 	}
 	return d
+}
+
+func (s *Store) SetAPIAccountCircuitBreakerEnabled(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.apiAccountBreakerEnabled.Store(enabled)
+}
+
+func (s *Store) GetAPIAccountCircuitBreakerEnabled() bool {
+	return s != nil && s.apiAccountBreakerEnabled.Load()
+}
+
+func (s *Store) SetAPIAccountFailureRateThreshold(v int) {
+	if v <= 0 {
+		v = defaultAPIAccountFailureRate
+	}
+	if v > 100 {
+		v = 100
+	}
+	atomic.StoreInt64(&s.apiAccountFailureRate, int64(v))
+}
+
+func (s *Store) GetAPIAccountFailureRateThreshold() int {
+	v := atomic.LoadInt64(&s.apiAccountFailureRate)
+	if v <= 0 {
+		return defaultAPIAccountFailureRate
+	}
+	if v > 100 {
+		return 100
+	}
+	return int(v)
+}
+
+func (s *Store) SetAPIAccountFailureMinSamples(v int) {
+	if v <= 0 {
+		v = defaultAPIAccountFailureSamples
+	}
+	if v > 20 {
+		v = 20
+	}
+	atomic.StoreInt64(&s.apiAccountFailureSamples, int64(v))
+}
+
+func (s *Store) GetAPIAccountFailureMinSamples() int {
+	v := atomic.LoadInt64(&s.apiAccountFailureSamples)
+	if v <= 0 {
+		return defaultAPIAccountFailureSamples
+	}
+	if v > 20 {
+		return 20
+	}
+	return int(v)
+}
+
+func (s *Store) SetAPIAccountCooldown(d time.Duration) {
+	if d <= 0 {
+		d = defaultAPIAccountCooldown
+	}
+	atomic.StoreInt64(&s.apiAccountCooldown, int64(d))
+}
+
+func (s *Store) GetAPIAccountCooldown() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.apiAccountCooldown))
+	if d <= 0 {
+		return defaultAPIAccountCooldown
+	}
+	return d
+}
+
+func (s *Store) SetAPIAccountRecoveryProbeInterval(d time.Duration) {
+	if d <= 0 {
+		d = defaultAPIAccountProbeInterval
+	}
+	atomic.StoreInt64(&s.apiAccountProbeInterval, int64(d))
+}
+
+func (s *Store) GetAPIAccountRecoveryProbeInterval() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.apiAccountProbeInterval))
+	if d <= 0 {
+		return defaultAPIAccountProbeInterval
+	}
+	return d
+}
+
+func (s *Store) SetAPIAccountRecoveryProbeSuccesses(v int) {
+	if v <= 0 {
+		v = defaultAPIAccountProbeSuccesses
+	}
+	if v > 10 {
+		v = 10
+	}
+	atomic.StoreInt64(&s.apiAccountProbeSuccesses, int64(v))
+}
+
+func (s *Store) GetAPIAccountRecoveryProbeSuccesses() int {
+	v := atomic.LoadInt64(&s.apiAccountProbeSuccesses)
+	if v <= 0 {
+		return defaultAPIAccountProbeSuccesses
+	}
+	if v > 10 {
+		return 10
+	}
+	return int(v)
+}
+
+func (s *Store) SetAPIAccountRecoveryDirectHealthy(enabled bool) {
+	if s == nil {
+		return
+	}
+	s.apiAccountDirectHealthy.Store(enabled)
+}
+
+func (s *Store) GetAPIAccountRecoveryDirectHealthy() bool {
+	return s != nil && s.apiAccountDirectHealthy.Load()
+}
+
+func (s *Store) SetAPIAccountRecoveryGuard(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	atomic.StoreInt64(&s.apiAccountRecoveryGuard, int64(d))
+}
+
+func (s *Store) GetAPIAccountRecoveryGuard() time.Duration {
+	d := time.Duration(atomic.LoadInt64(&s.apiAccountRecoveryGuard))
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+func (s *Store) GetAPIAccountCooldownMinutes() int {
+	return int(s.GetAPIAccountCooldown() / time.Minute)
+}
+
+func (s *Store) GetAPIAccountRecoveryProbeIntervalMinutes() int {
+	return int(s.GetAPIAccountRecoveryProbeInterval() / time.Minute)
+}
+
+func (s *Store) GetAPIAccountRecoveryGuardMinutes() int {
+	return int(s.GetAPIAccountRecoveryGuard() / time.Minute)
 }
 
 func (s *Store) SetSessionAffinityTTL(d time.Duration) {
@@ -3335,7 +3555,9 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 	acc.mu.Lock()
 	switch reason {
 	case "unauthorized":
-		if !acc.LastUnauthorizedAt.IsZero() && now.Sub(acc.LastUnauthorizedAt) < 24*time.Hour {
+		if acc.isOpenAIResponsesAPILocked() {
+			duration = s.GetAPIAccountCooldown()
+		} else if !acc.LastUnauthorizedAt.IsZero() && now.Sub(acc.LastUnauthorizedAt) < 24*time.Hour {
 			duration = 24 * time.Hour
 		} else {
 			duration = 6 * time.Hour
@@ -3344,7 +3566,11 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 		acc.LastFailureAt = now
 		acc.FailureStreak++
 		acc.SuccessStreak = 0
-		acc.HealthTier = HealthTierBanned
+		if acc.isOpenAIResponsesAPILocked() {
+			acc.HealthTier = HealthTierRisky
+		} else {
+			acc.HealthTier = HealthTierBanned
+		}
 	case "rate_limited":
 		acc.LastRateLimitedAt = now
 		acc.LastFailureAt = now
@@ -3355,7 +3581,34 @@ func (s *Store) MarkCooldown(acc *Account, duration time.Duration, reason string
 		} else {
 			acc.HealthTier = HealthTierRisky
 		}
+	case "payment_required", "quota_unavailable", "subscription_unavailable":
+		acc.LastFailureAt = now
+		acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
+		acc.SuccessStreak = 0
+		if acc.isOpenAIResponsesAPILocked() {
+			duration = s.GetAPIAccountCooldown()
+		}
+		if acc.HealthTier == HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		} else if acc.HealthTier == HealthTierHealthy || acc.HealthTier == "" {
+			acc.HealthTier = HealthTierWarm
+		} else {
+			acc.HealthTier = HealthTierRisky
+		}
+	case "api_account_failure_rate":
+		acc.LastFailureAt = now
+		acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
+		acc.SuccessStreak = 0
+		if duration <= 0 {
+			duration = s.GetAPIAccountCooldown()
+		}
+		if acc.HealthTier == HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		} else {
+			acc.HealthTier = HealthTierRisky
+		}
 	}
+	acc.RecoveryProbeSuccesses = 0
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 
@@ -3525,6 +3778,8 @@ func (s *Store) ClearCooldown(acc *Account) {
 	acc.ErrorMsg = ""
 	acc.CooldownUtil = time.Time{}
 	acc.CooldownReason = ""
+	acc.RecoveryGuardUntil = time.Time{}
+	acc.RecoveryProbeSuccesses = 0
 	if wasCooling && !premium5hLimited {
 		acc.HealthTier = HealthTierWarm
 	} else if wasError && acc.HealthTier != HealthTierBanned {
@@ -3546,6 +3801,88 @@ func (s *Store) ClearCooldown(acc *Account) {
 	}
 }
 
+func (s *Store) MarkRecoveryProbeSuccess(acc *Account) bool {
+	if acc == nil {
+		return false
+	}
+	if !acc.IsOpenAIResponsesAPI() {
+		s.RecoverAccountFromProbe(acc, time.Now())
+		return true
+	}
+	required := s.GetAPIAccountRecoveryProbeSuccesses()
+	if required <= 0 {
+		required = 1
+	}
+	now := time.Now()
+	acc.mu.Lock()
+	acc.RecoveryProbeSuccesses++
+	recovered := acc.RecoveryProbeSuccesses >= required
+	acc.mu.Unlock()
+	if !recovered {
+		return false
+	}
+	s.RecoverAccountFromProbe(acc, now)
+	return true
+}
+
+func (s *Store) RecoverAccountFromProbe(acc *Account, now time.Time) {
+	if acc == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	guard := s.GetAPIAccountRecoveryGuard()
+	directHealthy := s.GetAPIAccountRecoveryDirectHealthy()
+	atomic.StoreInt32(&acc.Disabled, 0)
+	acc.mu.Lock()
+	acc.Status = StatusReady
+	acc.ErrorMsg = ""
+	acc.CooldownUtil = time.Time{}
+	acc.CooldownReason = ""
+	acc.LastFailureAt = time.Time{}
+	acc.LastUnauthorizedAt = time.Time{}
+	acc.LastRateLimitedAt = time.Time{}
+	acc.LastTimeoutAt = time.Time{}
+	acc.LastServerErrorAt = time.Time{}
+	acc.FailureStreak = 0
+	acc.SuccessStreak = 1
+	acc.RecoveryProbeSuccesses = 0
+	acc.LastSuccessAt = now
+	for i := range acc.RecentResults {
+		acc.RecentResults[i] = 0
+	}
+	acc.RecentResultsIdx = 0
+	acc.RecentResultsCnt = 0
+	if guard > 0 {
+		acc.RecoveryGuardUntil = now.Add(guard)
+	} else {
+		acc.RecoveryGuardUntil = time.Time{}
+	}
+	if directHealthy {
+		acc.HealthTier = HealthTierHealthy
+	} else {
+		acc.HealthTier = HealthTierWarm
+	}
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	s.deleteCachedAccountCooldown(acc.DBID)
+
+	if s.db == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.ClearError(ctx, acc.DBID); err != nil {
+		log.Printf("[账号 %d] 探测恢复时清理账号状态失败: %v", acc.DBID, err)
+	}
+	if err := s.db.ClearCooldown(ctx, acc.DBID); err != nil {
+		log.Printf("[账号 %d] 探测恢复时清理冷却状态失败: %v", acc.DBID, err)
+	}
+}
+
 // ForceAccountHealthy 强制将账号运行时状态恢复为健康。
 // 该操作仅影响内存中的调度状态，不改写数据库中的长期凭据元数据。
 func (s *Store) ForceAccountHealthy(acc *Account) {
@@ -3559,6 +3896,8 @@ func (s *Store) ForceAccountHealthy(acc *Account) {
 	acc.ErrorMsg = ""
 	acc.CooldownUtil = time.Time{}
 	acc.CooldownReason = ""
+	acc.RecoveryGuardUntil = time.Time{}
+	acc.RecoveryProbeSuccesses = 0
 	acc.HealthTier = HealthTierHealthy
 	acc.LastFailureAt = time.Time{}
 	acc.LastUnauthorizedAt = time.Time{}
@@ -3601,6 +3940,9 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 	acc.LastSuccessAt = time.Now()
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
 	acc.FailureStreak = 0
+	if !acc.recoveryProbeInFlight {
+		acc.RecoveryProbeSuccesses = 0
+	}
 	if acc.HealthTier == "" {
 		acc.HealthTier = HealthTierHealthy
 	}
@@ -3616,12 +3958,16 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 	}
 
 	now := time.Now()
+	shouldShortCooldown := false
+	var failureRate float64
+	var failureSamples int
 	acc.mu.Lock()
 	acc.recordLatencyLocked(latency)
 	acc.recordResultLocked(false)
 	acc.LastFailureAt = now
 	acc.FailureStreak = clampInt(acc.FailureStreak+1, 0, 20)
 	acc.SuccessStreak = 0
+	acc.RecoveryProbeSuccesses = 0
 
 	switch kind {
 	case "unauthorized":
@@ -3653,9 +3999,24 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 		}
 	}
 
+	if s.GetAPIAccountCircuitBreakerEnabled() &&
+		apiAccountFailureCooldownEligible(kind) &&
+		acc.isOpenAIResponsesAPILocked() &&
+		!(acc.Status == StatusCooldown && now.Before(acc.CooldownUtil)) {
+		if rate, samples, ok := acc.recentFailureRateLocked(s.GetAPIAccountFailureMinSamples()); ok && rate >= float64(s.GetAPIAccountFailureRateThreshold()) {
+			shouldShortCooldown = true
+			failureRate = rate
+			failureSamples = samples
+		}
+	}
+
 	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
+	if shouldShortCooldown {
+		log.Printf("[账号 %d] API 账号失败率 %.0f%%/%d 达到阈值，进入短冷却", acc.DBID, failureRate, failureSamples)
+		s.MarkCooldown(acc, s.GetAPIAccountCooldown(), "api_account_failure_rate")
+	}
 }
 
 // PersistUsageSnapshot 持久化账号用量快照（7d + 5h）
@@ -4019,7 +4380,11 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 	var wg sync.WaitGroup
 
 	for _, acc := range accounts {
-		if !acc.NeedsRecoveryProbe(s.GetRecoveryProbeInterval()) {
+		interval := s.GetRecoveryProbeInterval()
+		if acc != nil && acc.IsOpenAIResponsesAPI() {
+			interval = s.GetAPIAccountRecoveryProbeInterval()
+		}
+		if !acc.NeedsRecoveryProbe(interval) {
 			continue
 		}
 		if !acc.TryBeginRecoveryProbe() {
@@ -4036,7 +4401,7 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 			probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			defer cancel()
 
-			if account.NeedsRefresh() {
+			if !account.IsOpenAIResponsesAPI() && account.NeedsRefresh() {
 				if err := s.refreshAccount(probeCtx, account); err != nil {
 					log.Printf("[账号 %d] 恢复探测前刷新失败: %v", account.DBID, err)
 				}
@@ -4052,28 +4417,13 @@ func (s *Store) parallelRecoveryProbe(ctx context.Context) {
 				if exhausted {
 					log.Printf("[账号 %d] 恢复探测成功但用量已耗尽，保持当前状态", account.DBID)
 				} else {
-					// 探测成功：将账号从 banned 升级到 warm，给予重新调度的机会
-					atomic.StoreInt32(&account.Disabled, 0) // 清除原子禁用标志
-					account.mu.Lock()
-					if account.HealthTier == HealthTierBanned {
-						account.HealthTier = HealthTierWarm
-						account.SchedulerScore = 80
-						account.FailureStreak = 0
-						account.SuccessStreak = 1
-						account.LastSuccessAt = time.Now()
-						if account.Status == StatusCooldown {
-							account.Status = StatusReady
-							account.CooldownUtil = time.Time{}
-							account.CooldownReason = ""
-						}
-						account.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
-						log.Printf("[账号 %d] 恢复探测成功！已从 banned 升级到 warm", account.DBID)
-					}
-					account.mu.Unlock()
-					// 清理数据库冷却状态
-					s.deleteCachedAccountCooldown(account.DBID)
-					if s.db != nil {
-						_ = s.db.ClearCooldown(context.Background(), account.DBID)
+					if s.MarkRecoveryProbeSuccess(account) {
+						log.Printf("[账号 %d] 恢复探测成功！已恢复到 %s", account.DBID, account.GetHealthTier())
+					} else {
+						account.mu.RLock()
+						successes := account.RecoveryProbeSuccesses
+						account.mu.RUnlock()
+						log.Printf("[账号 %d] 恢复探测成功 %d/%d", account.DBID, successes, s.GetAPIAccountRecoveryProbeSuccesses())
 					}
 				}
 			}

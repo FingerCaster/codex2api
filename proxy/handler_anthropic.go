@@ -221,6 +221,8 @@ func (h *Handler) Messages(c *gin.Context) {
 			if !isGenericProvider {
 				h.logUpstreamCyberPolicy(c, "/v1/messages", model, errBody)
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			} else {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			}
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{

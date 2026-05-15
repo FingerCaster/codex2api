@@ -84,6 +84,9 @@ func (h *Handler) TestConnection(c *gin.Context) {
 		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
 	}
 	if reqErr != nil {
+		if isOpenAIResponsesAccount {
+			h.store.ReportRequestFailure(account, apiProbeTransportFailureKind(reqErr), time.Since(start))
+		}
 		sendTestEvent(c, testEvent{Type: "error", Error: fmt.Sprintf("请求失败: %s", reqErr.Error())})
 		return
 	}
@@ -94,17 +97,13 @@ func (h *Handler) TestConnection(c *gin.Context) {
 			proxy.SyncCodexUsageState(h.store, account, resp)
 		}
 		errBody, _ := io.ReadAll(resp.Body)
-		switch resp.StatusCode {
-		case http.StatusUnauthorized:
-			if isOpenAIResponsesAccount {
-				h.store.MarkError(account, fmt.Sprintf("连接测试上游返回 %d: %s", resp.StatusCode, truncate(string(errBody), 300)))
-			} else {
+		if isOpenAIResponsesAccount {
+			h.applyAPIAccountConnectionTestFailure(account, resp.StatusCode, errBody, resp, testModel, time.Since(start))
+		} else {
+			switch resp.StatusCode {
+			case http.StatusUnauthorized:
 				h.store.MarkCooldown(account, 24*time.Hour, "unauthorized")
-			}
-		case http.StatusTooManyRequests:
-			if isOpenAIResponsesAccount {
-				h.store.MarkCooldown(account, time.Minute, "rate_limited")
-			} else {
+			case http.StatusTooManyRequests:
 				proxy.Apply429Cooldown(h.store, account, errBody, resp, testModel)
 			}
 		}
@@ -496,6 +495,16 @@ func (h *Handler) connectionTestModelForAccount(ctx context.Context, account *au
 	}
 
 	models := account.OpenAIResponsesModels()
+	if len(models) == 0 {
+		if requested == "" {
+			return h.connectionTestModel(ctx), nil
+		}
+		if !isTextConnectionModel(requested) {
+			return "", fmt.Errorf("不支持的测试模型: %s", requested)
+		}
+		return requested, nil
+	}
+
 	textModels := make([]string, 0, len(models))
 	for _, model := range models {
 		if isTextConnectionModel(model) {
@@ -626,7 +635,11 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				resp, err = proxy.ExecuteRequest(context.Background(), acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
 			}
 			if err != nil {
-				h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
+				if isOpenAIResponsesAccount {
+					h.store.ReportRequestFailure(acc, apiProbeTransportFailureKind(err), 0)
+				} else {
+					h.store.MarkError(acc, "批量测试请求失败: "+err.Error())
+				}
 				atomic.AddInt64(&failedCount, 1)
 				return
 			}
@@ -648,7 +661,7 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				atomic.AddInt64(&successCount, 1)
 			case http.StatusUnauthorized:
 				if isOpenAIResponsesAccount {
-					h.store.MarkError(acc, fmt.Sprintf("批量测试上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+					h.applyAPIAccountConnectionTestFailure(acc, resp.StatusCode, body, resp, testModel, 0)
 					atomic.AddInt64(&failedCount, 1)
 				} else {
 					proxy.SyncCodexUsageState(h.store, acc, resp)
@@ -657,12 +670,26 @@ func (h *Handler) BatchTest(c *gin.Context) {
 				}
 			case http.StatusTooManyRequests:
 				if isOpenAIResponsesAccount {
-					h.store.MarkCooldown(acc, time.Minute, "rate_limited")
+					h.applyAPIAccountConnectionTestFailure(acc, resp.StatusCode, body, resp, testModel, 0)
 				} else {
 					proxy.SyncCodexUsageState(h.store, acc, resp)
 					proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
 				}
 				atomic.AddInt64(&rateLimitCount, 1)
+			case http.StatusPaymentRequired, http.StatusForbidden:
+				if isOpenAIResponsesAccount {
+					_, rateLimited := h.applyAPIAccountConnectionTestFailure(acc, resp.StatusCode, body, resp, testModel, 0)
+					if rateLimited {
+						atomic.AddInt64(&rateLimitCount, 1)
+					} else {
+						atomic.AddInt64(&failedCount, 1)
+					}
+				} else {
+					if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
+						h.store.MarkError(acc, fmt.Sprintf("批量测试上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
+					}
+					atomic.AddInt64(&failedCount, 1)
+				}
 			default:
 				if shouldMarkBatchTestAccountError(resp.StatusCode, body) {
 					h.store.MarkError(acc, fmt.Sprintf("批量测试上游返回 %d: %s", resp.StatusCode, truncate(string(body), 300)))
@@ -681,6 +708,42 @@ func (h *Handler) BatchTest(c *gin.Context) {
 		"banned":       bannedCount,
 		"rate_limited": rateLimitCount,
 	})
+}
+
+func (h *Handler) applyAPIAccountConnectionTestFailure(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string, latency time.Duration) (handled bool, rateLimited bool) {
+	if h == nil || h.store == nil || account == nil || !account.IsOpenAIResponsesAPI() {
+		return false, false
+	}
+
+	switch statusCode {
+	case http.StatusUnauthorized:
+		h.store.ReportRequestFailure(account, "unauthorized", latency)
+		h.store.MarkCooldown(account, h.store.GetAPIAccountCooldown(), "unauthorized")
+		return true, false
+	case http.StatusTooManyRequests:
+		h.store.ReportRequestFailure(account, "client", latency)
+		proxy.Apply429Cooldown(h.store, account, body, resp, model)
+		return true, true
+	case http.StatusPaymentRequired, http.StatusForbidden:
+		h.store.ReportRequestFailure(account, "client", latency)
+		reason := "quota_unavailable"
+		rateLimited := true
+		if proxy.IsDeactivatedWorkspaceError(body) {
+			reason = "subscription_unavailable"
+		} else if statusCode == http.StatusForbidden && !apiProbeBodyLooksQuotaLimited(body) {
+			reason = "unauthorized"
+			rateLimited = false
+		}
+		h.store.MarkCooldown(account, h.store.GetAPIAccountCooldown(), reason)
+		return true, rateLimited
+	default:
+		if statusCode >= 500 {
+			h.store.ReportRequestFailure(account, "server", latency)
+		} else if statusCode >= 400 {
+			h.store.ReportRequestFailure(account, "client", latency)
+		}
+		return false, false
+	}
 }
 
 func shouldMarkBatchTestAccountError(statusCode int, body []byte) bool {

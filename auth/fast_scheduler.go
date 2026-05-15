@@ -371,6 +371,7 @@ func (a *Account) fastSchedulerSnapshot(baseLimit int64, now time.Time) (Account
 		}
 		limit = concurrencyLimitForTier(baseConcurrencyEffective, tier)
 	}
+	limit = recoveryGuardedConcurrencyLimit(limit, a.RecoveryGuardUntil, now)
 
 	available := a.Status != StatusError && tier != HealthTierBanned && a.hasDispatchCredentialLocked()
 	if atomic.LoadInt32(&a.ManualDisabled) != 0 {

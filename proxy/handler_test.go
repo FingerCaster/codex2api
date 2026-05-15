@@ -527,6 +527,46 @@ func TestDeactivatedWorkspace402MarksAccountError(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesUnauthorizedUsesShortCooldownEvenWithAutoClean(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                   2,
+		TestConcurrency:                  1,
+		TestModel:                        "gpt-5.4",
+		APIAccountCooldownMinutes:        2,
+		AutoCleanUnauthorized:            true,
+		MaxRateLimitRetries:              1,
+		RecoveryProbeIntervalMinutes:     30,
+		BackgroundRefreshIntervalMinutes: 2,
+		UsageProbeMaxAgeMinutes:          10,
+	})
+	account := &auth.Account{
+		DBID:         42,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://api.example.com",
+		APIKey:       "sk-test",
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+	}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	handler.applyCooldownForModel(account, http.StatusUnauthorized, []byte(`{"error":{"message":"invalid api key"}}`), &http.Response{Header: make(http.Header)}, "gpt-5.4")
+
+	if got := store.FindByID(account.DBID); got == nil {
+		t.Fatal("API account was removed despite short cooldown policy")
+	}
+	reason, until := account.GetCooldownSnapshot()
+	if reason != "unauthorized" {
+		t.Fatalf("CooldownReason = %q, want unauthorized", reason)
+	}
+	if until.IsZero() || time.Until(until) > 3*time.Minute {
+		t.Fatalf("CooldownUtil = %v, want short API cooldown", until)
+	}
+	if !account.NeedsRecoveryProbe(time.Minute) {
+		t.Fatal("API account should be eligible for recovery probe after unauthorized short cooldown")
+	}
+}
+
 func TestSendFinalUpstreamError_UsageLimitRewrites429(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

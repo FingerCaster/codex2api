@@ -1372,6 +1372,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			upstreamEndpoint := "/v1/responses"
 			if isGenericProvider {
 				upstreamEndpoint = inboundEndpoint
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)
 			} else {
 				h.logUpstreamCyberPolicy(c, inboundEndpoint, requestModel, errBody)
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, requestModel)

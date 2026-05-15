@@ -374,6 +374,14 @@ export default function Settings() {
     background_refresh_interval_minutes: 2,
     usage_probe_max_age_minutes: 10,
     recovery_probe_interval_minutes: 30,
+    api_account_circuit_breaker_enabled: true,
+    api_account_failure_rate_threshold: 80,
+    api_account_failure_min_samples: 20,
+    api_account_cooldown_minutes: 2,
+    api_account_recovery_probe_interval_minutes: 1,
+    api_account_recovery_probe_successes: 1,
+    api_account_recovery_direct_healthy: true,
+    api_account_recovery_guard_minutes: 1,
     session_affinity_ttl_minutes: 60,
     pg_max_conns: 50,
     redis_pool_size: 30,
@@ -730,6 +738,74 @@ export default function Settings() {
                     value={settingsForm.fast_scheduler_enabled ? 'true' : 'false'}
                     onValueChange={(value) => setSettingsForm((f) => ({ ...f, fast_scheduler_enabled: value === 'true' }))}
                     options={booleanOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.apiAccountCircuitBreaker')} description={t('settings.apiAccountCircuitBreakerDesc')}>
+                  <Select
+                    value={settingsForm.api_account_circuit_breaker_enabled ? 'true' : 'false'}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, api_account_circuit_breaker_enabled: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.apiAccountFailureRateThreshold')} description={t('settings.apiAccountFailureRateThresholdDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={settingsForm.api_account_failure_rate_threshold}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, api_account_failure_rate_threshold: parseInt(e.target.value) || 80 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.apiAccountFailureMinSamples')} description={t('settings.apiAccountFailureMinSamplesDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={settingsForm.api_account_failure_min_samples}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, api_account_failure_min_samples: parseInt(e.target.value) || 20 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.apiAccountCooldown')} description={t('settings.apiAccountCooldownDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={1440}
+                    value={settingsForm.api_account_cooldown_minutes}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, api_account_cooldown_minutes: parseInt(e.target.value) || 2 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.apiAccountRecoveryProbeInterval')} description={t('settings.apiAccountRecoveryProbeIntervalDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={10080}
+                    value={settingsForm.api_account_recovery_probe_interval_minutes}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, api_account_recovery_probe_interval_minutes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.apiAccountRecoveryProbeSuccesses')} description={t('settings.apiAccountRecoveryProbeSuccessesDesc')}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={10}
+                    value={settingsForm.api_account_recovery_probe_successes}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, api_account_recovery_probe_successes: parseInt(e.target.value) || 1 }))}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.apiAccountRecoveryDirectHealthy')} description={t('settings.apiAccountRecoveryDirectHealthyDesc')}>
+                  <Select
+                    value={settingsForm.api_account_recovery_direct_healthy ? 'true' : 'false'}
+                    onValueChange={(value) => setSettingsForm((f) => ({ ...f, api_account_recovery_direct_healthy: value === 'true' }))}
+                    options={booleanOptions}
+                  />
+                </SettingField>
+                <SettingField label={t('settings.apiAccountRecoveryGuard')} description={t('settings.apiAccountRecoveryGuardDesc')}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={1440}
+                    value={settingsForm.api_account_recovery_guard_minutes}
+                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, api_account_recovery_guard_minutes: parseInt(e.target.value) || 0 }))}
                   />
                 </SettingField>
               </div>

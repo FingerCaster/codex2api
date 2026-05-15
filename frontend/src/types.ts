@@ -36,7 +36,6 @@ export interface AccountRow {
   at_only?: boolean
   account_type?: string
   openai_responses_api?: boolean
-  base_url?: string
   models?: string[]
   health_tier?: string
   scheduler_score?: number
@@ -294,6 +293,14 @@ export interface SystemSettings {
   background_refresh_interval_minutes: number
   usage_probe_max_age_minutes: number
   recovery_probe_interval_minutes: number
+  api_account_circuit_breaker_enabled: boolean
+  api_account_failure_rate_threshold: number
+  api_account_failure_min_samples: number
+  api_account_cooldown_minutes: number
+  api_account_recovery_probe_interval_minutes: number
+  api_account_recovery_probe_successes: number
+  api_account_recovery_direct_healthy: boolean
+  api_account_recovery_guard_minutes: number
   session_affinity_ttl_minutes: number
   proxy_url?: string
   pg_max_conns: number

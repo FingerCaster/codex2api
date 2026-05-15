@@ -1,0 +1,45 @@
+feature: 2026-05-15-api-account-cooldown-recovery
+created: 2026-05-15
+
+steps:
+  - action: "配置与状态骨架：新增 settings 字段、Store 配置方法和 Account 恢复保护状态"
+    exit_signal: "数据库 settings 读写、默认值和 admin API 编译通过"
+    status: done
+  - action: "冷却触发计算：接入明确账号级错误与高失败率短冷却"
+    exit_signal: "server/timeout 普通失败只降权，高失败率才 cooldown"
+    status: done
+  - action: "恢复探测：让 API 账号进入恢复 probe，成功后清理冷却并进入保护窗口"
+    exit_signal: "API 账号 cooldown 后不进调度，probe 成功后恢复"
+    status: done
+  - action: "前端设置：类型、默认表单和设置页字段接入"
+    exit_signal: "TypeScript 类型检查通过"
+    status: done
+  - action: "测试覆盖：补 Store、429/settings、probe 相关测试"
+    exit_signal: "目标 Go 测试、前端构建/类型检查通过"
+    status: done
+
+checks:
+  - item: "新增系统设置字段可通过 admin settings API 读写"
+    source: 名词契约
+    status: passed
+  - item: "账号级、模型级、恢复探测三个冷却路径复用现有调度状态"
+    source: 编排骨架
+    status: passed
+  - item: "普通 5xx/timeout/transport 先降权，高失败率才短冷却"
+    source: 流程级约束
+    status: passed
+  - item: "冷却账号不进入正常调度池"
+    source: 验收场景
+    status: passed
+  - item: "API 账号 probe 成功后清除 cooldown 和失败计数"
+    source: 验收场景
+    status: passed
+  - item: "恢复保护窗口内并发限制为 1"
+    source: 验收场景
+    status: passed
+  - item: "不把普通 5xx/timeout 单次失败标记 error"
+    source: 范围守护
+    status: passed
+  - item: "不改变模型级 cooldown 表和主键"
+    source: 范围守护
+    status: passed

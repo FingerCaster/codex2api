@@ -1384,6 +1384,31 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 	}
 }
 
+func isAPIAccountQuotaUnavailableError(statusCode int, body []byte) bool {
+	if statusCode == http.StatusPaymentRequired {
+		return true
+	}
+	if statusCode != http.StatusForbidden {
+		return false
+	}
+	if IsDeactivatedWorkspaceError(body) {
+		return true
+	}
+	joined := strings.ToLower(strings.Join([]string{
+		gjson.GetBytes(body, "error.type").String(),
+		gjson.GetBytes(body, "error.code").String(),
+		gjson.GetBytes(body, "error.message").String(),
+		gjson.GetBytes(body, "message").String(),
+		string(body),
+	}, " "))
+	for _, needle := range []string{"quota", "credit", "billing", "subscription", "insufficient", "exhausted", "limit"} {
+		if strings.Contains(joined, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
 	if len(body) == 0 {
 		return usageLimitDetails{}, false
@@ -2303,6 +2328,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 			if !isGenericProvider {
 				h.logUpstreamCyberPolicy(c, "/v1/responses/compact", model, errBody)
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
+			} else {
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			}
 			shouldRetry := shouldRetryHTTPStatus(resp.StatusCode, &generalRetries, &rateLimitRetries, maxRetries, maxRateLimitRetries)
 			h.logUsageForRequest(c, &database.UsageLogInput{
@@ -2578,6 +2605,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			upstreamEndpoint := "/v1/responses"
 			if account.IsOpenAIResponsesAPI() {
 				upstreamEndpoint = "/v1/chat/completions"
+				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
 			} else {
 				h.logUpstreamCyberPolicy(c, "/v1/chat/completions", model, errBody)
 				decision = h.applyCooldownForModel(account, resp.StatusCode, errBody, resp, effectiveModel)
@@ -3207,6 +3235,11 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 		// 原子标志瞬间置位，阻止其他并发请求再选到该账号
 		atomic.StoreInt32(&account.Disabled, 1)
 
+		if account.IsOpenAIResponsesAPI() {
+			h.store.MarkCooldown(account, h.store.GetAPIAccountCooldown(), "unauthorized")
+			return codex429Decision{}
+		}
+
 		if isMissingScopeUnauthorized(body) {
 			log.Printf("账号 %d 收到 missing_scope 401，保留在号池", account.ID())
 			atomic.StoreInt32(&account.Disabled, 0)
@@ -3227,6 +3260,18 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 			h.store.MarkCooldown(account, 5*time.Minute, "unauthorized")
 		}
 	case http.StatusPaymentRequired, http.StatusForbidden:
+		if account.IsOpenAIResponsesAPI() {
+			if IsDeactivatedWorkspaceError(body) {
+				log.Printf("API 账号 %d 工作区已停用，进入短冷却", account.ID())
+				h.store.MarkCooldown(account, h.store.GetAPIAccountCooldown(), "subscription_unavailable")
+				return codex429Decision{}
+			}
+			if isAPIAccountQuotaUnavailableError(statusCode, body) {
+				log.Printf("API 账号 %d 额度/订阅不可用，进入短冷却", account.ID())
+				h.store.MarkCooldown(account, h.store.GetAPIAccountCooldown(), "quota_unavailable")
+				return codex429Decision{}
+			}
+		}
 		if IsDeactivatedWorkspaceError(body) {
 			log.Printf("账号 %d 工作区已停用，标记为错误", account.ID())
 			if h.store != nil {

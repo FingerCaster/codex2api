@@ -253,32 +253,40 @@ func TestSQLiteSystemSettingsPersistsSessionAffinityTTL(t *testing.T) {
 
 	ctx := context.Background()
 	err = db.UpdateSystemSettings(ctx, &SystemSettings{
-		SiteName:                         DefaultSiteName,
-		MaxConcurrency:                   2,
-		GlobalRPM:                        0,
-		TestModel:                        "gpt-5.4",
-		TestConcurrency:                  50,
-		PgMaxConns:                       50,
-		RedisPoolSize:                    30,
-		BackgroundRefreshIntervalMinutes: 2,
-		UsageProbeMaxAgeMinutes:          10,
-		RecoveryProbeIntervalMinutes:     30,
-		SessionAffinityTTLMinutes:        45,
-		PromptFilterMode:                 "monitor",
-		PromptFilterThreshold:            50,
-		PromptFilterStrictThreshold:      90,
-		PromptFilterLogMatches:           true,
-		PromptFilterMaxTextLength:        81920,
-		PromptFilterCustomPatterns:       "[]",
-		PromptFilterDisabledPatterns:     "[]",
-		ClientCompatMode:                 "preserve",
-		CodexMinCLIVersion:               "0.118.0",
-		UsageLogMode:                     UsageLogModeFull,
-		UsageLogBatchSize:                200,
-		UsageLogFlushIntervalSeconds:     5,
-		StreamFlushPolicy:                "immediate",
-		StreamFlushIntervalMS:            20,
-		ImageStorageConfig:               "{}",
+		SiteName:                               DefaultSiteName,
+		MaxConcurrency:                         2,
+		GlobalRPM:                              0,
+		TestModel:                              "gpt-5.4",
+		TestConcurrency:                        50,
+		PgMaxConns:                             50,
+		RedisPoolSize:                          30,
+		BackgroundRefreshIntervalMinutes:       2,
+		UsageProbeMaxAgeMinutes:                10,
+		RecoveryProbeIntervalMinutes:           30,
+		APIAccountCircuitBreakerEnabled:        true,
+		APIAccountFailureRateThreshold:         75,
+		APIAccountFailureMinSamples:            12,
+		APIAccountCooldownMinutes:              3,
+		APIAccountRecoveryProbeIntervalMinutes: 2,
+		APIAccountRecoveryProbeSuccesses:       2,
+		APIAccountRecoveryDirectHealthy:        false,
+		APIAccountRecoveryGuardMinutes:         4,
+		SessionAffinityTTLMinutes:              45,
+		PromptFilterMode:                       "monitor",
+		PromptFilterThreshold:                  50,
+		PromptFilterStrictThreshold:            90,
+		PromptFilterLogMatches:                 true,
+		PromptFilterMaxTextLength:              81920,
+		PromptFilterCustomPatterns:             "[]",
+		PromptFilterDisabledPatterns:           "[]",
+		ClientCompatMode:                       "preserve",
+		CodexMinCLIVersion:                     "0.118.0",
+		UsageLogMode:                           UsageLogModeFull,
+		UsageLogBatchSize:                      200,
+		UsageLogFlushIntervalSeconds:           5,
+		StreamFlushPolicy:                      "immediate",
+		StreamFlushIntervalMS:                  20,
+		ImageStorageConfig:                     "{}",
 	})
 	if err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
@@ -293,6 +301,30 @@ func TestSQLiteSystemSettingsPersistsSessionAffinityTTL(t *testing.T) {
 	}
 	if settings.SessionAffinityTTLMinutes != 45 {
 		t.Fatalf("SessionAffinityTTLMinutes = %d, want 45", settings.SessionAffinityTTLMinutes)
+	}
+	if !settings.APIAccountCircuitBreakerEnabled {
+		t.Fatal("APIAccountCircuitBreakerEnabled = false, want true")
+	}
+	if settings.APIAccountFailureRateThreshold != 75 {
+		t.Fatalf("APIAccountFailureRateThreshold = %d, want 75", settings.APIAccountFailureRateThreshold)
+	}
+	if settings.APIAccountFailureMinSamples != 12 {
+		t.Fatalf("APIAccountFailureMinSamples = %d, want 12", settings.APIAccountFailureMinSamples)
+	}
+	if settings.APIAccountCooldownMinutes != 3 {
+		t.Fatalf("APIAccountCooldownMinutes = %d, want 3", settings.APIAccountCooldownMinutes)
+	}
+	if settings.APIAccountRecoveryProbeIntervalMinutes != 2 {
+		t.Fatalf("APIAccountRecoveryProbeIntervalMinutes = %d, want 2", settings.APIAccountRecoveryProbeIntervalMinutes)
+	}
+	if settings.APIAccountRecoveryProbeSuccesses != 2 {
+		t.Fatalf("APIAccountRecoveryProbeSuccesses = %d, want 2", settings.APIAccountRecoveryProbeSuccesses)
+	}
+	if settings.APIAccountRecoveryDirectHealthy {
+		t.Fatal("APIAccountRecoveryDirectHealthy = true, want false")
+	}
+	if settings.APIAccountRecoveryGuardMinutes != 4 {
+		t.Fatalf("APIAccountRecoveryGuardMinutes = %d, want 4", settings.APIAccountRecoveryGuardMinutes)
 	}
 }
 

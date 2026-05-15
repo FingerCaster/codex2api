@@ -631,6 +631,14 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS background_refresh_interval_minutes INT DEFAULT 2;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS usage_probe_max_age_minutes INT DEFAULT 10;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS recovery_probe_interval_minutes INT DEFAULT 30;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS api_account_circuit_breaker_enabled BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS api_account_failure_rate_threshold INT DEFAULT 80;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS api_account_failure_min_samples INT DEFAULT 20;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS api_account_cooldown_minutes INT DEFAULT 2;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS api_account_recovery_probe_interval_minutes INT DEFAULT 1;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS api_account_recovery_probe_successes INT DEFAULT 1;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS api_account_recovery_direct_healthy BOOLEAN DEFAULT TRUE;
+	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS api_account_recovery_guard_minutes INT DEFAULT 1;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS session_affinity_ttl_minutes INT DEFAULT 0;
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_url TEXT DEFAULT '';
 	ALTER TABLE system_settings ADD COLUMN IF NOT EXISTS resin_platform_name TEXT DEFAULT '';
@@ -1081,50 +1089,58 @@ func NormalizeSiteName(value string) string {
 
 // SystemSettings 运行时设置项
 type SystemSettings struct {
-	SiteName                         string
-	SiteLogo                         string
-	MaxConcurrency                   int
-	GlobalRPM                        int
-	TestModel                        string
-	TestConcurrency                  int
-	ProxyURL                         string
-	PgMaxConns                       int
-	RedisPoolSize                    int
-	AutoCleanUnauthorized            bool
-	AutoCleanRateLimited             bool
-	AdminSecret                      string
-	AutoCleanFullUsage               bool
-	AutoCleanError                   bool
-	AutoCleanExpired                 bool
-	ProxyPoolEnabled                 bool
-	FastSchedulerEnabled             bool
-	MaxRetries                       int
-	MaxRateLimitRetries              int
-	AllowRemoteMigration             bool
-	ModelMapping                     string // JSON: {"anthropic_model": "codex_model", ...}
-	BackgroundRefreshIntervalMinutes int
-	UsageProbeMaxAgeMinutes          int
-	RecoveryProbeIntervalMinutes     int
-	SessionAffinityTTLMinutes        int
-	ResinURL                         string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
-	ResinPlatformName                string // Resin 平台标识，例如 codex2api
-	PromptFilterEnabled              bool
-	PromptFilterMode                 string
-	PromptFilterThreshold            int
-	PromptFilterStrictThreshold      int
-	PromptFilterLogMatches           bool
-	PromptFilterMaxTextLength        int
-	PromptFilterSensitiveWords       string
-	PromptFilterCustomPatterns       string
-	PromptFilterDisabledPatterns     string
-	ClientCompatMode                 string
-	CodexMinCLIVersion               string
-	UsageLogMode                     string
-	UsageLogBatchSize                int
-	UsageLogFlushIntervalSeconds     int
-	StreamFlushPolicy                string
-	StreamFlushIntervalMS            int
-	ImageStorageConfig               string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
+	SiteName                               string
+	SiteLogo                               string
+	MaxConcurrency                         int
+	GlobalRPM                              int
+	TestModel                              string
+	TestConcurrency                        int
+	ProxyURL                               string
+	PgMaxConns                             int
+	RedisPoolSize                          int
+	AutoCleanUnauthorized                  bool
+	AutoCleanRateLimited                   bool
+	AdminSecret                            string
+	AutoCleanFullUsage                     bool
+	AutoCleanError                         bool
+	AutoCleanExpired                       bool
+	ProxyPoolEnabled                       bool
+	FastSchedulerEnabled                   bool
+	MaxRetries                             int
+	MaxRateLimitRetries                    int
+	AllowRemoteMigration                   bool
+	ModelMapping                           string // JSON: {"anthropic_model": "codex_model", ...}
+	BackgroundRefreshIntervalMinutes       int
+	UsageProbeMaxAgeMinutes                int
+	RecoveryProbeIntervalMinutes           int
+	APIAccountCircuitBreakerEnabled        bool
+	APIAccountFailureRateThreshold         int
+	APIAccountFailureMinSamples            int
+	APIAccountCooldownMinutes              int
+	APIAccountRecoveryProbeIntervalMinutes int
+	APIAccountRecoveryProbeSuccesses       int
+	APIAccountRecoveryDirectHealthy        bool
+	APIAccountRecoveryGuardMinutes         int
+	SessionAffinityTTLMinutes              int
+	ResinURL                               string // Resin 代理池地址（含 Token），例如 http://127.0.0.1:2260/my-token
+	ResinPlatformName                      string // Resin 平台标识，例如 codex2api
+	PromptFilterEnabled                    bool
+	PromptFilterMode                       string
+	PromptFilterThreshold                  int
+	PromptFilterStrictThreshold            int
+	PromptFilterLogMatches                 bool
+	PromptFilterMaxTextLength              int
+	PromptFilterSensitiveWords             string
+	PromptFilterCustomPatterns             string
+	PromptFilterDisabledPatterns           string
+	ClientCompatMode                       string
+	CodexMinCLIVersion                     string
+	UsageLogMode                           string
+	UsageLogBatchSize                      int
+	UsageLogFlushIntervalSeconds           int
+	StreamFlushPolicy                      string
+	StreamFlushIntervalMS                  int
+	ImageStorageConfig                     string // JSON: {"backend":"s3","endpoint":"...","region":"...","bucket":"...","access_key":"...","secret_key":"...","prefix":"...","force_path_style":false}
 }
 
 // GetSystemSettings 加载全局设置
@@ -1145,6 +1161,14 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		       COALESCE(background_refresh_interval_minutes, 2),
 		       COALESCE(usage_probe_max_age_minutes, 10),
 		       COALESCE(recovery_probe_interval_minutes, 30),
+		       COALESCE(api_account_circuit_breaker_enabled, true),
+		       COALESCE(api_account_failure_rate_threshold, 80),
+		       COALESCE(api_account_failure_min_samples, 20),
+		       COALESCE(api_account_cooldown_minutes, 2),
+		       COALESCE(api_account_recovery_probe_interval_minutes, 1),
+		       COALESCE(api_account_recovery_probe_successes, 1),
+		       COALESCE(api_account_recovery_direct_healthy, true),
+		       COALESCE(api_account_recovery_guard_minutes, 1),
 		       COALESCE(session_affinity_ttl_minutes, 0),
 		       COALESCE(resin_url, ''),
 		       COALESCE(resin_platform_name, ''),
@@ -1172,7 +1196,10 @@ func (db *DB) GetSystemSettings(ctx context.Context) (*SystemSettings, error) {
 		&s.AutoCleanUnauthorized, &s.AutoCleanRateLimited, &s.AdminSecret, &s.AutoCleanFullUsage,
 		&s.ProxyPoolEnabled, &s.FastSchedulerEnabled, &s.MaxRetries, &s.MaxRateLimitRetries, &s.AllowRemoteMigration,
 		&s.AutoCleanError, &s.AutoCleanExpired, &s.ModelMapping,
-		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes, &s.SessionAffinityTTLMinutes,
+		&s.BackgroundRefreshIntervalMinutes, &s.UsageProbeMaxAgeMinutes, &s.RecoveryProbeIntervalMinutes,
+		&s.APIAccountCircuitBreakerEnabled, &s.APIAccountFailureRateThreshold, &s.APIAccountFailureMinSamples,
+		&s.APIAccountCooldownMinutes, &s.APIAccountRecoveryProbeIntervalMinutes, &s.APIAccountRecoveryProbeSuccesses,
+		&s.APIAccountRecoveryDirectHealthy, &s.APIAccountRecoveryGuardMinutes, &s.SessionAffinityTTLMinutes,
 		&s.ResinURL, &s.ResinPlatformName,
 		&s.PromptFilterEnabled, &s.PromptFilterMode, &s.PromptFilterThreshold, &s.PromptFilterStrictThreshold,
 		&s.PromptFilterLogMatches, &s.PromptFilterMaxTextLength, &s.PromptFilterSensitiveWords,
@@ -1196,7 +1223,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				id, site_name, site_logo, max_concurrency, global_rpm, test_model, test_concurrency, proxy_url, pg_max_conns, redis_pool_size,
 				auto_clean_unauthorized, auto_clean_rate_limited, admin_secret, auto_clean_full_usage, proxy_pool_enabled,
 				fast_scheduler_enabled, max_retries, max_rate_limit_retries, allow_remote_migration, auto_clean_error, auto_clean_expired, model_mapping,
-				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes, session_affinity_ttl_minutes,
+				background_refresh_interval_minutes, usage_probe_max_age_minutes, recovery_probe_interval_minutes,
+				api_account_circuit_breaker_enabled, api_account_failure_rate_threshold, api_account_failure_min_samples,
+				api_account_cooldown_minutes, api_account_recovery_probe_interval_minutes, api_account_recovery_probe_successes,
+				api_account_recovery_direct_healthy, api_account_recovery_guard_minutes, session_affinity_ttl_minutes,
 				resin_url, resin_platform_name, prompt_filter_enabled, prompt_filter_mode, prompt_filter_threshold,
 				prompt_filter_strict_threshold, prompt_filter_log_matches, prompt_filter_max_text_length,
 				prompt_filter_sensitive_words, prompt_filter_custom_patterns, prompt_filter_disabled_patterns,
@@ -1204,7 +1234,7 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				usage_log_flush_interval_seconds, stream_flush_policy, stream_flush_interval_ms,
 				image_storage_config
 			)
-			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44)
+			VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52)
 			ON CONFLICT (id) DO UPDATE SET
 				site_name               = EXCLUDED.site_name,
 				site_logo               = EXCLUDED.site_logo,
@@ -1230,6 +1260,14 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 				background_refresh_interval_minutes = EXCLUDED.background_refresh_interval_minutes,
 				usage_probe_max_age_minutes = EXCLUDED.usage_probe_max_age_minutes,
 				recovery_probe_interval_minutes = EXCLUDED.recovery_probe_interval_minutes,
+				api_account_circuit_breaker_enabled = EXCLUDED.api_account_circuit_breaker_enabled,
+				api_account_failure_rate_threshold = EXCLUDED.api_account_failure_rate_threshold,
+				api_account_failure_min_samples = EXCLUDED.api_account_failure_min_samples,
+				api_account_cooldown_minutes = EXCLUDED.api_account_cooldown_minutes,
+				api_account_recovery_probe_interval_minutes = EXCLUDED.api_account_recovery_probe_interval_minutes,
+				api_account_recovery_probe_successes = EXCLUDED.api_account_recovery_probe_successes,
+				api_account_recovery_direct_healthy = EXCLUDED.api_account_recovery_direct_healthy,
+				api_account_recovery_guard_minutes = EXCLUDED.api_account_recovery_guard_minutes,
 				session_affinity_ttl_minutes = EXCLUDED.session_affinity_ttl_minutes,
 				resin_url               = EXCLUDED.resin_url,
 				resin_platform_name     = EXCLUDED.resin_platform_name,
@@ -1254,7 +1292,10 @@ func (db *DB) UpdateSystemSettings(ctx context.Context, s *SystemSettings) error
 		s.MaxConcurrency, s.GlobalRPM, s.TestModel, s.TestConcurrency, s.ProxyURL, s.PgMaxConns, s.RedisPoolSize,
 		s.AutoCleanUnauthorized, s.AutoCleanRateLimited, s.AdminSecret, s.AutoCleanFullUsage, s.ProxyPoolEnabled,
 		s.FastSchedulerEnabled, s.MaxRetries, s.MaxRateLimitRetries, s.AllowRemoteMigration, s.AutoCleanError, s.AutoCleanExpired, s.ModelMapping,
-		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes, s.SessionAffinityTTLMinutes,
+		s.BackgroundRefreshIntervalMinutes, s.UsageProbeMaxAgeMinutes, s.RecoveryProbeIntervalMinutes,
+		s.APIAccountCircuitBreakerEnabled, s.APIAccountFailureRateThreshold, s.APIAccountFailureMinSamples,
+		s.APIAccountCooldownMinutes, s.APIAccountRecoveryProbeIntervalMinutes, s.APIAccountRecoveryProbeSuccesses,
+		s.APIAccountRecoveryDirectHealthy, s.APIAccountRecoveryGuardMinutes, s.SessionAffinityTTLMinutes,
 		s.ResinURL, s.ResinPlatformName, s.PromptFilterEnabled, s.PromptFilterMode, s.PromptFilterThreshold,
 		s.PromptFilterStrictThreshold, s.PromptFilterLogMatches, s.PromptFilterMaxTextLength,
 		s.PromptFilterSensitiveWords, s.PromptFilterCustomPatterns, s.PromptFilterDisabledPatterns,
@@ -2006,29 +2047,35 @@ func (db *DB) GetUsageStatsByAPIKey(ctx context.Context, apiKeyID *int64) (*Usag
 			COALESCE(SUM(cached_tokens), 0) AS today_cached,
 			COALESCE(SUM(account_billed), 0) AS today_account_billed,
 			COALESCE(SUM(user_billed), 0) AS today_user_billed,
-			COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime($2) THEN 1 ELSE 0 END), 0) AS rpm,
-			COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime($2) THEN total_tokens ELSE 0 END), 0) AS tpm,
+			COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime(?) THEN 1 ELSE 0 END), 0) AS rpm,
+			COALESCE(SUM(CASE WHEN datetime(created_at) >= datetime(?) THEN total_tokens ELSE 0 END), 0) AS tpm,
 			COALESCE(AVG(NULLIF(first_token_ms, 0)), 0) AS avg_first_token_ms,
 			COALESCE(AVG(duration_ms), 0) AS avg_duration_ms,
 			COALESCE(SUM(CASE WHEN cached_tokens > 0 THEN 1 ELSE 0 END), 0) AS today_cache_hit_requests,
 			COALESCE(SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END), 0) AS today_errors
 		FROM usage_logs
-		WHERE datetime(created_at) >= datetime($1)
+		WHERE datetime(created_at) >= datetime(?)
 		  AND status_code <> 499
 		`
-		queryArgs = []interface{}{todayStart.Format(time.RFC3339), minuteAgo.Format(time.RFC3339)}
+		queryArgs = []interface{}{minuteAgo.Format(time.RFC3339), minuteAgo.Format(time.RFC3339), todayStart.Format(time.RFC3339)}
 	}
 	if apiKeyID != nil {
-		paramIdx := len(queryArgs) + 1
-		todayQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", paramIdx)
+		if db.isSQLite() {
+			todayQuery += " AND COALESCE(api_key_id, 0) = ?"
+			totalQuery += " AND COALESCE(api_key_id, 0) = ?"
+			currentQuery += " AND COALESCE(api_key_id, 0) = ?"
+		} else {
+			paramIdx := len(queryArgs) + 1
+			todayQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", paramIdx)
+
+			totalParamIdx := len(totalArgs) + 1
+			totalQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", totalParamIdx)
+
+			currentParamIdx := len(currentArgs) + 1
+			currentQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", currentParamIdx)
+		}
 		queryArgs = append(queryArgs, *apiKeyID)
-
-		totalParamIdx := len(totalArgs) + 1
-		totalQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", totalParamIdx)
 		totalArgs = append(totalArgs, *apiKeyID)
-
-		currentParamIdx := len(currentArgs) + 1
-		currentQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", currentParamIdx)
 		currentArgs = append(currentArgs, *apiKeyID)
 	}
 
@@ -2082,7 +2129,11 @@ func (db *DB) GetUsageStatsByAPIKey(ctx context.Context, apiKeyID *int64) (*Usag
 			WHERE status_code <> 499
 		`
 	if apiKeyID != nil {
-		currentQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", len(currentArgs)+1)
+		if db.isSQLite() {
+			currentQuery += " AND COALESCE(api_key_id, 0) = ?"
+		} else {
+			currentQuery += fmt.Sprintf(" AND COALESCE(api_key_id, 0) = $%d", len(currentArgs))
+		}
 	}
 	err = db.conn.QueryRowContext(ctx, currentQuery, currentArgs...).Scan(&visibleTotal, &currentTokens, &currentPrompt, &currentCompletion, &currentCached, &visibleCacheHitRequests, &currentFirstTokenMsSum, &visibleFirstTokenSamples, &currentAccountBilled, &currentUserBilled)
 	if err != nil {
