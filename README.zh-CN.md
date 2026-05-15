@@ -288,6 +288,7 @@ Vite 会自动代理 `/api` 和 `/health` 到后端，开发时访问 `http://lo
 | --- | --- |
 | `CODEX_PORT` | HTTP 端口，默认 `8080` |
 | `ADMIN_SECRET` | 管理后台登录密钥；设置后首次访问 `/admin` 会弹出密码输入框 |
+| `BOOTSTRAP_ALLOWED_CIDR` | 允许执行首次初始化的客户端 CIDR；未设置 `ADMIN_SECRET` 且从 Docker 网关或远程浏览器初始化时需要配置 |
 | `DATABASE_DRIVER` | 数据库驱动，支持 `postgres` / `sqlite` |
 | `DATABASE_PATH` | SQLite 数据文件路径，`DATABASE_DRIVER=sqlite` 时生效 |
 | `DATABASE_HOST` | PostgreSQL 主机，`DATABASE_DRIVER=postgres` 时生效 |

@@ -44,6 +44,7 @@ Codex2API 采用三层配置架构：
 |------|------|--------|------|
 | `CODEX_PORT` | 否 | 8080 | HTTP 服务端口 |
 | `ADMIN_SECRET` | 否 | - | 管理后台登录密钥 |
+| `BOOTSTRAP_ALLOWED_CIDR` | 否 | - | 允许执行首次初始化的客户端 CIDR，多个值用逗号分隔；未设置 `ADMIN_SECRET` 且从非本机浏览器初始化时需要配置 |
 | `TZ` | 否 | UTC | 时区，如 `Asia/Shanghai` |
 
 ### Codex 上游稳定性配置
@@ -237,6 +238,8 @@ CACHE_DRIVER=memory
 
 CODEX_PORT=8080
 # ADMIN_SECRET=dev  # 开发环境可不设置
+# Docker 本地浏览器首次初始化可按实际网关设置
+# BOOTSTRAP_ALLOWED_CIDR=172.17.0.1/32
 
 # 本地 PostgreSQL
 DATABASE_DRIVER=postgres

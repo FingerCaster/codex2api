@@ -42,6 +42,7 @@ docker run -d \
   -e CACHE_DRIVER=memory \
   -e DATABASE_PATH=/data/codex2api.db \
   -e IMAGE_ASSET_DIR=/data/images \
+  -e BOOTSTRAP_ALLOWED_CIDR='你的公网IP/32' \
   -e TZ=Asia/Shanghai \
   -v codex2api-data:/data \
   --restart unless-stopped \
@@ -55,6 +56,8 @@ http://服务器IP:8080/admin/
 ```
 
 首次访问管理后台时，如果没有设置 `ADMIN_SECRET`，页面会进入首次初始化流程，用浏览器设置管理密钥。
+
+`BOOTSTRAP_ALLOWED_CIDR` 用于限制谁可以执行首次初始化。远程 VPS 建议填当前访问管理台的公网 IP，例如 `1.2.3.4/32`；本机 Docker Desktop / 默认 bridge 冒烟测试常见值是 `172.17.0.1/32`。如果已设置 `ADMIN_SECRET`，则不需要通过页面执行首次初始化。
 
 ### 带管理密钥启动
 
@@ -98,6 +101,7 @@ services:
       DATABASE_PATH: /data/codex2api.db
       IMAGE_ASSET_DIR: /data/images
       ADMIN_SECRET: ${ADMIN_SECRET:-}
+      BOOTSTRAP_ALLOWED_CIDR: ${BOOTSTRAP_ALLOWED_CIDR:-}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - sqlite-data:/data
@@ -114,6 +118,7 @@ volumes:
 CODEX_PORT=8080
 BIND_HOST=0.0.0.0
 ADMIN_SECRET=
+BOOTSTRAP_ALLOWED_CIDR=
 TZ=Asia/Shanghai
 ```
 
@@ -161,6 +166,7 @@ services:
       REDIS_ADDR: redis:6379
       IMAGE_ASSET_DIR: /data/images
       ADMIN_SECRET: ${ADMIN_SECRET:-}
+      BOOTSTRAP_ALLOWED_CIDR: ${BOOTSTRAP_ALLOWED_CIDR:-}
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - image-assets:/data
@@ -228,6 +234,7 @@ volumes:
 CODEX_PORT=8080
 BIND_HOST=0.0.0.0
 ADMIN_SECRET=替换成强密码
+BOOTSTRAP_ALLOWED_CIDR=
 DATABASE_USER=codex2api
 DATABASE_PASSWORD=替换成数据库强密码
 DATABASE_NAME=codex2api
@@ -335,4 +342,3 @@ OpenAI 兼容入口：
 ```text
 http://服务器IP:8080/v1
 ```
-

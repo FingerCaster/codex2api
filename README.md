@@ -237,6 +237,7 @@ Vite proxies `/api` and `/health` to the backend. During development, open `http
 | --- | --- |
 | `CODEX_PORT` | HTTP port, default `8080` |
 | `ADMIN_SECRET` | Admin dashboard secret. When set, `/admin` prompts for authentication |
+| `BOOTSTRAP_ALLOWED_CIDR` | Client CIDR allowed to perform first-run bootstrap when `ADMIN_SECRET` is unset, such as a Docker bridge gateway or your remote browser IP |
 | `DATABASE_DRIVER` | Database driver: `postgres` or `sqlite` |
 | `DATABASE_PATH` | SQLite database file path, used when `DATABASE_DRIVER=sqlite` |
 | `DATABASE_HOST` | PostgreSQL host |

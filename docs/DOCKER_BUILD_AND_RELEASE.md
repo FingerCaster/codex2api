@@ -94,6 +94,7 @@ docker run -d --rm `
   -e CACHE_DRIVER=memory `
   -e DATABASE_PATH=/data/codex2api.db `
   -e IMAGE_ASSET_DIR=/data/images `
+  -e BOOTSTRAP_ALLOWED_CIDR=172.17.0.1/32 `
   -e LOG_DISABLED=true `
   -v codex2api-smoke-data:/data `
   codex2api:local
@@ -111,6 +112,8 @@ docker volume rm codex2api-smoke-data
 ```
 
 看到 HTTP `200`，并且日志里有 `Codex2API v2 已启动`，说明镜像能正常启动。
+
+如果冒烟测试后要打开 `/admin/` 做首次初始化，`BOOTSTRAP_ALLOWED_CIDR` 需要包含 Docker 转发进容器后的客户端地址。本机默认 bridge 常见为 `172.17.0.1/32`；如果 Docker 网络不同，可用 `docker inspect <容器名>` 查看网关后调整。
 
 ---
 
@@ -178,6 +181,7 @@ docker run -d \
   -e CACHE_DRIVER=memory \
   -e DATABASE_PATH=/data/codex2api.db \
   -e IMAGE_ASSET_DIR=/data/images \
+  -e BOOTSTRAP_ALLOWED_CIDR='你的公网IP/32' \
   -e TZ=Asia/Shanghai \
   -v codex2api-data:/data \
   --restart unless-stopped \
@@ -185,6 +189,8 @@ docker run -d \
 ```
 
 数据在 `codex2api-data` 卷里，`docker rm -f codex2api` 只删除容器，不会删除数据卷。
+
+如果已经用 `ADMIN_SECRET` 直接启动，可以不设置 `BOOTSTRAP_ALLOWED_CIDR`。如果希望朋友首次打开网页自行初始化，把这里改成对方当前公网 IP，例如 `1.2.3.4/32`。
 
 如果朋友用 Docker Compose：
 
@@ -218,6 +224,7 @@ docker run -d \
   -e CACHE_DRIVER=memory \
   -e DATABASE_PATH=/data/codex2api.db \
   -e IMAGE_ASSET_DIR=/data/images \
+  -e BOOTSTRAP_ALLOWED_CIDR='你的公网IP/32' \
   -e TZ=Asia/Shanghai \
   -v codex2api-data:/data \
   --restart unless-stopped \
@@ -301,4 +308,3 @@ docker buildx build `
   -t daybreakx/codex2api:$rev `
   --push .
 ```
-
