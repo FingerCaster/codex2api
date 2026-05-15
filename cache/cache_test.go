@@ -151,6 +151,27 @@ func TestMemoryTokenCache_RuntimeCacheRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMemoryTokenCache_ClearSessionAffinities(t *testing.T) {
+	tc := NewMemory(10)
+	ctx := context.Background()
+
+	if err := tc.SetSessionAffinity(ctx, "session-a", SessionAffinityBinding{AccountID: 1}, time.Hour); err != nil {
+		t.Fatalf("SetSessionAffinity(session-a) error = %v", err)
+	}
+	if err := tc.SetSessionAffinity(ctx, "session-b", SessionAffinityBinding{AccountID: 2}, time.Hour); err != nil {
+		t.Fatalf("SetSessionAffinity(session-b) error = %v", err)
+	}
+	if err := tc.ClearSessionAffinities(ctx); err != nil {
+		t.Fatalf("ClearSessionAffinities() error = %v", err)
+	}
+	if _, ok, err := tc.GetSessionAffinity(ctx, "session-a"); err != nil || ok {
+		t.Fatalf("GetSessionAffinity(session-a) after clear ok=%v err=%v, want miss", ok, err)
+	}
+	if _, ok, err := tc.GetSessionAffinity(ctx, "session-b"); err != nil || ok {
+		t.Fatalf("GetSessionAffinity(session-b) after clear ok=%v err=%v, want miss", ok, err)
+	}
+}
+
 func TestMemoryTokenCache_GetAccessToken_NotFound(t *testing.T) {
 	tc := NewMemory(10)
 	ctx := context.Background()

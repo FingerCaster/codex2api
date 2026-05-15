@@ -147,6 +147,83 @@ func TestRefreshAccountReturnsRefreshFailure(t *testing.T) {
 	}
 }
 
+func TestToggleAccountEnabledDisablesRuntimeAndListStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+	db, err := database.New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("database.New 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	id, err := db.InsertOpenAIResponsesAccount(ctx, "lumio", map[string]interface{}{
+		"upstream_type": auth.UpstreamOpenAIResponses,
+		"base_url":      "https://example.test",
+		"api_key":       "sk-test",
+		"models":        []string{"gpt-test"},
+	}, "")
+	if err != nil {
+		t.Fatalf("InsertOpenAIResponsesAccount 返回错误: %v", err)
+	}
+
+	store := auth.NewStore(db, nil, nil)
+	store.AddAccount(&auth.Account{
+		DBID:         id,
+		AccessToken:  "token",
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://example.test",
+		APIKey:       "sk-test",
+		PlanType:     "api",
+		Models:       []string{"gpt-test"},
+	})
+	handler := &Handler{
+		db:                db,
+		store:             store,
+		reqCountCache:     map[int64]*database.AccountRequestCount{},
+		reqCountExpiresAt: time.Now().Add(time.Minute),
+	}
+
+	recorder := httptest.NewRecorder()
+	reqCtx, _ := gin.CreateTestContext(recorder)
+	reqCtx.Params = gin.Params{{Key: "id", Value: fmt.Sprintf("%d", id)}}
+	reqCtx.Request = httptest.NewRequest(http.MethodPost, "/api/admin/accounts/1/enable", strings.NewReader(`{"enabled":false}`))
+	reqCtx.Request.Header.Set("Content-Type", "application/json")
+
+	handler.ToggleAccountEnabled(reqCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("ToggleAccountEnabled status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	if got := store.FindByID(id).RuntimeStatus(); got != "disabled" {
+		t.Fatalf("RuntimeStatus() = %q, want disabled", got)
+	}
+	if got := store.Next(); got != nil {
+		t.Fatalf("Next() returned disabled account dbID=%d, want nil", got.DBID)
+	}
+
+	recorder = httptest.NewRecorder()
+	listCtx, _ := gin.CreateTestContext(recorder)
+	listCtx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/accounts", nil)
+	handler.ListAccounts(listCtx)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("ListAccounts status = %d, want %d, body=%s", recorder.Code, http.StatusOK, recorder.Body.String())
+	}
+	var payload accountsResponse
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode accounts: %v", err)
+	}
+	accounts := payload.Accounts
+	if len(accounts) != 1 {
+		t.Fatalf("accounts len = %d, want 1", len(accounts))
+	}
+	if accounts[0].Status != "disabled" || accounts[0].Enabled || !accounts[0].Disabled {
+		t.Fatalf("account state = status=%q enabled=%v disabled=%v, want disabled/false/true", accounts[0].Status, accounts[0].Enabled, accounts[0].Disabled)
+	}
+}
+
 func TestCreateAPIKeyPersistsQuotaAndExpiration(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

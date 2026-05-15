@@ -1506,6 +1506,7 @@ type Store struct {
 	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping         atomic.Value // 模型映射 JSON 字符串
 	promptFilterConfig   atomic.Value // promptfilter.Config
+	sessionAffinityTTL   int64
 	sessionMu            sync.RWMutex
 	sessionBindings      map[string]sessionAffinity
 }
@@ -1532,7 +1533,7 @@ type runtimeCooldownRecord struct {
 	BackoffLevel int       `json:"backoff_level,omitempty"`
 }
 
-func sessionAffinityTTL() time.Duration {
+func sessionAffinityTTLFromEnv() time.Duration {
 	raw := strings.TrimSpace(os.Getenv("CODEX_SESSION_AFFINITY_TTL"))
 	if raw == "" {
 		return defaultSessionAffinityTTL
@@ -1544,6 +1545,13 @@ func sessionAffinityTTL() time.Duration {
 		return time.Duration(seconds) * time.Second
 	}
 	return defaultSessionAffinityTTL
+}
+
+func normalizeSessionAffinityTTL(d time.Duration) time.Duration {
+	if d <= 0 {
+		return sessionAffinityTTLFromEnv()
+	}
+	return d
 }
 
 func cooldownRuntimeContext() (context.Context, context.CancelFunc) {
@@ -1872,6 +1880,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.SetBackgroundRefreshInterval(time.Duration(settings.BackgroundRefreshIntervalMinutes) * time.Minute)
 	s.SetUsageProbeMaxAge(time.Duration(settings.UsageProbeMaxAgeMinutes) * time.Minute)
 	s.SetRecoveryProbeInterval(time.Duration(settings.RecoveryProbeIntervalMinutes) * time.Minute)
+	s.SetSessionAffinityTTL(time.Duration(settings.SessionAffinityTTLMinutes) * time.Minute)
 	s.autoCleanUnauthorized.Store(settings.AutoCleanUnauthorized)
 	s.autoCleanRateLimited.Store(settings.AutoCleanRateLimited)
 	s.autoCleanFullUsage.Store(settings.AutoCleanFullUsage)
@@ -2203,6 +2212,37 @@ func (s *Store) GetRecoveryProbeInterval() time.Duration {
 		return defaultRecoveryProbeInterval
 	}
 	return d
+}
+
+func (s *Store) SetSessionAffinityTTL(d time.Duration) {
+	atomic.StoreInt64(&s.sessionAffinityTTL, int64(d))
+}
+
+func (s *Store) GetSessionAffinityTTL() time.Duration {
+	return normalizeSessionAffinityTTL(time.Duration(atomic.LoadInt64(&s.sessionAffinityTTL)))
+}
+
+func (s *Store) GetSessionAffinityTTLMinutes() int {
+	d := time.Duration(atomic.LoadInt64(&s.sessionAffinityTTL))
+	if d <= 0 {
+		return 0
+	}
+	return int(d / time.Minute)
+}
+
+func (s *Store) ClearSessionAffinities() error {
+	if s == nil {
+		return nil
+	}
+	s.sessionMu.Lock()
+	s.sessionBindings = make(map[string]sessionAffinity)
+	s.sessionMu.Unlock()
+	if s.tokenCache == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return s.tokenCache.ClearSessionAffinities(ctx)
 }
 
 // CleanExpiredNow 立即执行一次过期清理，返回清理数量
@@ -2603,7 +2643,7 @@ func (s *Store) bindSessionAffinity(key string, account *Account, proxyURL strin
 	if key == "" {
 		return
 	}
-	ttl := sessionAffinityTTL()
+	ttl := s.GetSessionAffinityTTL()
 	binding := sessionAffinity{
 		accountID: account.DBID,
 		proxyURL:  strings.TrimSpace(proxyURL),
@@ -2717,7 +2757,7 @@ func (s *Store) getCachedSessionAffinity(key string) (sessionAffinity, bool) {
 	return sessionAffinity{
 		accountID: binding.AccountID,
 		proxyURL:  strings.TrimSpace(binding.ProxyURL),
-		expiresAt: time.Now().Add(sessionAffinityTTL()),
+		expiresAt: time.Now().Add(s.GetSessionAffinityTTL()),
 	}, true
 }
 
@@ -3503,6 +3543,49 @@ func (s *Store) ClearCooldown(acc *Account) {
 	defer cancel()
 	if err := s.db.ClearError(ctx, acc.DBID); err != nil {
 		log.Printf("[账号 %d] 清理账号状态失败: %v", acc.DBID, err)
+	}
+}
+
+// ForceAccountHealthy 强制将账号运行时状态恢复为健康。
+// 该操作仅影响内存中的调度状态，不改写数据库中的长期凭据元数据。
+func (s *Store) ForceAccountHealthy(acc *Account) {
+	if acc == nil {
+		return
+	}
+
+	atomic.StoreInt32(&acc.Disabled, 0)
+	acc.mu.Lock()
+	acc.Status = StatusReady
+	acc.ErrorMsg = ""
+	acc.CooldownUtil = time.Time{}
+	acc.CooldownReason = ""
+	acc.HealthTier = HealthTierHealthy
+	acc.LastFailureAt = time.Time{}
+	acc.LastUnauthorizedAt = time.Time{}
+	acc.LastRateLimitedAt = time.Time{}
+	acc.LastTimeoutAt = time.Time{}
+	acc.LastServerErrorAt = time.Time{}
+	acc.FailureStreak = 0
+	if acc.SuccessStreak <= 0 {
+		acc.SuccessStreak = 1
+	}
+	acc.LastSuccessAt = time.Now()
+	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.mu.Unlock()
+	s.fastSchedulerUpdate(acc)
+	s.deleteCachedAccountCooldown(acc.DBID)
+
+	if s.db == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := s.db.ClearError(ctx, acc.DBID); err != nil {
+		log.Printf("[账号 %d] 强制恢复健康时清理账号状态失败: %v", acc.DBID, err)
+	}
+	if err := s.db.ClearCooldown(ctx, acc.DBID); err != nil {
+		log.Printf("[账号 %d] 强制恢复健康时清理冷却状态失败: %v", acc.DBID, err)
 	}
 }
 

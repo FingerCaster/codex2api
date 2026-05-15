@@ -223,6 +223,8 @@ export const api = {
     request<MessageResponse>(`/accounts/${id}/lock`, { method: 'POST', body: JSON.stringify({ locked }) }),
   resetAccountStatus: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/reset-status`, { method: 'POST' }),
+  forceAccountHealthy: (id: number) =>
+    request<MessageResponse>(`/accounts/${id}/force-healthy`, { method: 'POST' }),
   batchResetStatus: (ids: number[]) =>
     request<{ message: string; success: number; failed: number }>('/accounts/batch-reset-status', { method: 'POST', body: JSON.stringify({ ids }) }),
   getAccountUsage: (id: number) =>
@@ -389,6 +391,8 @@ export const api = {
   getSettings: () => request<SystemSettings>('/settings'),
   updateSettings: (data: Partial<SystemSettings>) =>
     request<SystemSettings>('/settings', { method: 'PUT', body: JSON.stringify(data) }),
+  clearSessionAffinities: () =>
+    request<MessageResponse>('/settings/session-affinity/clear', { method: 'POST' }),
   testImageStorageConnection: (data: {
     endpoint: string
     region: string

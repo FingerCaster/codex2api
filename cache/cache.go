@@ -37,6 +37,7 @@ type TokenCache interface {
 	SetSessionAffinity(ctx context.Context, key string, binding SessionAffinityBinding, ttl time.Duration) error
 	GetSessionAffinity(ctx context.Context, key string) (SessionAffinityBinding, bool, error)
 	DeleteSessionAffinity(ctx context.Context, key string, accountID int64) error
+	ClearSessionAffinities(ctx context.Context) error
 	SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error
 	GetResponseContext(ctx context.Context, responseID string) ([]json.RawMessage, error)
 	SetRuntime(ctx context.Context, namespace string, key string, value json.RawMessage, ttl time.Duration) error

@@ -220,6 +220,7 @@ func defaultBootstrapSettings() *database.SystemSettings {
 		BackgroundRefreshIntervalMinutes: 2,
 		UsageProbeMaxAgeMinutes:          10,
 		RecoveryProbeIntervalMinutes:     30,
+		SessionAffinityTTLMinutes:        0,
 		PgMaxConns:                       50,
 		RedisPoolSize:                    30,
 		PromptFilterMode:                 "monitor",

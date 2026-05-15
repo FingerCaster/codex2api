@@ -292,6 +292,13 @@ func (tc *MemoryTokenCache) DeleteSessionAffinity(ctx context.Context, key strin
 	return nil
 }
 
+func (tc *MemoryTokenCache) ClearSessionAffinities(ctx context.Context) error {
+	tc.mu.Lock()
+	tc.sessions = make(map[string]memorySessionAffinityEntry)
+	tc.mu.Unlock()
+	return nil
+}
+
 func (tc *MemoryTokenCache) SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error {
 	responseID = strings.TrimSpace(responseID)
 	if responseID == "" {

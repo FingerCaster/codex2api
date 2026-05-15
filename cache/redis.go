@@ -379,6 +379,25 @@ return 0
 	return tc.client.Eval(ctx, script, []string{sessionAffinityKey(key)}, accountID).Err()
 }
 
+func (tc *redisTokenCache) ClearSessionAffinities(ctx context.Context) error {
+	var cursor uint64
+	for {
+		keys, nextCursor, err := tc.client.Scan(ctx, cursor, "codex:session:*", 200).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			if err := tc.client.Del(ctx, keys...).Err(); err != nil {
+				return err
+			}
+		}
+		cursor = nextCursor
+		if cursor == 0 {
+			return nil
+		}
+	}
+}
+
 func (tc *redisTokenCache) SetResponseContext(ctx context.Context, responseID string, items []json.RawMessage, ttl time.Duration) error {
 	responseID = strings.TrimSpace(responseID)
 	if responseID == "" {

@@ -64,6 +64,7 @@ func TestNextForSessionUsesCachedAffinityWhenLocalBindingMissing(t *testing.T) {
 func TestBindSessionAffinityUsesConfigurableTTL(t *testing.T) {
 	t.Setenv("CODEX_SESSION_AFFINITY_TTL", "2h")
 	store := &Store{}
+	store.SetSessionAffinityTTL(0)
 	account := &Account{DBID: 1, AccessToken: "tok-1"}
 
 	before := time.Now()
@@ -77,6 +78,50 @@ func TestBindSessionAffinityUsesConfigurableTTL(t *testing.T) {
 	}
 	if binding.expiresAt.Before(before.Add(2*time.Hour - time.Second)) {
 		t.Fatalf("expiresAt too early: got %s want about 2h from now", binding.expiresAt)
+	}
+}
+
+func TestBindSessionAffinityUsesRuntimeTTLOverride(t *testing.T) {
+	store := &Store{}
+	store.SetSessionAffinityTTL(15 * time.Minute)
+	account := &Account{DBID: 1, AccessToken: "tok-1"}
+
+	before := time.Now()
+	store.bindSessionAffinity("session-ttl-runtime", account, "http://proxy-1")
+
+	store.sessionMu.RLock()
+	binding, ok := store.sessionBindings["session-ttl-runtime"]
+	store.sessionMu.RUnlock()
+	if !ok {
+		t.Fatal("expected session binding")
+	}
+	if binding.expiresAt.Before(before.Add(15*time.Minute - time.Second)) {
+		t.Fatalf("expiresAt too early: got %s want about 15m from now", binding.expiresAt)
+	}
+}
+
+func TestClearSessionAffinitiesClearsMemoryAndCache(t *testing.T) {
+	tokenCache := cache.NewMemory(1)
+	defer tokenCache.Close()
+	store := &Store{
+		tokenCache:      tokenCache,
+		sessionBindings: map[string]sessionAffinity{},
+	}
+	store.SetSessionAffinityTTL(time.Hour)
+	account := &Account{DBID: 7, AccessToken: "tok-7"}
+	store.bindSessionAffinity("session-clear", account, "http://proxy-7")
+
+	if err := store.ClearSessionAffinities(); err != nil {
+		t.Fatalf("ClearSessionAffinities() error = %v", err)
+	}
+
+	store.sessionMu.RLock()
+	defer store.sessionMu.RUnlock()
+	if len(store.sessionBindings) != 0 {
+		t.Fatalf("sessionBindings len = %d, want 0", len(store.sessionBindings))
+	}
+	if _, ok, err := tokenCache.GetSessionAffinity(context.Background(), "session-clear"); err != nil || ok {
+		t.Fatalf("GetSessionAffinity() after clear ok=%v err=%v, want miss", ok, err)
 	}
 }
 

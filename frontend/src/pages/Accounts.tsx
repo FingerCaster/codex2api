@@ -59,6 +59,7 @@ import {
   Lock,
   Unlock,
   RotateCcw,
+  ShieldCheck,
   Pencil,
   Check,
   ChevronDown,
@@ -1564,6 +1565,19 @@ export default function Accounts() {
     }
   };
 
+  const handleForceHealthy = async (account: AccountRow) => {
+    try {
+      await api.forceAccountHealthy(account.id);
+      showToast(t("accounts.forceHealthySuccess"));
+      void reload();
+    } catch (error) {
+      showToast(
+        t("accounts.forceHealthyFailed", { error: getErrorMessage(error) }),
+        "error",
+      );
+    }
+  };
+
   const handleBatchResetStatus = async () => {
     const ids = Array.from(selected);
     if (ids.length === 0) return;
@@ -2928,6 +2942,17 @@ export default function Accounts() {
                                     title={t("accounts.resetStatusHint")}
                                   >
                                     <RotateCcw className="size-3.5" />
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    size="icon"
+                                    className="h-7 w-8 px-0"
+                                    onClick={() =>
+                                      void handleForceHealthy(account)
+                                    }
+                                    title={t("accounts.forceHealthyHint")}
+                                  >
+                                    <ShieldCheck className="size-3.5" />
                                   </Button>
                                   <Button
                                     variant="destructive"

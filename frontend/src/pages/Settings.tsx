@@ -374,6 +374,7 @@ export default function Settings() {
     background_refresh_interval_minutes: 2,
     usage_probe_max_age_minutes: 10,
     recovery_probe_interval_minutes: 30,
+    session_affinity_ttl_minutes: 60,
     pg_max_conns: 50,
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
@@ -421,6 +422,7 @@ export default function Settings() {
     image_s3_force_path_style: false,
   })
   const [savingSettings, setSavingSettings] = useState(false)
+  const [clearingSessionAffinity, setClearingSessionAffinity] = useState(false)
   const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
@@ -545,6 +547,18 @@ export default function Settings() {
       showToast(`${t('settings.modelsSyncFailed')}: ${getErrorMessage(error)}`, 'error')
     } finally {
       setSyncingModels(false)
+    }
+  }
+
+  const handleClearSessionAffinities = async () => {
+    setClearingSessionAffinity(true)
+    try {
+      const result = await api.clearSessionAffinities()
+      showToast(result.message || t('settings.sessionAffinityClearSuccess'))
+    } catch (error) {
+      showToast(`${t('settings.sessionAffinityClearFailed')}: ${getErrorMessage(error)}`, 'error')
+    } finally {
+      setClearingSessionAffinity(false)
     }
   }
 
@@ -778,6 +792,27 @@ export default function Settings() {
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, stream_flush_interval_ms: parseInt(e.target.value) || 20 }))}
                 />
               </SettingField>
+              <SettingField label={t('settings.sessionAffinityTTL')} description={t('settings.sessionAffinityTTLDesc')}>
+                <Input
+                  type="number"
+                  min={0}
+                  max={10080}
+                  value={settingsForm.session_affinity_ttl_minutes}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, session_affinity_ttl_minutes: parseInt(e.target.value) || 0 }))}
+                />
+              </SettingField>
+            </div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void handleClearSessionAffinities()}
+                disabled={clearingSessionAffinity}
+              >
+                <RefreshCw className={cn('size-4', clearingSessionAffinity && 'animate-spin')} />
+                {clearingSessionAffinity ? t('settings.sessionAffinityClearing') : t('settings.sessionAffinityClear')}
+              </Button>
             </div>
           </SettingsCard>
 

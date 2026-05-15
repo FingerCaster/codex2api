@@ -209,6 +209,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/enable", h.ToggleAccountEnabled)
 	api.POST("/accounts/:id/lock", h.ToggleAccountLock)
 	api.POST("/accounts/:id/reset-status", h.ResetAccountStatus)
+	api.POST("/accounts/:id/force-healthy", h.ForceAccountHealthy)
 	api.GET("/accounts/:id/test", h.TestConnection)
 	api.GET("/accounts/:id/usage", h.GetAccountUsage)
 	api.GET("/accounts/:id/auth-json", h.GetAccountAuthJSON)
@@ -240,6 +241,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
+	api.POST("/settings/session-affinity/clear", h.ClearSessionAffinities)
 	api.POST("/settings/image-storage/test", h.TestImageStorageConnection)
 	api.GET("/prompt-filter/logs", h.ListPromptFilterLogs)
 	api.DELETE("/prompt-filter/logs", h.ClearPromptFilterLogs)
@@ -619,6 +621,11 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		} else if row.CooldownUntil.Valid && row.CooldownUntil.Time.After(time.Now()) {
 			resp.CooldownReason = row.CooldownReason
 			resp.CooldownUntil = row.CooldownUntil.Time.Format(time.RFC3339)
+		}
+		if row.Disabled || !row.Enabled {
+			resp.Status = "disabled"
+			resp.Disabled = true
+			resp.Enabled = false
 		}
 		if resp.DispatchScore == 0 {
 			resp.DispatchScore = dispatchScoreFallback(resp.SchedulerScore, resp.ScoreBiasEffective, resp.HealthTier, resp.Status)
@@ -2460,6 +2467,7 @@ func (h *Handler) ToggleAccountEnabled(c *gin.Context) {
 		return
 	}
 
+	h.store.SetManualDisabled(id, !*req.Enabled)
 	h.store.ApplyAccountEnabled(id, *req.Enabled)
 
 	if *req.Enabled {
@@ -2527,6 +2535,25 @@ func (h *Handler) ResetAccountStatus(c *gin.Context) {
 	h.store.ClearCooldown(acc)
 	acc.ClearUsageCache()
 	writeMessage(c, http.StatusOK, "账号状态已重置")
+}
+
+// ForceAccountHealthy 强制将单个账号运行时状态恢复为健康
+func (h *Handler) ForceAccountHealthy(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		writeError(c, http.StatusBadRequest, "无效的账号 ID")
+		return
+	}
+
+	acc := h.store.FindByID(id)
+	if acc == nil {
+		writeError(c, http.StatusNotFound, "账号不在运行时池中")
+		return
+	}
+
+	h.store.ForceAccountHealthy(acc)
+	acc.ClearUsageCache()
+	writeMessage(c, http.StatusOK, "账号已强制恢复为健康状态")
 }
 
 // BatchResetStatus 批量重置账号状态为正常
@@ -3648,6 +3675,7 @@ type settingsResponse struct {
 	BackgroundRefreshIntervalMinutes int    `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes          int    `json:"usage_probe_max_age_minutes"`
 	RecoveryProbeIntervalMinutes     int    `json:"recovery_probe_interval_minutes"`
+	SessionAffinityTTLMinutes        int    `json:"session_affinity_ttl_minutes"`
 	ProxyURL                         string `json:"proxy_url"`
 	PgMaxConns                       int    `json:"pg_max_conns"`
 	RedisPoolSize                    int    `json:"redis_pool_size"`
@@ -3707,6 +3735,7 @@ type updateSettingsReq struct {
 	BackgroundRefreshIntervalMinutes *int    `json:"background_refresh_interval_minutes"`
 	UsageProbeMaxAgeMinutes          *int    `json:"usage_probe_max_age_minutes"`
 	RecoveryProbeIntervalMinutes     *int    `json:"recovery_probe_interval_minutes"`
+	SessionAffinityTTLMinutes        *int    `json:"session_affinity_ttl_minutes"`
 	ProxyURL                         *string `json:"proxy_url"`
 	PgMaxConns                       *int    `json:"pg_max_conns"`
 	RedisPoolSize                    *int    `json:"redis_pool_size"`
@@ -3846,6 +3875,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
+		SessionAffinityTTLMinutes:        h.store.GetSessionAffinityTTLMinutes(),
 		ProxyURL:                         h.store.GetProxyURL(),
 		PgMaxConns:                       h.pgMaxConns,
 		RedisPoolSize:                    h.redisPoolSize,
@@ -4011,6 +4041,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		}
 		h.store.SetRecoveryProbeInterval(time.Duration(v) * time.Minute)
 		log.Printf("设置已更新: recovery_probe_interval_minutes = %d", v)
+	}
+
+	if req.SessionAffinityTTLMinutes != nil {
+		v := *req.SessionAffinityTTLMinutes
+		if v < 0 {
+			v = 0
+		}
+		if v > 10080 {
+			v = 10080
+		}
+		h.store.SetSessionAffinityTTL(time.Duration(v) * time.Minute)
+		log.Printf("设置已更新: session_affinity_ttl_minutes = %d", v)
 	}
 
 	if req.ProxyURL != nil {
@@ -4320,6 +4362,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
+		SessionAffinityTTLMinutes:        h.store.GetSessionAffinityTTLMinutes(),
 		ProxyURL:                         h.store.GetProxyURL(),
 		PgMaxConns:                       h.pgMaxConns,
 		RedisPoolSize:                    h.redisPoolSize,
@@ -4382,6 +4425,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		BackgroundRefreshIntervalMinutes: h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:          h.store.GetUsageProbeMaxAgeMinutes(),
 		RecoveryProbeIntervalMinutes:     h.store.GetRecoveryProbeIntervalMinutes(),
+		SessionAffinityTTLMinutes:        h.store.GetSessionAffinityTTLMinutes(),
 		ProxyURL:                         h.store.GetProxyURL(),
 		PgMaxConns:                       h.pgMaxConns,
 		RedisPoolSize:                    h.redisPoolSize,
@@ -4430,6 +4474,18 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ImageS3Prefix:                    strings.TrimSuffix(imgCfg.Prefix, "/"),
 		ImageS3ForcePathStyle:            imgCfg.ForcePathStyle,
 	})
+}
+
+func (h *Handler) ClearSessionAffinities(c *gin.Context) {
+	if h.store == nil {
+		writeError(c, http.StatusServiceUnavailable, "账号调度器未初始化")
+		return
+	}
+	if err := h.store.ClearSessionAffinities(); err != nil {
+		writeError(c, http.StatusInternalServerError, "清理会话粘性失败: "+err.Error())
+		return
+	}
+	writeMessage(c, http.StatusOK, "会话粘性已清理")
 }
 
 type testImageStorageReq struct {
