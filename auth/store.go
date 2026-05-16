@@ -585,6 +585,14 @@ func (a *Account) recordResultLocked(success bool) {
 	}
 }
 
+func (a *Account) clearRecentResultsLocked() {
+	for i := range a.RecentResults {
+		a.RecentResults[i] = 0
+	}
+	a.RecentResultsIdx = 0
+	a.RecentResultsCnt = 0
+}
+
 // recentSuccessRateLocked 计算滑动窗口成功率 (0.0 ~ 1.0)
 func (a *Account) recentSuccessRateLocked() float64 {
 	if a.RecentResultsCnt == 0 {
@@ -3881,11 +3889,7 @@ func (s *Store) RecoverAccountFromProbe(acc *Account, now time.Time) {
 	acc.SuccessStreak = 1
 	acc.RecoveryProbeSuccesses = 0
 	acc.LastSuccessAt = now
-	for i := range acc.RecentResults {
-		acc.RecentResults[i] = 0
-	}
-	acc.RecentResultsIdx = 0
-	acc.RecentResultsCnt = 0
+	acc.clearRecentResultsLocked()
 	if guard > 0 {
 		acc.RecoveryGuardUntil = now.Add(guard)
 	} else {
@@ -3969,6 +3973,10 @@ func (s *Store) ReportRequestSuccess(acc *Account, latency time.Duration) {
 
 	acc.mu.Lock()
 	acc.recordLatencyLocked(latency)
+	if acc.isOpenAIResponsesAPILocked() {
+		acc.clearRecentResultsLocked()
+		acc.LastOtherErrorAt = time.Time{}
+	}
 	acc.recordResultLocked(true)
 	acc.LastSuccessAt = time.Now()
 	acc.SuccessStreak = clampInt(acc.SuccessStreak+1, 0, 20)
@@ -3992,8 +4000,8 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 
 	now := time.Now()
 	shouldShortCooldown := false
-	var failureRate float64
-	var failureSamples int
+	var otherErrorFailures int
+	var otherErrorThreshold int
 	acc.mu.Lock()
 	kind = normalizeFailureKindForAccountLocked(acc, kind)
 	acc.recordLatencyLocked(latency)
@@ -4045,10 +4053,10 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 		apiAccountFailureCooldownEligible(kind) &&
 		acc.isOpenAIResponsesAPILocked() &&
 		!(acc.Status == StatusCooldown && now.Before(acc.CooldownUtil)) {
-		if rate, samples, ok := acc.recentFailureRateLocked(s.GetAPIAccountFailureMinSamples()); ok && rate >= float64(s.GetAPIAccountFailureRateThreshold()) {
+		otherErrorThreshold = s.GetAPIAccountFailureMinSamples()
+		otherErrorFailures = acc.FailureStreak
+		if kind == FailureKindOtherError && otherErrorFailures >= otherErrorThreshold {
 			shouldShortCooldown = true
-			failureRate = rate
-			failureSamples = samples
 		}
 	}
 
@@ -4056,7 +4064,7 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 	acc.mu.Unlock()
 	s.fastSchedulerUpdate(acc)
 	if shouldShortCooldown {
-		log.Printf("[账号 %d] API 账号失败率 %.0f%%/%d 达到阈值，进入短冷却", acc.DBID, failureRate, failureSamples)
+		log.Printf("[账号 %d] API 账号 other_error 连续失败 %d/%d 达到阈值，进入短冷却", acc.DBID, otherErrorFailures, otherErrorThreshold)
 		s.MarkCooldown(acc, s.GetAPIAccountCooldown(), "api_account_failure_rate")
 	}
 }

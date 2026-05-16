@@ -747,15 +747,6 @@ export default function Settings() {
                     options={booleanOptions}
                   />
                 </SettingField>
-                <SettingField label={t('settings.apiAccountFailureRateThreshold')} description={t('settings.apiAccountFailureRateThresholdDesc')}>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={100}
-                    value={settingsForm.api_account_failure_rate_threshold}
-                    onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, api_account_failure_rate_threshold: parseInt(e.target.value) || 80 }))}
-                  />
-                </SettingField>
                 <SettingField label={t('settings.apiAccountFailureMinSamples')} description={t('settings.apiAccountFailureMinSamplesDesc')}>
                   <Input
                     type="number"

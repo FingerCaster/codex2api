@@ -113,7 +113,6 @@ func TestAPIAccountRepeatedOtherErrorsBeforeThresholdKeepHealthy(t *testing.T) {
 func TestAPIAccountOtherErrorCooldownUsesConfiguredSamples(t *testing.T) {
 	store := newAPIAccountCooldownTestStore()
 	store.SetAPIAccountFailureMinSamples(3)
-	store.SetAPIAccountFailureRateThreshold(100)
 	acc := newTestAPIAccount(1)
 	store.AddAccount(acc)
 
@@ -135,6 +134,47 @@ func TestAPIAccountOtherErrorCooldownUsesConfiguredSamples(t *testing.T) {
 	reason, _ := acc.GetCooldownSnapshot()
 	if reason != "api_account_failure_rate" {
 		t.Fatalf("CooldownReason = %q, want api_account_failure_rate after configured sample count", reason)
+	}
+}
+
+func TestAPIAccountSuccessClearsOtherErrorAccumulation(t *testing.T) {
+	store := newAPIAccountCooldownTestStore()
+	store.SetAPIAccountFailureMinSamples(3)
+	acc := newTestAPIAccount(1)
+	store.AddAccount(acc)
+
+	for i := 0; i < 2; i++ {
+		store.ReportRequestFailure(acc, "server", 0)
+	}
+	if acc.FailureStreak != 2 {
+		t.Fatalf("FailureStreak = %d, want 2 before success", acc.FailureStreak)
+	}
+	if acc.LastOtherErrorAt.IsZero() {
+		t.Fatal("server failures for API accounts should be counted as other_error")
+	}
+
+	store.ReportRequestSuccess(acc, 0)
+	if acc.FailureStreak != 0 {
+		t.Fatalf("FailureStreak = %d, want 0 after success", acc.FailureStreak)
+	}
+	if !acc.LastOtherErrorAt.IsZero() {
+		t.Fatalf("LastOtherErrorAt = %v, want cleared after success", acc.LastOtherErrorAt)
+	}
+	if acc.RecentResultsCnt != 1 || acc.RecentResults[0] != 1 {
+		t.Fatalf("recent results = count %d first %d, want one success sample after clearing", acc.RecentResultsCnt, acc.RecentResults[0])
+	}
+
+	for i := 0; i < 2; i++ {
+		store.ReportRequestFailure(acc, "server", 0)
+		if acc.HasActiveCooldown() {
+			t.Fatalf("post-success failure %d unexpectedly put account into cooldown", i+1)
+		}
+	}
+
+	store.ReportRequestFailure(acc, "server", 0)
+	reason, _ := acc.GetCooldownSnapshot()
+	if reason != "api_account_failure_rate" {
+		t.Fatalf("CooldownReason = %q, want api_account_failure_rate after new consecutive failures", reason)
 	}
 }
 

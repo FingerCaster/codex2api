@@ -9,6 +9,8 @@ frontend/dist/
 # IDE
 .vscode/
 .idea/
+.agents/
+skills-lock.json
 *.swp
 *.swo
 
