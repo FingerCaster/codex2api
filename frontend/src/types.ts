@@ -531,6 +531,33 @@ export interface UsageAPIKeyStat {
   user_billed: number
 }
 
+export interface UsageAPIKeyRankingItem {
+  rank: number
+  api_key_id: number
+  label: string
+  requests: number
+  tokens: number
+  input_tokens: number
+  output_tokens: number
+  cached_tokens: number
+  error_count: number
+  user_billed: number
+  account_billed: number
+  last_used_at: string
+}
+
+export interface UsageAPIKeyRanking {
+  period: 'day' | 'week' | 'month'
+  start: string
+  end: string
+  updated_at: string
+  total_requests: number
+  total_tokens: number
+  total_user_billed: number
+  total_account_billed: number
+  items: UsageAPIKeyRankingItem[]
+}
+
 export interface UsageLog {
   id: number
   account_id: number

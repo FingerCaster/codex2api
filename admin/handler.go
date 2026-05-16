@@ -223,6 +223,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/accounts/event-trend", h.GetAccountEventTrend)
 	api.GET("/usage/stats", h.GetUsageStats)
 	api.GET("/usage/logs", h.GetUsageLogs)
+	api.GET("/usage/ranking", h.GetUsageRanking)
 	api.GET("/usage/chart-data", h.GetChartData)
 	api.DELETE("/usage/logs", h.ClearUsageLogs)
 	api.GET("/keys", h.ListAPIKeys)
@@ -2659,6 +2660,43 @@ func parseUsageLogFilter(c *gin.Context) (database.UsageLogFilter, error) {
 	return filter, nil
 }
 
+func usageRankingRange(period string, now time.Time) (string, time.Time, time.Time, error) {
+	normalized := strings.ToLower(strings.TrimSpace(period))
+	if normalized == "" {
+		normalized = "day"
+	}
+	localNow := now.In(time.Local)
+	dayStart := time.Date(localNow.Year(), localNow.Month(), localNow.Day(), 0, 0, 0, 0, localNow.Location())
+
+	switch normalized {
+	case "day":
+		return normalized, dayStart, dayStart.AddDate(0, 0, 1), nil
+	case "week":
+		daysSinceMonday := (int(dayStart.Weekday()) + 6) % 7
+		start := dayStart.AddDate(0, 0, -daysSinceMonday)
+		return normalized, start, start.AddDate(0, 0, 7), nil
+	case "month":
+		start := time.Date(localNow.Year(), localNow.Month(), 1, 0, 0, 0, 0, localNow.Location())
+		return normalized, start, start.AddDate(0, 1, 0), nil
+	default:
+		return "", time.Time{}, time.Time{}, fmt.Errorf("period 参数无效，需要 day/week/month")
+	}
+}
+
+func parseUsageRankingLimit(raw string) (int, error) {
+	if raw == "" {
+		return 50, nil
+	}
+	limit, err := strconv.Atoi(raw)
+	if err != nil || limit <= 0 {
+		return 0, fmt.Errorf("limit 参数无效，需要正整数")
+	}
+	if limit > 200 {
+		limit = 200
+	}
+	return limit, nil
+}
+
 // GetUsageStats 获取使用统计
 func (h *Handler) GetUsageStats(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
@@ -2676,6 +2714,30 @@ func (h *Handler) GetUsageStats(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, stats)
+}
+
+// GetUsageRanking 获取 API Key 使用排行榜
+func (h *Handler) GetUsageRanking(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
+	defer cancel()
+
+	period, start, end, err := usageRankingRange(c.DefaultQuery("period", "day"), time.Now())
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	limit, err := parseUsageRankingLimit(c.Query("limit"))
+	if err != nil {
+		writeError(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	ranking, err := h.db.GetUsageAPIKeyRanking(ctx, period, start, end, c.Query("q"), limit)
+	if err != nil {
+		writeInternalError(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, ranking)
 }
 
 // GetChartData 返回图表聚合数据（服务端分桶 + 内存缓存）

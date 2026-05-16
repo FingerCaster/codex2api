@@ -1575,6 +1575,101 @@ func TestGetUsageStatsByFilter(t *testing.T) {
 	}
 }
 
+func TestGetUsageAPIKeyRanking(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
+
+	db, err := New("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("New(sqlite) 返回错误: %v", err)
+	}
+	defer db.Close()
+
+	ctx := context.Background()
+	now := time.Now()
+	start := now.Add(-1 * time.Hour)
+	end := now.Add(1 * time.Hour)
+
+	alphaID, err := db.InsertAPIKey(ctx, "Team Alpha", "sk-alpha-12345678901234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey(alpha) 返回错误: %v", err)
+	}
+	betaID, err := db.InsertAPIKey(ctx, "Team Beta", "sk-beta-12345678901234567890")
+	if err != nil {
+		t.Fatalf("InsertAPIKey(beta) 返回错误: %v", err)
+	}
+
+	for _, usageLog := range []*UsageLogInput{
+		{
+			AccountID:    1,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.4",
+			StatusCode:   200,
+			InputTokens:  100,
+			OutputTokens: 20,
+			TotalTokens:  120,
+			CachedTokens: 10,
+			APIKeyID:     alphaID,
+			APIKeyName:   "Team Alpha",
+			APIKeyMasked: "sk-...alpha",
+			ServiceTier:  "default",
+		},
+		{
+			AccountID:    1,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.4",
+			StatusCode:   500,
+			InputTokens:  300,
+			OutputTokens: 100,
+			TotalTokens:  400,
+			APIKeyID:     betaID,
+			APIKeyName:   "Team Beta",
+			APIKeyMasked: "sk-...beta",
+		},
+		{
+			AccountID:    1,
+			Endpoint:     "/v1/responses",
+			Model:        "gpt-5.4",
+			StatusCode:   499,
+			InputTokens:  2000,
+			OutputTokens: 2000,
+			TotalTokens:  4000,
+			APIKeyID:     betaID,
+			APIKeyName:   "Team Beta",
+			APIKeyMasked: "sk-...beta",
+		},
+	} {
+		if err := db.InsertUsageLog(ctx, usageLog); err != nil {
+			t.Fatalf("InsertUsageLog 返回错误: %v", err)
+		}
+	}
+	db.flushLogs()
+
+	ranking, err := db.GetUsageAPIKeyRanking(ctx, "day", start, end, "", 10)
+	if err != nil {
+		t.Fatalf("GetUsageAPIKeyRanking 返回错误: %v", err)
+	}
+	if ranking.TotalRequests != 2 || ranking.TotalTokens != 520 {
+		t.Fatalf("ranking totals = requests %d tokens %d, want 2/520", ranking.TotalRequests, ranking.TotalTokens)
+	}
+	if len(ranking.Items) != 2 {
+		t.Fatalf("ranking items len = %d, want 2: %+v", len(ranking.Items), ranking.Items)
+	}
+	if ranking.Items[0].APIKeyID != betaID || ranking.Items[0].Rank != 1 || ranking.Items[0].ErrorCount != 1 {
+		t.Fatalf("ranking first item = %+v, want beta rank 1 with one error", ranking.Items[0])
+	}
+	if ranking.Items[1].APIKeyID != alphaID || ranking.Items[1].CachedTokens != 10 {
+		t.Fatalf("ranking second item = %+v, want alpha with cached tokens", ranking.Items[1])
+	}
+
+	filtered, err := db.GetUsageAPIKeyRanking(ctx, "day", start, end, "alpha", 10)
+	if err != nil {
+		t.Fatalf("filtered GetUsageAPIKeyRanking 返回错误: %v", err)
+	}
+	if filtered.TotalRequests != 1 || len(filtered.Items) != 1 || filtered.Items[0].APIKeyID != alphaID {
+		t.Fatalf("filtered ranking = totals %d items %+v, want only alpha", filtered.TotalRequests, filtered.Items)
+	}
+}
+
 func TestSQLiteTimeRangeQueriesHandleOffsetWindows(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "codex2api.db")
 

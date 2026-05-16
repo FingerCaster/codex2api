@@ -554,6 +554,22 @@ func TestGetUsageStatsRejectsIncompleteTimeRange(t *testing.T) {
 	assertErrorMessage(t, recorder, "start/end 参数需要同时提供，且格式为 RFC3339")
 }
 
+func TestGetUsageRankingRejectsInvalidPeriod(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{}
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/api/admin/usage/ranking?period=year", nil)
+
+	handler.GetUsageRanking(ctx)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", recorder.Code, http.StatusBadRequest)
+	}
+	assertErrorMessage(t, recorder, "period 参数无效，需要 day/week/month")
+}
+
 func TestUpdateAccountSchedulerRejectsInvalidBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

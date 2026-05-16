@@ -40,6 +40,7 @@ import type {
   UpdateOpenAIResponsesAccountRequest,
   UsageLogsResponse,
   UsageLogsPagedResponse,
+  UsageAPIKeyRanking,
   UsageStats,
   AccountGroup,
   AccountGroupsResponse,
@@ -290,6 +291,14 @@ export const api = {
     if (params.stream) searchParams.set('stream', params.stream)
     const query = searchParams.toString()
     return request<UsageStats>(query ? `/usage/stats?${query}` : '/usage/stats')
+  },
+  getUsageRanking: (params: { period?: 'day' | 'week' | 'month'; q?: string; limit?: number } = {}) => {
+    const searchParams = new URLSearchParams()
+    if (params.period) searchParams.set('period', params.period)
+    if (params.q) searchParams.set('q', params.q)
+    if (params.limit) searchParams.set('limit', String(params.limit))
+    const query = searchParams.toString()
+    return request<UsageAPIKeyRanking>(query ? `/usage/ranking?${query}` : '/usage/ranking')
   },
   getUsageLogs: (params: { start?: string; end?: string; limit?: number } = {}) => {
     const searchParams = new URLSearchParams()

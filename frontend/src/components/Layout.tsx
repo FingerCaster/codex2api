@@ -1,6 +1,6 @@
 import { type PropsWithChildren, type ReactNode, useEffect, useRef, useState } from 'react'
 import { NavLink, useLocation } from 'react-router-dom'
-import { LayoutDashboard, Users, Activity, Settings, Server, Sun, Moon, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink } from 'lucide-react'
+import { LayoutDashboard, Users, Activity, Settings, Server, Sun, Moon, Languages, Globe, BookOpen, KeyRound, Image as ImageIcon, ShieldAlert, ExternalLink, Trophy } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 import { DEFAULT_SITE_LOGO, useBranding } from '../branding'
 import { useTheme } from '../hooks/useTheme'
@@ -23,7 +23,8 @@ const navDefs: NavDef[] = [
   { to: '/images/studio', labelKey: 'nav.images', icon: <ImageIcon className="size-[18px]" />, activePrefix: '/images' },
   { to: '/prompt-filter/overview', labelKey: 'nav.promptFilter', icon: <ShieldAlert className="size-[18px]" />, activePrefix: '/prompt-filter' },
   { to: '/ops/overview', labelKey: 'nav.ops', icon: <Server className="size-[18px]" />, activePrefix: '/ops' },
-  { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" /> },
+  { to: '/usage', labelKey: 'nav.usage', icon: <Activity className="size-[18px]" />, end: true },
+  { to: '/usage/ranking', labelKey: 'nav.usageRanking', icon: <Trophy className="size-[18px]" /> },
   { to: '/settings', labelKey: 'nav.settings', icon: <Settings className="size-[18px]" /> },
   { to: '/docs', labelKey: 'nav2.docs', icon: <BookOpen className="size-[18px]" /> },
 ]

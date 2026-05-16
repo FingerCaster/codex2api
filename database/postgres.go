@@ -1969,6 +1969,35 @@ type UsageAPIKeyStat struct {
 	UserBilled float64 `json:"user_billed"`
 }
 
+// UsageAPIKeyRanking 按 API Key 统计指定周期内的消耗排行。
+type UsageAPIKeyRanking struct {
+	Period             string                   `json:"period"`
+	Start              time.Time                `json:"start"`
+	End                time.Time                `json:"end"`
+	UpdatedAt          time.Time                `json:"updated_at"`
+	TotalRequests      int64                    `json:"total_requests"`
+	TotalTokens        int64                    `json:"total_tokens"`
+	TotalUserBilled    float64                  `json:"total_user_billed"`
+	TotalAccountBilled float64                  `json:"total_account_billed"`
+	Items              []UsageAPIKeyRankingItem `json:"items"`
+}
+
+// UsageAPIKeyRankingItem 是单个 API Key 在排行榜中的聚合结果。
+type UsageAPIKeyRankingItem struct {
+	Rank          int       `json:"rank"`
+	APIKeyID      int64     `json:"api_key_id"`
+	Label         string    `json:"label"`
+	Requests      int64     `json:"requests"`
+	Tokens        int64     `json:"tokens"`
+	InputTokens   int64     `json:"input_tokens"`
+	OutputTokens  int64     `json:"output_tokens"`
+	CachedTokens  int64     `json:"cached_tokens"`
+	ErrorCount    int64     `json:"error_count"`
+	UserBilled    float64   `json:"user_billed"`
+	AccountBilled float64   `json:"account_billed"`
+	LastUsedAt    time.Time `json:"last_used_at"`
+}
+
 // TrafficSnapshot 近实时流量快照
 type TrafficSnapshot struct {
 	QPS     float64 `json:"qps"`
@@ -2362,6 +2391,131 @@ func (db *DB) getUsageAPIKeyStats(ctx context.Context, limit int) ([]UsageAPIKey
 		items = []UsageAPIKeyStat{}
 	}
 	return items, nil
+}
+
+// GetUsageAPIKeyRanking 返回指定时间窗口内 API Key 消耗排行榜。
+func (db *DB) GetUsageAPIKeyRanking(ctx context.Context, period string, start, end time.Time, query string, limit int) (*UsageAPIKeyRanking, error) {
+	if limit <= 0 {
+		limit = 50
+	}
+	if limit > 200 {
+		limit = 200
+	}
+
+	addArg := func(args *[]interface{}, value interface{}) string {
+		*args = append(*args, value)
+		return fmt.Sprintf("$%d", len(*args))
+	}
+
+	args := make([]interface{}, 0, 4)
+	startPlaceholder := addArg(&args, db.timeArg(start))
+	endPlaceholder := addArg(&args, db.timeArg(end))
+
+	conditions := []string{
+		fmt.Sprintf("u.created_at >= %s", startPlaceholder),
+		fmt.Sprintf("u.created_at < %s", endPlaceholder),
+		"u.status_code <> 499",
+	}
+
+	query = strings.TrimSpace(query)
+	if query != "" {
+		likePlaceholder := addArg(&args, "%"+query+"%")
+		conditions = append(conditions, fmt.Sprintf(`(
+			LOWER(COALESCE(k.name, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(k.key, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(u.api_key_name, '')) LIKE LOWER(%[1]s)
+			OR LOWER(COALESCE(u.api_key_masked, '')) LIKE LOWER(%[1]s)
+			OR CAST(COALESCE(u.api_key_id, 0) AS TEXT) LIKE %[1]s
+		)`, likePlaceholder))
+	}
+
+	where := strings.Join(conditions, " AND ")
+	totalArgs := append([]interface{}(nil), args...)
+	result := &UsageAPIKeyRanking{
+		Period:    period,
+		Start:     start,
+		End:       end,
+		UpdatedAt: time.Now(),
+		Items:     []UsageAPIKeyRankingItem{},
+	}
+
+	totalQuery := fmt.Sprintf(`
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(u.total_tokens), 0),
+			COALESCE(SUM(u.user_billed), 0),
+			COALESCE(SUM(u.account_billed), 0)
+		FROM usage_logs u
+		LEFT JOIN api_keys k ON COALESCE(u.api_key_id, 0) = k.id
+		WHERE %s
+	`, where)
+	if err := db.conn.QueryRowContext(ctx, totalQuery, totalArgs...).Scan(
+		&result.TotalRequests,
+		&result.TotalTokens,
+		&result.TotalUserBilled,
+		&result.TotalAccountBilled,
+	); err != nil {
+		return nil, err
+	}
+
+	limitPlaceholder := addArg(&args, limit)
+	sqlQuery := fmt.Sprintf(`
+		SELECT
+			COALESCE(u.api_key_id, 0) AS api_key_id,
+			COALESCE(NULLIF(MAX(k.name), ''), NULLIF(MAX(u.api_key_name), ''), NULLIF(MAX(u.api_key_masked), ''), 'unknown') AS api_key_label,
+			COUNT(*) AS requests,
+			COALESCE(SUM(u.total_tokens), 0) AS tokens,
+			COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+			COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+			COALESCE(SUM(u.cached_tokens), 0) AS cached_tokens,
+			COALESCE(SUM(CASE WHEN u.status_code >= 400 THEN 1 ELSE 0 END), 0) AS error_count,
+			COALESCE(SUM(u.user_billed), 0) AS user_billed,
+			COALESCE(SUM(u.account_billed), 0) AS account_billed,
+			MAX(u.created_at) AS last_used_at
+		FROM usage_logs u
+		LEFT JOIN api_keys k ON COALESCE(u.api_key_id, 0) = k.id
+		WHERE %s
+		GROUP BY 1
+		ORDER BY user_billed DESC, tokens DESC, requests DESC, api_key_label ASC
+		LIMIT %s
+	`, where, limitPlaceholder)
+
+	rows, err := db.conn.QueryContext(ctx, sqlQuery, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var item UsageAPIKeyRankingItem
+		var lastUsedAtRaw interface{}
+		if err := rows.Scan(
+			&item.APIKeyID,
+			&item.Label,
+			&item.Requests,
+			&item.Tokens,
+			&item.InputTokens,
+			&item.OutputTokens,
+			&item.CachedTokens,
+			&item.ErrorCount,
+			&item.UserBilled,
+			&item.AccountBilled,
+			&lastUsedAtRaw,
+		); err != nil {
+			return nil, err
+		}
+		item.Rank = len(result.Items) + 1
+		item.LastUsedAt, err = parseDBTimeValue(lastUsedAtRaw)
+		if err != nil {
+			return nil, err
+		}
+		result.Items = append(result.Items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 // GetTrafficSnapshot 获取近实时流量快照

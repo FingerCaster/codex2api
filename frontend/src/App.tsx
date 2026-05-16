@@ -16,6 +16,7 @@ const Settings = lazy(() => import('./pages/Settings'))
 const Docs = lazy(() => import('./pages/Docs'))
 const APIKeys = lazy(() => import('./pages/APIKeys'))
 const Usage = lazy(() => import('./pages/Usage'))
+const UsageRanking = lazy(() => import('./pages/UsageRanking'))
 const ImageStudio = lazy(() => import('./pages/ImageStudio'))
 const PromptFilter = lazy(() => import('./pages/PromptFilter'))
 
@@ -40,6 +41,7 @@ export default function App() {
                 <Route path="/ops/errors" element={<OperationsErrors />} />
                 <Route path="/ops/scheduler" element={<SchedulerBoard />} />
                 <Route path="/usage" element={<Usage />} />
+                <Route path="/usage/ranking" element={<UsageRanking />} />
                 <Route path="/settings" element={<Settings />} />
                 <Route path="/docs" element={<Docs />} />
                 <Route path="/guide" element={<Navigate to="/docs" replace />} />
