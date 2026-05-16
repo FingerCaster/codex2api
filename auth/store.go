@@ -94,6 +94,7 @@ type Account struct {
 	LastUnauthorizedAt       time.Time
 	LastRateLimitedAt        time.Time
 	LastTimeoutAt            time.Time
+	LastOtherErrorAt         time.Time
 	LastServerErrorAt        time.Time
 	LastRecoveryProbeAt      time.Time
 	RecoveryProbeSuccesses   int
@@ -154,6 +155,8 @@ const (
 	premium7dUrgencyMinRemainingPct  = 5.0
 	premium7dUrgencyFullRemainingPct = 70.0
 )
+
+const FailureKindOtherError = "other_error"
 
 // SchedulerBreakdown 调度评分拆解
 type SchedulerBreakdown struct {
@@ -605,6 +608,7 @@ func linearDecay(base float64, elapsed, window time.Duration) float64 {
 func (a *Account) schedulerBreakdownLocked(now time.Time) SchedulerBreakdown {
 	breakdown := SchedulerBreakdown{}
 	premium5hLimited := a.premium5hRateLimitedLocked(now)
+	suppressAPIOtherErrorPenalty := a.suppressAPIOtherErrorPenaltyLocked()
 
 	// 线性衰减惩罚：随时间平滑更无突变
 	if !a.LastUnauthorizedAt.IsZero() {
@@ -615,16 +619,18 @@ func (a *Account) schedulerBreakdownLocked(now time.Time) SchedulerBreakdown {
 		elapsed := now.Sub(a.LastRateLimitedAt)
 		breakdown.RateLimitPenalty = linearDecay(22, elapsed, time.Hour)
 	}
-	if !a.LastTimeoutAt.IsZero() {
+	if !suppressAPIOtherErrorPenalty && !a.LastTimeoutAt.IsZero() {
 		elapsed := now.Sub(a.LastTimeoutAt)
 		breakdown.TimeoutPenalty = linearDecay(18, elapsed, 15*time.Minute)
 	}
-	if !a.LastServerErrorAt.IsZero() {
+	if !suppressAPIOtherErrorPenalty && !a.LastServerErrorAt.IsZero() {
 		elapsed := now.Sub(a.LastServerErrorAt)
 		breakdown.ServerPenalty = linearDecay(12, elapsed, 15*time.Minute)
 	}
 
-	breakdown.FailurePenalty = float64(clampInt(a.FailureStreak*6, 0, 24))
+	if !suppressAPIOtherErrorPenalty {
+		breakdown.FailurePenalty = float64(clampInt(a.FailureStreak*6, 0, 24))
+	}
 	if !premium5hLimited {
 		breakdown.SuccessBonus = float64(clampInt(a.SuccessStreak*2, 0, 12))
 	}
@@ -635,7 +641,7 @@ func (a *Account) schedulerBreakdownLocked(now time.Time) SchedulerBreakdown {
 	}
 
 	// 滑动窗口成功率惩罚
-	if a.RecentResultsCnt >= 5 { // 至少 5 次请求才统计
+	if !suppressAPIOtherErrorPenalty && a.RecentResultsCnt >= 5 { // 至少 5 次请求才统计
 		rate := a.recentSuccessRateLocked()
 		switch {
 		case rate < 0.5:
@@ -802,6 +808,7 @@ func (a *Account) effectiveScoreBiasLocked(now time.Time, tier AccountHealthTier
 
 func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 	now := time.Now()
+	suppressAPIOtherErrorPenalty := a.suppressAPIOtherErrorPenaltyLocked()
 	breakdown := a.schedulerBreakdownLocked(now)
 	score := 100.0 -
 		breakdown.UnauthorizedPenalty -
@@ -823,7 +830,7 @@ func (a *Account) recomputeSchedulerLocked(baseLimit int64) {
 		tier = HealthTierWarm
 	}
 
-	if a.LastFailureAt.After(a.LastSuccessAt) && !a.LastFailureAt.IsZero() && tier == HealthTierHealthy {
+	if !suppressAPIOtherErrorPenalty && a.LastFailureAt.After(a.LastSuccessAt) && !a.LastFailureAt.IsZero() && tier == HealthTierHealthy {
 		tier = HealthTierWarm
 	}
 	if !a.LastUnauthorizedAt.IsZero() && now.Sub(a.LastUnauthorizedAt) < 24*time.Hour && tier == HealthTierHealthy {
@@ -1484,6 +1491,16 @@ func (a *Account) recentFailureRateLocked(minSamples int) (float64, int, bool) {
 	return float64(failures) * 100 / float64(a.RecentResultsCnt), a.RecentResultsCnt, true
 }
 
+func (a *Account) suppressAPIOtherErrorPenaltyLocked() bool {
+	if !a.isOpenAIResponsesAPILocked() {
+		return false
+	}
+	if a.LastOtherErrorAt.IsZero() || a.LastFailureAt.IsZero() {
+		return false
+	}
+	return a.LastOtherErrorAt.Equal(a.LastFailureAt)
+}
+
 // GetActiveRequests 获取当前并发数
 func (a *Account) GetActiveRequests() int64 {
 	return atomic.LoadInt64(&a.ActiveRequests)
@@ -1629,11 +1646,22 @@ func normalizeCooldownReason(reason string) string {
 
 func apiAccountFailureCooldownEligible(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "server", "timeout", "transport":
+	case FailureKindOtherError, "server", "timeout", "transport":
 		return true
 	default:
 		return false
 	}
+}
+
+func normalizeFailureKindForAccountLocked(acc *Account, kind string) string {
+	kind = strings.TrimSpace(kind)
+	if acc == nil || !acc.isOpenAIResponsesAPILocked() || kind == "" {
+		return kind
+	}
+	if kind == "unauthorized" {
+		return kind
+	}
+	return FailureKindOtherError
 }
 
 func cooldownTTL(resetAt time.Time) (time.Duration, bool) {
@@ -1890,6 +1918,9 @@ func (s *Store) WithModelCooldownFilter(model string, filter AccountFilter) Acco
 		}
 		if filter != nil && !filter(acc) {
 			return false
+		}
+		if acc.IsOpenAIResponsesAPI() {
+			return true
 		}
 		return !s.accountHasCachedModelCooldown(acc, key)
 	}
@@ -3844,6 +3875,7 @@ func (s *Store) RecoverAccountFromProbe(acc *Account, now time.Time) {
 	acc.LastUnauthorizedAt = time.Time{}
 	acc.LastRateLimitedAt = time.Time{}
 	acc.LastTimeoutAt = time.Time{}
+	acc.LastOtherErrorAt = time.Time{}
 	acc.LastServerErrorAt = time.Time{}
 	acc.FailureStreak = 0
 	acc.SuccessStreak = 1
@@ -3903,6 +3935,7 @@ func (s *Store) ForceAccountHealthy(acc *Account) {
 	acc.LastUnauthorizedAt = time.Time{}
 	acc.LastRateLimitedAt = time.Time{}
 	acc.LastTimeoutAt = time.Time{}
+	acc.LastOtherErrorAt = time.Time{}
 	acc.LastServerErrorAt = time.Time{}
 	acc.FailureStreak = 0
 	if acc.SuccessStreak <= 0 {
@@ -3962,6 +3995,7 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 	var failureRate float64
 	var failureSamples int
 	acc.mu.Lock()
+	kind = normalizeFailureKindForAccountLocked(acc, kind)
 	acc.recordLatencyLocked(latency)
 	acc.recordResultLocked(false)
 	acc.LastFailureAt = now
@@ -3975,24 +4009,32 @@ func (s *Store) ReportRequestFailure(acc *Account, kind string, latency time.Dur
 		acc.HealthTier = HealthTierBanned
 	case "timeout":
 		acc.LastTimeoutAt = now
-		if acc.HealthTier == HealthTierHealthy {
-			acc.HealthTier = HealthTierWarm
-		} else {
-			acc.HealthTier = HealthTierRisky
+		if !acc.isOpenAIResponsesAPILocked() {
+			if acc.HealthTier == HealthTierHealthy {
+				acc.HealthTier = HealthTierWarm
+			} else {
+				acc.HealthTier = HealthTierRisky
+			}
 		}
 	case "server":
 		acc.LastServerErrorAt = now
-		if acc.HealthTier == HealthTierHealthy {
-			acc.HealthTier = HealthTierWarm
-		} else {
-			acc.HealthTier = HealthTierRisky
+		if !acc.isOpenAIResponsesAPILocked() {
+			if acc.HealthTier == HealthTierHealthy {
+				acc.HealthTier = HealthTierWarm
+			} else {
+				acc.HealthTier = HealthTierRisky
+			}
 		}
 	case "transport":
-		if acc.HealthTier == HealthTierHealthy {
-			acc.HealthTier = HealthTierWarm
-		} else {
-			acc.HealthTier = HealthTierRisky
+		if !acc.isOpenAIResponsesAPILocked() {
+			if acc.HealthTier == HealthTierHealthy {
+				acc.HealthTier = HealthTierWarm
+			} else {
+				acc.HealthTier = HealthTierRisky
+			}
 		}
+	case FailureKindOtherError:
+		acc.LastOtherErrorAt = now
 	case "client":
 		if acc.HealthTier == HealthTierHealthy {
 			acc.HealthTier = HealthTierWarm

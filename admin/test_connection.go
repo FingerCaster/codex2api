@@ -671,11 +671,12 @@ func (h *Handler) BatchTest(c *gin.Context) {
 			case http.StatusTooManyRequests:
 				if isOpenAIResponsesAccount {
 					h.applyAPIAccountConnectionTestFailure(acc, resp.StatusCode, body, resp, testModel, 0)
+					atomic.AddInt64(&failedCount, 1)
 				} else {
 					proxy.SyncCodexUsageState(h.store, acc, resp)
 					proxy.Apply429Cooldown(h.store, acc, body, resp, testModel)
+					atomic.AddInt64(&rateLimitCount, 1)
 				}
-				atomic.AddInt64(&rateLimitCount, 1)
 			case http.StatusPaymentRequired, http.StatusForbidden:
 				if isOpenAIResponsesAccount {
 					_, rateLimited := h.applyAPIAccountConnectionTestFailure(acc, resp.StatusCode, body, resp, testModel, 0)
@@ -723,19 +724,12 @@ func (h *Handler) applyAPIAccountConnectionTestFailure(account *auth.Account, st
 	case http.StatusTooManyRequests:
 		h.store.ReportRequestFailure(account, "client", latency)
 		proxy.Apply429Cooldown(h.store, account, body, resp, model)
-		return true, true
+		return true, false
+	case apiProbeClientClosedStatus:
+		return true, false
 	case http.StatusPaymentRequired, http.StatusForbidden:
 		h.store.ReportRequestFailure(account, "client", latency)
-		reason := "quota_unavailable"
-		rateLimited := true
-		if proxy.IsDeactivatedWorkspaceError(body) {
-			reason = "subscription_unavailable"
-		} else if statusCode == http.StatusForbidden && !apiProbeBodyLooksQuotaLimited(body) {
-			reason = "unauthorized"
-			rateLimited = false
-		}
-		h.store.MarkCooldown(account, h.store.GetAPIAccountCooldown(), reason)
-		return true, rateLimited
+		return true, false
 	default:
 		if statusCode >= 500 {
 			h.store.ReportRequestFailure(account, "server", latency)

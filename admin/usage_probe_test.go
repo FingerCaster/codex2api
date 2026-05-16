@@ -67,20 +67,20 @@ func TestProbeUsageSnapshotOpenAIResponsesSuccessLeavesRecoveryToCaller(t *testi
 	}
 }
 
-func TestProbeUsageSnapshotOpenAIResponsesQuotaMarksShortCooldown(t *testing.T) {
+func TestProbeUsageSnapshotOpenAIResponsesQuotaCountsAsOtherError(t *testing.T) {
 	handler, account, cleanup := newAPIProbeTestHandler(http.StatusPaymentRequired, `{"error":{"message":"billing quota exhausted"}}`)
 	defer cleanup()
 
+	handler.store.ClearCooldown(account)
 	if err := handler.ProbeUsageSnapshot(context.Background(), account); err == nil {
 		t.Fatal("ProbeUsageSnapshot should return error for quota-limited probe response")
 	}
 
-	reason, until := account.GetCooldownSnapshot()
-	if reason != "quota_unavailable" {
-		t.Fatalf("CooldownReason = %q, want quota_unavailable", reason)
+	if account.HasActiveCooldown() {
+		t.Fatal("single quota probe response should not directly put API account into cooldown")
 	}
-	if until.IsZero() {
-		t.Fatal("CooldownUtil is zero, want short cooldown")
+	if account.LastOtherErrorAt.IsZero() {
+		t.Fatal("quota probe response should be counted as other_error")
 	}
 }
 
@@ -141,22 +141,20 @@ func TestAPIAccountConnectionTestUnauthorizedUsesShortCooldown(t *testing.T) {
 	}
 }
 
-func TestAPIAccountConnectionTestForbiddenQuotaUsesShortCooldown(t *testing.T) {
+func TestAPIAccountConnectionTestForbiddenQuotaCountsAsOtherError(t *testing.T) {
 	handler, account, cleanup := newAPIProbeTestHandler(http.StatusOK, `{"id":"resp_123"}`)
 	defer cleanup()
 
 	handler.store.ClearCooldown(account)
 	handled, rateLimited := handler.applyAPIAccountConnectionTestFailure(account, http.StatusForbidden, []byte(`{"error":{"message":"billing quota exhausted"}}`), nil, "gpt-5.4", 0)
-	if !handled || !rateLimited {
-		t.Fatalf("handled=%t rateLimited=%t, want true/true", handled, rateLimited)
+	if !handled || rateLimited {
+		t.Fatalf("handled=%t rateLimited=%t, want true/false", handled, rateLimited)
 	}
 
-	reason, until := account.GetCooldownSnapshot()
-	if reason != "quota_unavailable" {
-		t.Fatalf("CooldownReason = %q, want quota_unavailable", reason)
+	if account.HasActiveCooldown() {
+		t.Fatal("single forbidden quota response should not directly put API account into cooldown")
 	}
-	remaining := until.Sub(time.Now())
-	if remaining <= 0 || remaining > 3*time.Minute {
-		t.Fatalf("quota connection test cooldown remaining = %s, want short API cooldown", remaining)
+	if account.LastOtherErrorAt.IsZero() {
+		t.Fatal("forbidden quota response should be counted as other_error")
 	}
 }

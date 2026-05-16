@@ -12,6 +12,8 @@ import (
 	"github.com/codex2api/proxy"
 )
 
+const apiProbeClientClosedStatus = 499
+
 // ProbeUsageSnapshot 主动发送最小探针请求刷新账号用量
 func (h *Handler) ProbeUsageSnapshot(ctx context.Context, account *auth.Account) error {
 	if account == nil {
@@ -89,15 +91,10 @@ func (h *Handler) probeOpenAIResponsesAPIAccount(ctx context.Context, account *a
 		h.store.ReportRequestFailure(account, "client", 0)
 		proxy.Apply429Cooldown(h.store, account, body, resp, h.store.GetTestModel())
 		return fmt.Errorf("API 账号探针返回状态 %d", resp.StatusCode)
+	case apiProbeClientClosedStatus:
+		return fmt.Errorf("API 账号探针返回状态 %d", resp.StatusCode)
 	case http.StatusPaymentRequired, http.StatusForbidden:
 		h.store.ReportRequestFailure(account, "client", 0)
-		reason := "quota_unavailable"
-		if proxy.IsDeactivatedWorkspaceError(body) {
-			reason = "subscription_unavailable"
-		} else if resp.StatusCode == http.StatusForbidden && !apiProbeBodyLooksQuotaLimited(body) {
-			reason = "unauthorized"
-		}
-		h.store.MarkCooldown(account, h.store.GetAPIAccountCooldown(), reason)
 		return fmt.Errorf("API 账号探针返回状态 %d", resp.StatusCode)
 	default:
 		if resp.StatusCode >= 500 {

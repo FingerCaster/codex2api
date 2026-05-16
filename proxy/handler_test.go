@@ -426,6 +426,119 @@ func TestAccountFilterForSparkRequiresPro(t *testing.T) {
 	}
 }
 
+func newProxyAPIAccount(id int64) *auth.Account {
+	return &auth.Account{
+		DBID:         id,
+		UpstreamType: auth.UpstreamOpenAIResponses,
+		BaseURL:      "https://api.openai.com",
+		APIKey:       "sk-test",
+		PlanType:     "api",
+		Status:       auth.StatusReady,
+		HealthTier:   auth.HealthTierHealthy,
+		Models:       []string{"gpt-4.1"},
+	}
+}
+
+func TestAPIAccountHTTPFailureClassification(t *testing.T) {
+	account := newProxyAPIAccount(1)
+	cases := []struct {
+		status int
+		want   string
+	}{
+		{status: http.StatusUnauthorized, want: "unauthorized"},
+		{status: http.StatusTooManyRequests, want: auth.FailureKindOtherError},
+		{status: http.StatusForbidden, want: auth.FailureKindOtherError},
+		{status: http.StatusInternalServerError, want: auth.FailureKindOtherError},
+		{status: logStatusClientClosed, want: ""},
+	}
+	for _, tt := range cases {
+		if got := classifyHTTPFailureForAccount(account, tt.status); got != tt.want {
+			t.Fatalf("classifyHTTPFailureForAccount(%d) = %q, want %q", tt.status, got, tt.want)
+		}
+	}
+	if got := upstreamErrorKindForAccount(account, logStatusClientClosed, nil, codex429Decision{}); got != "" {
+		t.Fatalf("upstreamErrorKindForAccount(499) = %q, want empty", got)
+	}
+}
+
+func TestAPIAccountClientClosedDoesNotCountAsFailure(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{
+		MaxConcurrency:                  2,
+		APIAccountCircuitBreakerEnabled: true,
+		APIAccountFailureRateThreshold:  100,
+		APIAccountFailureMinSamples:     1,
+		APIAccountCooldownMinutes:       2,
+	})
+	account := newProxyAPIAccount(1)
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+
+	handler.reportRequestFailureForAccount(account, auth.FailureKindOtherError, logStatusClientClosed, 0)
+
+	if account.RecentResultsCnt != 0 {
+		t.Fatalf("RecentResultsCnt = %d, want 0 for client-closed request", account.RecentResultsCnt)
+	}
+	if !account.LastFailureAt.IsZero() {
+		t.Fatalf("LastFailureAt = %v, want zero for client-closed request", account.LastFailureAt)
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("client-closed request should not put API account into cooldown")
+	}
+}
+
+func TestMarkFakeAPIAccountSuccess(t *testing.T) {
+	account := newProxyAPIAccount(1)
+	input := &database.UsageLogInput{StatusCode: http.StatusOK}
+
+	if !markFakeAPIAccountSuccess(account, input) {
+		t.Fatal("200 with zero input/output tokens should be marked fake for API accounts")
+	}
+	if input.UpstreamErrorKind != auth.FailureKindOtherError {
+		t.Fatalf("UpstreamErrorKind = %q, want %q", input.UpstreamErrorKind, auth.FailureKindOtherError)
+	}
+	if input.ErrorMessage == "" {
+		t.Fatal("fake 200 should receive an error message")
+	}
+
+	input = &database.UsageLogInput{StatusCode: http.StatusOK, OutputTokens: 1}
+	if markFakeAPIAccountSuccess(account, input) {
+		t.Fatal("200 with output tokens should not be marked fake")
+	}
+}
+
+func TestApply429CooldownAPIAccountDoesNotSetDirectCooldown(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-4.1"})
+	account := newProxyAPIAccount(1)
+	store.AddAccount(account)
+
+	decision := Apply429Cooldown(store, account, []byte(`{"error":{"type":"rate_limit_error","message":"Too many requests"}}`), &http.Response{Header: make(http.Header)}, "gpt-4.1")
+
+	if decision.Scope != rateLimitScopeAccount || decision.Reason != auth.FailureKindOtherError {
+		t.Fatalf("Apply429Cooldown() = %#v, want account other_error decision", decision)
+	}
+	if account.HasActiveCooldown() {
+		t.Fatal("API account 429 should not directly enter cooldown")
+	}
+	if account.IsModelRateLimited("gpt-4.1") {
+		t.Fatal("API account 429 should not set model cooldown")
+	}
+}
+
+func TestAPIAccountIgnoresModelCooldownFilters(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	account := newProxyAPIAccount(1)
+	account.SetModelCooldownUntil("gpt-4.1", "model_capacity", time.Now().Add(time.Minute))
+
+	responsesFilter := accountFilterForResponsesModel("gpt-4.1", false)
+	if !responsesFilter(account) {
+		t.Fatal("responses filter should allow API account even with a stale model cooldown")
+	}
+	wrapped := store.WithModelCooldownFilter("gpt-4.1", responsesFilter)
+	if !wrapped(account) {
+		t.Fatal("store model cooldown filter should ignore model cooldowns for API accounts")
+	}
+}
+
 func TestSupportedModelIDsIncludesOpenAIResponsesAccountModels(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
 	store.AddAccount(&auth.Account{

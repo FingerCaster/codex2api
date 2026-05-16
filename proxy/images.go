@@ -1339,7 +1339,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		durationMs := int(time.Since(start).Milliseconds())
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				h.reportRequestFailureForAccount(account, kind, http.StatusBadGateway, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			excludeAccounts[account.ID()] = true
@@ -1355,8 +1355,8 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
+				h.reportRequestFailureForAccount(account, kind, resp.StatusCode, time.Duration(durationMs)*time.Millisecond)
 			}
 			if !isGenericProvider {
 				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
@@ -1389,7 +1389,7 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 				Stream:            stream,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind: upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 			if shouldRetry {
@@ -1480,16 +1480,16 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 			logInput.TotalTokens = logInput.PromptTokens + imageCount
 		}
 		applyImageUsageLogInfo(logInput, imageLogInfo)
-		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)
 		if readErr != nil {
-			h.store.ReportRequestFailure(account, "transport", time.Duration(logInput.DurationMs)*time.Millisecond)
+			h.reportRequestFailureForAccount(account, "transport", statusCode, time.Duration(logInput.DurationMs)*time.Millisecond)
 		} else {
 			h.store.ClearModelCooldown(account, requestModel)
-			h.store.ReportRequestSuccess(account, time.Duration(logInput.DurationMs)*time.Millisecond)
+			h.reportRequestSuccessOrFakeAPIError(account, logInput, time.Duration(logInput.DurationMs)*time.Millisecond)
 		}
+		h.logUsageForRequest(c, logInput)
 		h.store.Release(account)
 		return
 	}

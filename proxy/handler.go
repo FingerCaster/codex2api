@@ -237,7 +237,7 @@ func accountFilterForModel(model string) auth.AccountFilter {
 			return false
 		}
 		if account.IsOpenAIResponsesAPI() {
-			return account.SupportsOpenAIResponsesModel(model) && (model == "" || !account.IsModelRateLimited(model))
+			return account.SupportsOpenAIResponsesModel(model)
 		}
 		if model != "" && account.IsModelRateLimited(model) {
 			return false
@@ -257,7 +257,7 @@ func accountFilterForResponsesModel(model string, allowCodexAccounts bool) auth.
 			return false
 		}
 		if account.IsOpenAIResponsesAPI() {
-			return account.SupportsOpenAIResponsesModel(model) && (model == "" || !account.IsModelRateLimited(model))
+			return account.SupportsOpenAIResponsesModel(model)
 		}
 		if !allowCodexAccounts {
 			return false
@@ -596,6 +596,13 @@ func (h *Handler) logUsageForRequest(c *gin.Context, input *database.UsageLogInp
 	h.logUsage(input)
 }
 
+func shouldCountAPIAccountFailure(kind string, statusCode int) bool {
+	if statusCode == logStatusClientClosed {
+		return false
+	}
+	return strings.TrimSpace(kind) != ""
+}
+
 func estimateTokenCount(text string) int {
 	text = strings.TrimSpace(text)
 	if text == "" {
@@ -754,15 +761,15 @@ func (h *Handler) proxyGenericOpenAIResponse(c *gin.Context, resp *http.Response
 			}
 			input.TotalTokens = input.InputTokens + input.OutputTokens
 		}
+		h.reportRequestSuccessOrFakeAPIError(account, input, time.Duration(input.DurationMs)*time.Millisecond)
 		h.logUsageForRequest(c, input)
-		h.store.ReportRequestSuccess(account, time.Duration(input.DurationMs)*time.Millisecond)
 		return
 	}
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		ErrorToGinResponse(c, ErrUpstream(resp.StatusCode, "读取上游响应失败", err))
-		h.store.ReportRequestFailure(account, "transport", time.Duration(input.DurationMs)*time.Millisecond)
+		h.reportRequestFailureForAccount(account, "transport", resp.StatusCode, time.Duration(input.DurationMs)*time.Millisecond)
 		return
 	}
 
@@ -795,16 +802,18 @@ func (h *Handler) proxyGenericOpenAIResponse(c *gin.Context, resp *http.Response
 
 	if !gjson.ValidBytes(body) && strings.Contains(strings.ToLower(resp.Header.Get("content-type")), "json") {
 		ErrorToGinResponse(c, ErrUpstream(resp.StatusCode, "上游返回了无效 JSON", errors.New("invalid json")))
-		h.store.ReportRequestFailure(account, "server", time.Duration(input.DurationMs)*time.Millisecond)
+		h.reportRequestFailureForAccount(account, "server", resp.StatusCode, time.Duration(input.DurationMs)*time.Millisecond)
 		return
 	}
 
-	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
-	h.logUsageForRequest(c, input)
 	if resp.StatusCode >= 400 {
-		h.store.ReportRequestFailure(account, classifyHTTPFailure(resp.StatusCode), time.Duration(input.DurationMs)*time.Millisecond)
+		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
+		h.logUsageForRequest(c, input)
+		h.reportRequestFailureForAccount(account, classifyHTTPFailureForAccount(account, resp.StatusCode), resp.StatusCode, time.Duration(input.DurationMs)*time.Millisecond)
 	} else {
-		h.store.ReportRequestSuccess(account, time.Duration(input.DurationMs)*time.Millisecond)
+		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), body)
+		h.reportRequestSuccessOrFakeAPIError(account, input, time.Duration(input.DurationMs)*time.Millisecond)
+		h.logUsageForRequest(c, input)
 	}
 }
 
@@ -855,6 +864,84 @@ func classifyHTTPFailure(statusCode int) string {
 	default:
 		return ""
 	}
+}
+
+const apiAccountFake200Message = "上游返回 200 但 input/output token 均为 0"
+
+func failureKindForAccount(account *auth.Account, kind string) string {
+	kind = strings.TrimSpace(kind)
+	if account == nil || !account.IsOpenAIResponsesAPI() || kind == "" {
+		return kind
+	}
+	if kind == "unauthorized" {
+		return kind
+	}
+	return auth.FailureKindOtherError
+}
+
+func classifyHTTPFailureForAccount(account *auth.Account, statusCode int) string {
+	if account != nil && account.IsOpenAIResponsesAPI() {
+		switch {
+		case statusCode == logStatusClientClosed:
+			return ""
+		case statusCode == http.StatusUnauthorized:
+			return "unauthorized"
+		case statusCode >= 400:
+			return auth.FailureKindOtherError
+		default:
+			return ""
+		}
+	}
+	return classifyHTTPFailure(statusCode)
+}
+
+func upstreamErrorKindForAccount(account *auth.Account, statusCode int, body []byte, decision codex429Decision) string {
+	if statusCode == logStatusClientClosed {
+		return ""
+	}
+	return failureKindForAccount(account, upstreamErrorKind(statusCode, body, decision))
+}
+
+func isFakeAPIAccountSuccess(account *auth.Account, input *database.UsageLogInput) bool {
+	return account != nil &&
+		account.IsOpenAIResponsesAPI() &&
+		input != nil &&
+		input.StatusCode == http.StatusOK &&
+		input.InputTokens == 0 &&
+		input.OutputTokens == 0
+}
+
+func markFakeAPIAccountSuccess(account *auth.Account, input *database.UsageLogInput) bool {
+	if !isFakeAPIAccountSuccess(account, input) {
+		return false
+	}
+	input.UpstreamErrorKind = auth.FailureKindOtherError
+	if strings.TrimSpace(input.ErrorMessage) == "" {
+		input.ErrorMessage = apiAccountFake200Message
+	}
+	return true
+}
+
+func (h *Handler) reportRequestSuccessOrFakeAPIError(account *auth.Account, input *database.UsageLogInput, latency time.Duration) {
+	if h == nil || h.store == nil {
+		return
+	}
+	if markFakeAPIAccountSuccess(account, input) {
+		h.store.ReportRequestFailure(account, auth.FailureKindOtherError, latency)
+		return
+	}
+	h.store.ReportRequestSuccess(account, latency)
+}
+
+func (h *Handler) reportRequestFailureForAccount(account *auth.Account, kind string, statusCode int, latency time.Duration) {
+	if h == nil || h.store == nil {
+		return
+	}
+	kind = failureKindForAccount(account, kind)
+	if !shouldCountAPIAccountFailure(kind, statusCode) {
+		return
+	}
+	h.store.ReportRequestFailure(account, kind, latency)
 }
 
 type streamOutcome struct {
@@ -1384,31 +1471,6 @@ func upstreamErrorKind(statusCode int, body []byte, decision codex429Decision) s
 	}
 }
 
-func isAPIAccountQuotaUnavailableError(statusCode int, body []byte) bool {
-	if statusCode == http.StatusPaymentRequired {
-		return true
-	}
-	if statusCode != http.StatusForbidden {
-		return false
-	}
-	if IsDeactivatedWorkspaceError(body) {
-		return true
-	}
-	joined := strings.ToLower(strings.Join([]string{
-		gjson.GetBytes(body, "error.type").String(),
-		gjson.GetBytes(body, "error.code").String(),
-		gjson.GetBytes(body, "error.message").String(),
-		gjson.GetBytes(body, "message").String(),
-		string(body),
-	}, " "))
-	for _, needle := range []string{"quota", "credit", "billing", "subscription", "insufficient", "exhausted", "limit"} {
-		if strings.Contains(joined, needle) {
-			return true
-		}
-	}
-	return false
-}
-
 func parseUsageLimitDetails(body []byte) (usageLimitDetails, bool) {
 	if len(body) == 0 {
 		return usageLimitDetails{}, false
@@ -1562,7 +1624,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 			if reqErr != nil {
 				if kind := classifyTransportFailure(reqErr); kind != "" {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+					h.reportRequestFailureForAccount(account, kind, http.StatusBadGateway, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -1605,8 +1667,8 @@ func (h *Handler) Responses(c *gin.Context) {
 					}
 				}
 
-				if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-					h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
+					h.reportRequestFailureForAccount(account, kind, resp.StatusCode, time.Duration(durationMs)*time.Millisecond)
 				}
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -1630,7 +1692,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					ServiceTier:       serviceTier,
 					IsRetryAttempt:    shouldRetry,
 					AttemptIndex:      attempt + 1,
-					UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+					UpstreamErrorKind: upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 					ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 				})
 
@@ -1739,7 +1801,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			if shouldTransparentRetryStream(outcome, attempt, maxRetries, wroteAnyBody, c.Request.Context().Err(), writeErr) {
 				log.Printf("OpenAI Responses 上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 				recyclePooledClient(account, proxyURL)
-				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				h.reportRequestFailureForAccount(account, outcome.failureKind, outcome.logStatusCode, time.Duration(totalDuration)*time.Millisecond)
 				resp.Body.Close()
 				h.store.Release(account)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -1782,7 +1844,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			if outcome.logStatusCode != http.StatusOK {
 				logInput.ErrorMessage = usageLogErrorMessage(outcome.logStatusCode, []byte(outcome.failureMessage))
-				logInput.UpstreamErrorKind = outcome.failureKind
+				logInput.UpstreamErrorKind = failureKindForAccount(account, outcome.failureKind)
 			}
 			if usage != nil {
 				logInput.PromptTokens = usage.PromptTokens
@@ -1794,16 +1856,18 @@ func (h *Handler) Responses(c *gin.Context) {
 				logInput.CachedTokens = usage.CachedTokens
 			}
 			applyImageUsageLogInfo(logInput, imageLogInfo)
+			if outcome.logStatusCode == http.StatusOK {
+				h.reportRequestSuccessOrFakeAPIError(account, logInput, time.Duration(totalDuration)*time.Millisecond)
+			}
 			h.logUsageForRequest(c, logInput)
 
 			resp.Body.Close()
 			if outcome.penalize {
 				recyclePooledClient(account, proxyURL)
-				h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+				h.reportRequestFailureForAccount(account, outcome.failureKind, outcome.logStatusCode, time.Duration(totalDuration)*time.Millisecond)
 				h.store.UnbindSessionAffinity(affinityKey, account.ID())
 			} else if outcome.logStatusCode == http.StatusOK {
 				h.store.ClearModelCooldown(account, effectiveModel)
-				h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 			}
 			h.store.Release(account)
 			return
@@ -1826,7 +1890,7 @@ func (h *Handler) Responses(c *gin.Context) {
 
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				h.reportRequestFailureForAccount(account, kind, http.StatusBadGateway, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -1870,8 +1934,8 @@ func (h *Handler) Responses(c *gin.Context) {
 				}
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
+				h.reportRequestFailureForAccount(account, kind, resp.StatusCode, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
 			h.store.Release(account)
@@ -1898,7 +1962,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				ServiceTier:       serviceTier,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind: upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
@@ -2064,7 +2128,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/responses): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.reportRequestFailureForAccount(account, outcome.failureKind, outcome.logStatusCode, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -2119,7 +2183,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
-			logInput.UpstreamErrorKind = outcome.failureKind
+			logInput.UpstreamErrorKind = failureKindForAccount(account, outcome.failureKind)
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
@@ -2131,17 +2195,19 @@ func (h *Handler) Responses(c *gin.Context) {
 			logInput.CachedTokens = usage.CachedTokens
 		}
 		applyImageUsageLogInfo(logInput, imageLogInfo)
+		if outcome.logStatusCode == http.StatusOK {
+			h.reportRequestSuccessOrFakeAPIError(account, logInput, time.Duration(totalDuration)*time.Millisecond)
+		}
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.reportRequestFailureForAccount(account, outcome.failureKind, outcome.logStatusCode, time.Duration(totalDuration)*time.Millisecond)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, effectiveModel)
-			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
 		return
@@ -2272,7 +2338,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				h.reportRequestFailureForAccount(account, kind, http.StatusBadGateway, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -2313,8 +2379,8 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				}
 			}
 
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
+				h.reportRequestFailureForAccount(account, kind, resp.StatusCode, time.Duration(durationMs)*time.Millisecond)
 			}
 			if !isGenericProvider {
 				SyncCodexUsageState(h.store, account, resp)
@@ -2344,7 +2410,7 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 				ServiceTier:       serviceTier,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind: upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
@@ -2567,7 +2633,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				h.reportRequestFailureForAccount(account, kind, http.StatusBadGateway, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -2588,8 +2654,8 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
+				h.reportRequestFailureForAccount(account, kind, resp.StatusCode, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)
 			errBody, _ := io.ReadAll(resp.Body)
@@ -2623,7 +2689,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 				ServiceTier:       serviceTier,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind: upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
@@ -2810,7 +2876,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			log.Printf("上游流在首包前断开，重置连接并重试 (attempt %d/%d, account %d, /v1/chat/completions): %s", attempt+1, maxRetries+1, account.ID(), outcome.failureMessage)
 			recyclePooledClient(account, proxyURL)
 			SyncCodexUsageState(h.store, account, resp)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.reportRequestFailureForAccount(account, outcome.failureKind, outcome.logStatusCode, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -2865,7 +2931,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
-			logInput.UpstreamErrorKind = outcome.failureKind
+			logInput.UpstreamErrorKind = failureKindForAccount(account, outcome.failureKind)
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
@@ -2876,17 +2942,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
 		}
+		if logStatusCode == http.StatusOK {
+			h.reportRequestSuccessOrFakeAPIError(account, logInput, time.Duration(totalDuration)*time.Millisecond)
+		}
 		h.logUsageForRequest(c, logInput)
 
 		resp.Body.Close()
 		SyncCodexUsageState(h.store, account, resp)
 		if outcome.penalize {
 			recyclePooledClient(account, proxyURL)
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.reportRequestFailureForAccount(account, outcome.failureKind, outcome.logStatusCode, time.Duration(totalDuration)*time.Millisecond)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, effectiveModel)
-			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
 		return
@@ -3199,6 +3267,9 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 	if store == nil || account == nil {
 		return decision
 	}
+	if account.IsOpenAIResponsesAPI() {
+		return codex429Decision{Scope: rateLimitScopeAccount, Reason: auth.FailureKindOtherError}
+	}
 	if details, ok := parseUsageLimitDetails(body); ok {
 		store.ApplyUsageLimitMetadata(account, details.planType, decision.ResetAt)
 	}
@@ -3225,6 +3296,10 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 	switch statusCode {
 	case http.StatusTooManyRequests:
 		decision := Apply429Cooldown(h.store, account, body, resp, model)
+		if account != nil && account.IsOpenAIResponsesAPI() {
+			log.Printf("API 账号 %d 收到 429，按 other_error 计入失败率，不直接冷却", account.ID())
+			return decision
+		}
 		if decision.Scope == rateLimitScopeModel {
 			log.Printf("账号 %d 模型 %s 触发短时限流 (reason=%s)，冷却到 %s", account.ID(), decision.Model, decision.Reason, decision.ResetAt.Format(time.RFC3339))
 			return decision
@@ -3261,16 +3336,8 @@ func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, b
 		}
 	case http.StatusPaymentRequired, http.StatusForbidden:
 		if account.IsOpenAIResponsesAPI() {
-			if IsDeactivatedWorkspaceError(body) {
-				log.Printf("API 账号 %d 工作区已停用，进入短冷却", account.ID())
-				h.store.MarkCooldown(account, h.store.GetAPIAccountCooldown(), "subscription_unavailable")
-				return codex429Decision{}
-			}
-			if isAPIAccountQuotaUnavailableError(statusCode, body) {
-				log.Printf("API 账号 %d 额度/订阅不可用，进入短冷却", account.ID())
-				h.store.MarkCooldown(account, h.store.GetAPIAccountCooldown(), "quota_unavailable")
-				return codex429Decision{}
-			}
+			log.Printf("API 账号 %d 收到 %d，按 other_error 计入失败率，不直接冷却", account.ID(), statusCode)
+			return codex429Decision{Scope: rateLimitScopeAccount, Reason: auth.FailureKindOtherError}
 		}
 		if IsDeactivatedWorkspaceError(body) {
 			log.Printf("账号 %d 工作区已停用，标记为错误", account.ID())

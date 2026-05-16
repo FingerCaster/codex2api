@@ -181,7 +181,7 @@ func (h *Handler) Messages(c *gin.Context) {
 
 		if reqErr != nil {
 			if kind := classifyTransportFailure(reqErr); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+				h.reportRequestFailureForAccount(account, kind, http.StatusBadGateway, time.Duration(durationMs)*time.Millisecond)
 			}
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -201,8 +201,8 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
-				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
+			if kind := classifyHTTPFailureForAccount(account, resp.StatusCode); kind != "" {
+				h.reportRequestFailureForAccount(account, kind, resp.StatusCode, time.Duration(durationMs)*time.Millisecond)
 			}
 			if !isGenericProvider {
 				if usagePct, ok := parseCodexUsageHeaders(resp, account); ok {
@@ -238,7 +238,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				Stream:            isStream,
 				IsRetryAttempt:    shouldRetry,
 				AttemptIndex:      attempt + 1,
-				UpstreamErrorKind: upstreamErrorKind(resp.StatusCode, errBody, decision),
+				UpstreamErrorKind: upstreamErrorKindForAccount(account, resp.StatusCode, errBody, decision),
 				ErrorMessage:      usageLogErrorMessage(resp.StatusCode, errBody),
 			})
 
@@ -418,7 +418,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					h.store.PersistUsageSnapshot(account, usagePct)
 				}
 			}
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.reportRequestFailureForAccount(account, outcome.failureKind, outcome.logStatusCode, time.Duration(totalDuration)*time.Millisecond)
 			resp.Body.Close()
 			h.store.Release(account)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
@@ -459,7 +459,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		}
 		if logStatusCode != http.StatusOK {
 			logInput.ErrorMessage = usageLogErrorMessage(logStatusCode, []byte(outcome.failureMessage))
-			logInput.UpstreamErrorKind = outcome.failureKind
+			logInput.UpstreamErrorKind = failureKindForAccount(account, outcome.failureKind)
 		}
 		if usage != nil {
 			logInput.PromptTokens = usage.PromptTokens
@@ -469,6 +469,9 @@ func (h *Handler) Messages(c *gin.Context) {
 			logInput.OutputTokens = usage.OutputTokens
 			logInput.ReasoningTokens = usage.ReasoningTokens
 			logInput.CachedTokens = usage.CachedTokens
+		}
+		if logStatusCode == http.StatusOK {
+			h.reportRequestSuccessOrFakeAPIError(account, logInput, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.logUsageForRequest(c, logInput)
 
@@ -482,11 +485,10 @@ func (h *Handler) Messages(c *gin.Context) {
 			if !isGenericProvider {
 				recyclePooledClient(account, proxyURL)
 			}
-			h.store.ReportRequestFailure(account, outcome.failureKind, time.Duration(totalDuration)*time.Millisecond)
+			h.reportRequestFailureForAccount(account, outcome.failureKind, outcome.logStatusCode, time.Duration(totalDuration)*time.Millisecond)
 			h.store.UnbindSessionAffinity(affinityKey, account.ID())
 		} else if outcome.logStatusCode == http.StatusOK {
 			h.store.ClearModelCooldown(account, effectiveModel)
-			h.store.ReportRequestSuccess(account, time.Duration(totalDuration)*time.Millisecond)
 		}
 		h.store.Release(account)
 		return

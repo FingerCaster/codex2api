@@ -68,17 +68,73 @@ func TestAPIAccountServerFailuresCooldownOnlyAfterThreshold(t *testing.T) {
 	}
 }
 
-func TestAPIAccountClientFailureDoesNotTriggerFailureRateCooldown(t *testing.T) {
+func TestAPIAccountSingleServerFailureKeepsHealthy(t *testing.T) {
 	store := newAPIAccountCooldownTestStore()
 	acc := newTestAPIAccount(1)
 	store.AddAccount(acc)
 
-	for i := 0; i < 5; i++ {
-		store.ReportRequestFailure(acc, "client", 0)
-	}
+	store.ReportRequestFailure(acc, "server", 0)
 
 	if acc.HasActiveCooldown() {
-		t.Fatal("client failures should not trigger API account failure-rate cooldown")
+		t.Fatal("single API 5xx should not put account into cooldown")
+	}
+	if tier := acc.GetHealthTier(); tier != string(HealthTierHealthy) {
+		t.Fatalf("HealthTier = %s, want %s after one API 5xx", tier, HealthTierHealthy)
+	}
+	if acc.SchedulerScore != 100 {
+		t.Fatalf("SchedulerScore = %v, want 100 after one API 5xx", acc.SchedulerScore)
+	}
+	got := store.Next()
+	if got == nil {
+		t.Fatal("healthy API account should stay schedulable after one 5xx")
+	}
+	store.Release(got)
+}
+
+func TestAPIAccountRepeatedOtherErrorsBeforeThresholdKeepHealthy(t *testing.T) {
+	store := newAPIAccountCooldownTestStore()
+	acc := newTestAPIAccount(1)
+	store.AddAccount(acc)
+
+	for i := 0; i < store.GetAPIAccountFailureMinSamples()-1; i++ {
+		store.ReportRequestFailure(acc, "server", 0)
+		if acc.HasActiveCooldown() {
+			t.Fatalf("failure %d unexpectedly put account into cooldown", i+1)
+		}
+	}
+	if tier := acc.GetHealthTier(); tier != string(HealthTierHealthy) {
+		t.Fatalf("HealthTier = %s, want %s before API other_error threshold", tier, HealthTierHealthy)
+	}
+	if acc.SchedulerScore != 100 {
+		t.Fatalf("SchedulerScore = %v, want 100 before API other_error threshold", acc.SchedulerScore)
+	}
+}
+
+func TestAPIAccountOtherErrorCooldownUsesConfiguredSamples(t *testing.T) {
+	store := newAPIAccountCooldownTestStore()
+	store.SetAPIAccountFailureMinSamples(3)
+	store.SetAPIAccountFailureRateThreshold(100)
+	acc := newTestAPIAccount(1)
+	store.AddAccount(acc)
+
+	for i := 0; i < 2; i++ {
+		store.ReportRequestFailure(acc, "client", 0)
+		if acc.HasActiveCooldown() {
+			t.Fatalf("client failure %d unexpectedly put account into cooldown", i+1)
+		}
+	}
+	if acc.LastOtherErrorAt.IsZero() {
+		t.Fatal("client failures for API accounts should normalize to other_error")
+	}
+	if tier := acc.GetHealthTier(); tier != string(HealthTierHealthy) {
+		t.Fatalf("HealthTier = %s, want %s before configured sample count", tier, HealthTierHealthy)
+	}
+
+	store.ReportRequestFailure(acc, "client", 0)
+
+	reason, _ := acc.GetCooldownSnapshot()
+	if reason != "api_account_failure_rate" {
+		t.Fatalf("CooldownReason = %q, want api_account_failure_rate after configured sample count", reason)
 	}
 }
 
