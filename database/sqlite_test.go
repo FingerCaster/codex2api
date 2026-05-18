@@ -287,6 +287,7 @@ func TestSQLiteSystemSettingsPersistsSessionAffinityTTL(t *testing.T) {
 		StreamFlushPolicy:                      "immediate",
 		StreamFlushIntervalMS:                  20,
 		ImageStorageConfig:                     "{}",
+		DisableV1Messages:                      true,
 	})
 	if err != nil {
 		t.Fatalf("UpdateSystemSettings 返回错误: %v", err)
@@ -325,6 +326,9 @@ func TestSQLiteSystemSettingsPersistsSessionAffinityTTL(t *testing.T) {
 	}
 	if settings.APIAccountRecoveryGuardMinutes != 4 {
 		t.Fatalf("APIAccountRecoveryGuardMinutes = %d, want 4", settings.APIAccountRecoveryGuardMinutes)
+	}
+	if !settings.DisableV1Messages {
+		t.Fatal("DisableV1Messages = false, want true")
 	}
 }
 

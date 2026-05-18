@@ -1584,6 +1584,7 @@ type Store struct {
 	allowRemoteMigration atomic.Bool  // 是否允许远程迁移拉取账号
 	modelMapping         atomic.Value // 模型映射 JSON 字符串
 	promptFilterConfig   atomic.Value // promptfilter.Config
+	disableV1Messages    atomic.Bool
 	sessionAffinityTTL   int64
 	sessionMu            sync.RWMutex
 	sessionBindings      map[string]sessionAffinity
@@ -2017,6 +2018,7 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	if settings.ModelMapping != "" {
 		s.modelMapping.Store(settings.ModelMapping)
 	}
+	s.disableV1Messages.Store(settings.DisableV1Messages)
 	s.SetPromptFilterConfig(promptFilterConfigFromSettings(settings))
 	// 环境变量优先，否则读数据库设置
 	fastEnabled := fastSchedulerEnabledFromEnv() || settings.FastSchedulerEnabled
@@ -3269,6 +3271,17 @@ func (s *Store) GetModelMapping() string {
 		return v
 	}
 	return "{}"
+}
+
+func (s *Store) SetDisableV1Messages(disabled bool) {
+	if s == nil {
+		return
+	}
+	s.disableV1Messages.Store(disabled)
+}
+
+func (s *Store) GetDisableV1Messages() bool {
+	return s != nil && s.disableV1Messages.Load()
 }
 
 func promptFilterConfigFromSettings(settings *database.SystemSettings) promptfilter.Config {

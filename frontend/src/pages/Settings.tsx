@@ -420,6 +420,7 @@ export default function Settings() {
     usage_log_flush_interval_seconds: 5,
     stream_flush_policy: 'immediate',
     stream_flush_interval_ms: 20,
+    disable_v1_messages: false,
     image_storage_backend: 'local',
     image_s3_endpoint: '',
     image_s3_region: '',
@@ -866,6 +867,13 @@ export default function Settings() {
                   max={10080}
                   value={settingsForm.session_affinity_ttl_minutes}
                   onChange={(e: ChangeEvent<HTMLInputElement>) => setSettingsForm(f => ({ ...f, session_affinity_ttl_minutes: parseInt(e.target.value) || 0 }))}
+                />
+              </SettingField>
+              <SettingField label={t('settings.disableV1Messages')} description={t('settings.disableV1MessagesDesc')}>
+                <Select
+                  value={settingsForm.disable_v1_messages ? 'true' : 'false'}
+                  onValueChange={(value) => setSettingsForm((f) => ({ ...f, disable_v1_messages: value === 'true' }))}
+                  options={booleanOptions}
                 />
               </SettingField>
             </div>

@@ -342,6 +342,7 @@ export interface SystemSettings {
   usage_log_flush_interval_seconds: number
   stream_flush_policy: 'immediate' | 'coalesce' | string
   stream_flush_interval_ms: number
+  disable_v1_messages: boolean
   image_storage_backend: 'local' | 's3' | string
   image_s3_endpoint: string
   image_s3_region: string

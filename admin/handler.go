@@ -3793,6 +3793,7 @@ type settingsResponse struct {
 	ImageS3SecretKey                       string `json:"image_s3_secret_key"`
 	ImageS3Prefix                          string `json:"image_s3_prefix"`
 	ImageS3ForcePathStyle                  bool   `json:"image_s3_force_path_style"`
+	DisableV1Messages                      bool   `json:"disable_v1_messages"`
 }
 
 type updateSettingsReq struct {
@@ -3855,6 +3856,7 @@ type updateSettingsReq struct {
 	ImageS3SecretKey                       *string `json:"image_s3_secret_key"`
 	ImageS3Prefix                          *string `json:"image_s3_prefix"`
 	ImageS3ForcePathStyle                  *bool   `json:"image_s3_force_path_style"`
+	DisableV1Messages                      *bool   `json:"disable_v1_messages"`
 }
 
 type brandingResponse struct {
@@ -4008,6 +4010,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		ImageS3SecretKey:                       imgCfg.SecretKey,
 		ImageS3Prefix:                          imgPrefix,
 		ImageS3ForcePathStyle:                  imgCfg.ForcePathStyle,
+		DisableV1Messages:                      h.store.GetDisableV1Messages(),
 	})
 }
 
@@ -4340,6 +4343,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: model_mapping")
 	}
 
+	if req.DisableV1Messages != nil {
+		h.store.SetDisableV1Messages(*req.DisableV1Messages)
+		log.Printf("设置已更新: disable_v1_messages = %t", *req.DisableV1Messages)
+	}
+
 	if req.ClientCompatMode != nil {
 		runtimeCfg.ClientCompatMode = proxy.NormalizeClientCompatMode(*req.ClientCompatMode)
 		log.Printf("设置已更新: client_compat_mode = %s", runtimeCfg.ClientCompatMode)
@@ -4573,6 +4581,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		StreamFlushPolicy:                      runtimeCfg.StreamFlushPolicy,
 		StreamFlushIntervalMS:                  runtimeCfg.StreamFlushIntervalMS,
 		ImageStorageConfig:                     imgConfigJSON,
+		DisableV1Messages:                      h.store.GetDisableV1Messages(),
 	})
 	if err != nil {
 		log.Printf("无法持久化保存设置: %v", err)
@@ -4657,6 +4666,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		ImageS3SecretKey:                       imgCfg.SecretKey,
 		ImageS3Prefix:                          strings.TrimSuffix(imgCfg.Prefix, "/"),
 		ImageS3ForcePathStyle:                  imgCfg.ForcePathStyle,
+		DisableV1Messages:                      h.store.GetDisableV1Messages(),
 	})
 }
 

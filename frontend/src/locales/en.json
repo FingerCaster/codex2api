@@ -1124,6 +1124,8 @@
     "streamFlushCoalesce": "Coalesce",
     "streamFlushInterval": "Coalesce Interval",
     "streamFlushIntervalDesc": "Minimum interval between flushes in coalesce mode, in milliseconds (1~1000).",
+    "disableV1Messages": "Disable /v1/messages",
+    "disableV1MessagesDesc": "When enabled, the Anthropic-compatible /v1/messages and /messages routes return 404 locally instead of forwarding upstream. Applies immediately after saving.",
     "imageStorage": "Image Storage",
     "imageStorageDesc": "Choose where generated images are persisted: local disk or any S3-compatible object store (AWS S3 / Cloudflare R2 / MinIO / Aliyun OSS / Tencent COS / B2, etc.).",
     "imageStorageBackend": "Backend",

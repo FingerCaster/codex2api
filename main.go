@@ -104,6 +104,7 @@ func main() {
 			StreamFlushPolicy:                      proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:                  20,
 			ImageStorageConfig:                     "{}",
+			DisableV1Messages:                      cfg.DisableV1Messages,
 		}
 		_ = db.UpdateSystemSettings(context.Background(), settings)
 	} else if err != nil {
@@ -144,8 +145,12 @@ func main() {
 			StreamFlushPolicy:                      proxy.StreamFlushPolicyImmediate,
 			StreamFlushIntervalMS:                  20,
 			ImageStorageConfig:                     "{}",
+			DisableV1Messages:                      cfg.DisableV1Messages,
 		}
 	} else {
+		if cfg.DisableV1Messages && !settings.DisableV1Messages {
+			settings.DisableV1Messages = true
+		}
 		log.Printf("已加载持久化业务设置: ProxyURL=%s, MaxConcurrency=%d, GlobalRPM=%d, PgMaxConns=%d, RedisPoolSize=%d",
 			settings.ProxyURL, settings.MaxConcurrency, settings.GlobalRPM, settings.PgMaxConns, settings.RedisPoolSize)
 	}
@@ -346,7 +351,7 @@ func main() {
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")
 	log.Printf("  API:    POST /v1/images/edits")
-	if !cfg.DisableV1Messages {
+	if !store.GetDisableV1Messages() {
 		log.Printf("  API:    POST /v1/messages")
 	}
 	log.Printf("  API:    GET  /v1/models")

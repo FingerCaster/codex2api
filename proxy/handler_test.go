@@ -149,7 +149,7 @@ func TestRegisterRoutesIncludesMessagesByDefault(t *testing.T) {
 	}
 }
 
-func TestRegisterRoutesSkipsMessagesWhenDisabled(t *testing.T) {
+func TestRegisterRoutesKeepsMessagesWhenDisabled(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	router := gin.New()
@@ -157,10 +157,37 @@ func TestRegisterRoutesSkipsMessagesWhenDisabled(t *testing.T) {
 
 	handler.RegisterRoutes(router)
 
+	routes := make(map[string]bool)
 	for _, route := range router.Routes() {
-		if route.Method == http.MethodPost && (route.Path == "/v1/messages" || route.Path == "/messages") {
-			t.Fatalf("messages route should not be registered when disabled: %+v", route)
+		if route.Method == http.MethodPost {
+			routes[route.Path] = true
 		}
+	}
+
+	for _, path := range []string{"/v1/messages", "/messages"} {
+		if !routes[path] {
+			t.Fatalf("expected POST route %s to stay registered for runtime setting changes; routes=%v", path, routes)
+		}
+	}
+}
+
+func TestMessagesReturnsNotFoundWhenDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	handler := &Handler{cfg: &config.Config{DisableV1Messages: true}}
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"claude-sonnet-4-5-20250514","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	ctx.Request = req
+
+	handler.Messages(ctx)
+
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d; body=%s", recorder.Code, http.StatusNotFound, recorder.Body.String())
+	}
+	if !strings.Contains(recorder.Body.String(), "messages endpoint is disabled") {
+		t.Fatalf("body should mention disabled endpoint: %s", recorder.Body.String())
 	}
 }
 

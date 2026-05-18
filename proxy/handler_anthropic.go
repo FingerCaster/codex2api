@@ -61,6 +61,11 @@ func mapHTTPStatusToAnthropicError(statusCode int) string {
 
 // Messages 处理 /v1/messages 请求（Anthropic Messages API → Codex Responses）
 func (h *Handler) Messages(c *gin.Context) {
+	if !h.messagesEndpointEnabled() {
+		sendAnthropicError(c, http.StatusNotFound, "not_found_error", "messages endpoint is disabled")
+		return
+	}
+
 	// 1. 读取请求体
 	rawBody, err := io.ReadAll(c.Request.Body)
 	if err != nil {
