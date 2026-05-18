@@ -92,6 +92,7 @@ type Config struct {
 	BindAddress            string // 监听地址，默认 0.0.0.0（兼容 Docker / 反代 / 公网）；如需仅本机访问可设为 127.0.0.1
 	AdminSecret            string
 	AllowAnonymousV1       bool // 显式允许 /v1/* 在未配置 API Key 时无鉴权放行（默认禁止）
+	DisableV1Messages      bool // 禁用 Anthropic /v1/messages 兼容端点（默认开启端点）
 	MaxRequestBodySize     int
 	Database               DatabaseConfig
 	Cache                  CacheConfig
@@ -120,6 +121,7 @@ func Load(envPath string) (*Config, error) {
 	}
 	cfg.AdminSecret = strings.TrimSpace(os.Getenv("ADMIN_SECRET"))
 	cfg.AllowAnonymousV1 = parseBoolEnv(os.Getenv("CODEX_ALLOW_ANONYMOUS"))
+	cfg.DisableV1Messages = parseBoolEnv(os.Getenv("CODEX_DISABLE_V1_MESSAGES"))
 	// 默认绑 0.0.0.0 以兼容 Docker 端口映射、反向代理、生产服务器等常规部署。
 	// 安全防护由 fail-closed 中间件 + 首启自助初始化 (/api/admin/bootstrap) + 启动 banner 共同保证；
 	// 想要严格仅本机访问的用户可设 CODEX_BIND=127.0.0.1。

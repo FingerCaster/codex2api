@@ -346,7 +346,9 @@ func main() {
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")
 	log.Printf("  API:    POST /v1/images/edits")
-	log.Printf("  API:    POST /v1/messages")
+	if !cfg.DisableV1Messages {
+		log.Printf("  API:    POST /v1/messages")
+	}
 	log.Printf("  API:    GET  /v1/models")
 	log.Println("==========================================")
 

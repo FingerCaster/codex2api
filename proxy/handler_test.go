@@ -16,6 +16,7 @@ import (
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/cache"
+	"github.com/codex2api/config"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
 	"github.com/tidwall/gjson"
@@ -122,6 +123,43 @@ func TestRegisterRoutesIncludesCodexDirectResponses(t *testing.T) {
 	} {
 		if !routes[path] {
 			t.Fatalf("expected POST route %s to be registered; routes=%v", path, routes)
+		}
+	}
+}
+
+func TestRegisterRoutesIncludesMessagesByDefault(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	handler := &Handler{}
+
+	handler.RegisterRoutes(router)
+
+	routes := make(map[string]bool)
+	for _, route := range router.Routes() {
+		if route.Method == http.MethodPost {
+			routes[route.Path] = true
+		}
+	}
+
+	for _, path := range []string{"/v1/messages", "/messages"} {
+		if !routes[path] {
+			t.Fatalf("expected POST route %s to be registered by default; routes=%v", path, routes)
+		}
+	}
+}
+
+func TestRegisterRoutesSkipsMessagesWhenDisabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	router := gin.New()
+	handler := &Handler{cfg: &config.Config{DisableV1Messages: true}}
+
+	handler.RegisterRoutes(router)
+
+	for _, route := range router.Routes() {
+		if route.Method == http.MethodPost && (route.Path == "/v1/messages" || route.Path == "/messages") {
+			t.Fatalf("messages route should not be registered when disabled: %+v", route)
 		}
 	}
 }

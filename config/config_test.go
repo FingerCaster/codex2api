@@ -9,6 +9,7 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	keys := []string{
 		"CODEX_PORT",
 		"CODEX_MAX_REQUEST_BODY_SIZE_MB",
+		"CODEX_DISABLE_V1_MESSAGES",
 		"PORT",
 		"ADMIN_SECRET",
 		"DATABASE_DRIVER",
@@ -57,6 +58,9 @@ func TestLoadDefaultsToPostgresAndRedis(t *testing.T) {
 	}
 	if got := cfg.MaxRequestBodySize; got != 32*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 32*1024*1024)
+	}
+	if cfg.DisableV1Messages {
+		t.Fatal("DisableV1Messages = true, want false")
 	}
 }
 
@@ -183,6 +187,22 @@ func TestLoadReadsMaxRequestBodySizeFromEnv(t *testing.T) {
 
 	if got := cfg.MaxRequestBodySize; got != 64*1024*1024 {
 		t.Fatalf("MaxRequestBodySize = %d, want %d", got, 64*1024*1024)
+	}
+}
+
+func TestLoadReadsDisableV1MessagesFromEnv(t *testing.T) {
+	t.Setenv("DATABASE_DRIVER", "")
+	t.Setenv("DATABASE_HOST", "postgres")
+	t.Setenv("CACHE_DRIVER", "")
+	t.Setenv("REDIS_ADDR", "redis:6379")
+	t.Setenv("CODEX_DISABLE_V1_MESSAGES", "true")
+
+	cfg, err := Load("__not_exists__.env")
+	if err != nil {
+		t.Fatalf("Load() 返回错误: %v", err)
+	}
+	if !cfg.DisableV1Messages {
+		t.Fatal("DisableV1Messages = false, want true")
 	}
 }
 
